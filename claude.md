@@ -1,1 +1,1 @@
-Collect all images in out folder , even the one claude is testing for.
+Collect all images in out folder , even the one claude is testing for.We need them to prepare reports
