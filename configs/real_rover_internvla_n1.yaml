@@ -1,0 +1,19 @@
+{
+  "zenoh": {
+    "connect_endpoint": "",
+    "camera_keys": ["image_raw", "rt/image_raw"],
+    "camera_compressed_keys": ["image_raw/compressed", "rt/image_raw/compressed"],
+    "cmd_keys": ["cmd_vel", "rt/cmd_vel"],
+    "goal_keys": ["omnivla/goal_text"],
+    "explanation_keys": ["omnivla/explanation"]
+  },
+  "internvla_n1": {
+    "instruction": "stop",
+    "predict_hz": 2.0,
+    "max_linear": 0.06,
+    "max_angular": 0.15,
+    "model_path": "/mnt/bigdisk/hf_cache/transformers/models--InternRobotics--InternVLA-N1-DualVLN/snapshots/a698a9e898b4001621a319e1bc89f02ec715cc86",
+    "internnav_repo": "/mnt/bigdisk/Priyan/OmniVLA_safe/third_party/InternNav",
+    "stop_confirm_count": 2
+  }
+}

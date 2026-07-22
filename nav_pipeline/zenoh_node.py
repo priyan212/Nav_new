@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+"""DINO + NavDP Zenoh navigation node (GPU side, camera-only).
+
+Speaks the SAME Zenoh contract as the previous OmniVLA / InternVLA-N1 nodes,
+so the Pi rover / Isaac Sim side is unchanged:
+
+Subscribes (Zenoh, CDR ROS 2 msgs):
+  image_raw, rt/image_raw, rover_camera, rt/rover_camera     - sensor_msgs/Image
+  image_raw/compressed, rt/image_raw/compressed              - sensor_msgs/CompressedImage
+  depth_raw, rt/depth_raw                                    - sensor_msgs/Image (32FC1 m) [optional]
+  omnivla/goal_text                                          - std_msgs/String (target phrase)
+Publishes (Zenoh, CDR):
+  cmd_vel              - geometry_msgs/Twist
+  omnivla/explanation  - std_msgs/String
+  omnivla/waypoints    - nav_msgs/Path (selected NavDP trajectory, base_link)
+
+Inference core: Grounding DINO (open-vocab detection -> 3D point goal) +
+NavDP System-1 (trajectory diffusion + critic) with goal-directed trajectory
+selection. ~0.25s/tick on the RTX 3090 Ti. If no depth topic arrives, depth is
+estimated monocularly (Depth Anything V2 metric).
+
+Run (from Nav_new root, internnav conda env):
+  python -m nav_pipeline.zenoh_node --target "trash bin" [--pi-ip <IP>]
+"""
+
+import argparse
+import os
+import struct
+import sys
+import time
+from threading import Lock, Thread
+from typing import List, Optional, Tuple
+
+import numpy as np
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
+try:
+    import zenoh
+except ImportError:
+    print("ERROR: zenoh Python library not found (pip install eclipse-zenoh).")
+    sys.exit(1)
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from nav_pipeline.pipeline import DinoNavDPPipeline, PipelineConfig  # noqa: E402
+
+
+# ================================================================
+#  CDR helpers (DDS wire format) — same contract as previous nodes
+# ================================================================
+class CDRReader:
+    def __init__(self, data: bytes):
+        self.data = data
+        self.le = data[1] in (0x01, 0x11)
+        self.end = "<" if self.le else ">"
+        self.offset = 4
+        self.base = 4
+
+    def _align(self, n: int):
+        rem = (self.offset - self.base) % n
+        if rem:
+            self.offset += n - rem
+
+    def read_uint8(self) -> int:
+        v = self.data[self.offset]
+        self.offset += 1
+        return v
+
+    def read_int32(self) -> int:
+        self._align(4)
+        (v,) = struct.unpack_from(self.end + "i", self.data, self.offset)
+        self.offset += 4
+        return v
+
+    def read_uint32(self) -> int:
+        self._align(4)
+        (v,) = struct.unpack_from(self.end + "I", self.data, self.offset)
+        self.offset += 4
+        return v
+
+    def read_string(self) -> str:
+        length = self.read_uint32()
+        s = self.data[self.offset : self.offset + length - 1].decode("utf-8", errors="replace")
+        self.offset += length
+        return s
+
+    def read_sequence_uint8(self) -> bytes:
+        count = self.read_uint32()
+        data = self.data[self.offset : self.offset + count]
+        self.offset += count
+        return data
+
+
+class CDRWriter:
+    def __init__(self):
+        self.buf = bytearray(b"\x00\x01\x00\x00")  # CDR LE encapsulation
+        self.base = 4
+
+    def _align(self, n: int):
+        rem = (len(self.buf) - self.base) % n
+        if rem:
+            self.buf += b"\x00" * (n - rem)
+
+    def write_int32(self, v: int):
+        self._align(4)
+        self.buf += struct.pack("<i", v)
+
+    def write_uint32(self, v: int):
+        self._align(4)
+        self.buf += struct.pack("<I", v)
+
+    def write_float64(self, v: float):
+        self._align(8)
+        self.buf += struct.pack("<d", v)
+
+    def write_string(self, s: str):
+        encoded = s.encode("utf-8") + b"\x00"
+        self.write_uint32(len(encoded))
+        self.buf += encoded
+
+    def to_bytes(self) -> bytes:
+        return bytes(self.buf)
+
+
+def parse_image(cdr_data: bytes) -> Optional[np.ndarray]:
+    """sensor_msgs/Image CDR -> RGB uint8 (H,W,3) or float32 depth (H,W)."""
+    r = CDRReader(cdr_data)
+    r.read_int32(); r.read_uint32(); r.read_string()  # header
+    height = r.read_uint32()
+    width = r.read_uint32()
+    encoding = r.read_string()
+    r.read_uint8(); r._align(4); r.read_uint32()  # is_bigendian, step
+    pixel_data = r.read_sequence_uint8()
+
+    enc = encoding.lower()
+    if enc in ("32fc1", "depth32f"):
+        img = np.frombuffer(pixel_data, dtype=np.float32)
+        try:
+            return img.reshape(height, width).copy()
+        except ValueError:
+            return None
+    if enc == "16uc1":  # depth in mm
+        img = np.frombuffer(pixel_data, dtype=np.uint16)
+        try:
+            return (img.reshape(height, width).astype(np.float32) / 1000.0)
+        except ValueError:
+            return None
+
+    img = np.frombuffer(pixel_data, dtype=np.uint8)
+    try:
+        img = img.reshape(height, width, -1)
+    except ValueError:
+        return None
+    if enc == "bgr8":
+        return img[:, :, :3][:, :, ::-1].copy()
+    if img.shape[2] >= 3:
+        return img[:, :, :3]
+    return None
+
+
+def parse_compressed_image(cdr_data: bytes) -> Optional[np.ndarray]:
+    """sensor_msgs/CompressedImage CDR -> RGB uint8 (H,W,3)."""
+    r = CDRReader(cdr_data)
+    r.read_int32(); r.read_uint32(); r.read_string()  # header
+    r.read_string()  # format
+    jpeg_bytes = r.read_sequence_uint8()
+    try:
+        if cv2 is not None:
+            arr = np.frombuffer(bytes(jpeg_bytes), dtype=np.uint8)
+            bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if bgr is None:
+                return None
+            return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        import io
+
+        from PIL import Image
+
+        return np.array(Image.open(io.BytesIO(bytes(jpeg_bytes))).convert("RGB"), dtype=np.uint8)
+    except Exception:
+        return None
+
+
+def parse_string(cdr_data: bytes) -> str:
+    return CDRReader(cdr_data).read_string()
+
+
+def serialize_twist(linear_x: float, angular_z: float) -> bytes:
+    w = CDRWriter()
+    w.write_float64(linear_x); w.write_float64(0.0); w.write_float64(0.0)
+    w.write_float64(0.0); w.write_float64(0.0); w.write_float64(angular_z)
+    return w.to_bytes()
+
+
+def serialize_string(text: str) -> bytes:
+    w = CDRWriter()
+    w.write_string(text)
+    return w.to_bytes()
+
+
+def serialize_path(points_xy: List[Tuple[float, float]], frame_id: str = "base_link") -> bytes:
+    w = CDRWriter()
+    w.write_int32(0); w.write_uint32(0); w.write_string(frame_id)
+    w.write_uint32(len(points_xy))
+    for px, py in points_xy:
+        w.write_int32(0); w.write_uint32(0); w.write_string(frame_id)
+        w.write_float64(float(px)); w.write_float64(float(py)); w.write_float64(0.0)
+        w.write_float64(0.0); w.write_float64(0.0); w.write_float64(0.0); w.write_float64(1.0)
+    return w.to_bytes()
+
+
+# ================================================================
+#  Node
+# ================================================================
+CAMERA_KEYS = ["image_raw", "rt/image_raw", "rover_camera", "rt/rover_camera"]
+CAMERA_COMPRESSED_KEYS = ["image_raw/compressed", "rt/image_raw/compressed"]
+DEPTH_KEYS = ["depth_raw", "rt/depth_raw", "rover_camera_depth", "rt/rover_camera_depth"]
+GOAL_KEYS = ["omnivla/goal_text", "rt/omnivla/goal_text"]
+
+
+class DinoNavDPZenohNode:
+    # Rover firmware zeroes velocity if no cmd_vel arrives within ~500 ms;
+    # heartbeat re-sends the last command well under that deadline.
+    HEARTBEAT_PERIOD_S = 0.15
+    DEPTH_STALE_S = 1.0  # external depth older than this -> fall back to monocular
+
+    def __init__(self, session: zenoh.Session, pipeline: DinoNavDPPipeline, target: str, predict_hz: float,
+                 stop_confirm_count: int = 3):
+        self.session = session
+        self.pipe = pipeline
+        self.target = target
+        self.predict_hz = predict_hz
+        self.stop_confirm_count = stop_confirm_count
+
+        self.lock = Lock()
+        self.latest_rgb: Optional[np.ndarray] = None
+        self.latest_depth: Optional[np.ndarray] = None
+        self.latest_depth_t = 0.0
+        self._running = True
+        self._frame_count = 0
+        self._infer_count = 0
+        self._stop_streak = 0
+        self._goal_reached = False
+        self._last_cmd = (0.0, 0.0)
+
+        self.pub_cmd = session.declare_publisher("cmd_vel")
+        self.pub_explain = session.declare_publisher("omnivla/explanation")
+        self.pub_path = session.declare_publisher("omnivla/waypoints")
+        self.subs = (
+            [session.declare_subscriber(k, self._on_image) for k in CAMERA_KEYS]
+            + [session.declare_subscriber(k, self._on_image_compressed) for k in CAMERA_COMPRESSED_KEYS]
+            + [session.declare_subscriber(k, self._on_depth) for k in DEPTH_KEYS]
+            + [session.declare_subscriber(k, self._on_goal) for k in GOAL_KEYS]
+        )
+        print(f"[INFO] Zenoh subs: {CAMERA_KEYS + CAMERA_COMPRESSED_KEYS + DEPTH_KEYS + GOAL_KEYS}")
+        print("[INFO] Zenoh pubs: cmd_vel, omnivla/explanation, omnivla/waypoints")
+
+        Thread(target=self._heartbeat_loop, daemon=True).start()
+
+    # ---------------- zenoh callbacks ---------------- #
+    def _on_image(self, sample):
+        try:
+            img = parse_image(bytes(sample.payload))
+            if img is not None and img.ndim == 3:
+                with self.lock:
+                    self.latest_rgb = img
+                    self._frame_count += 1
+        except Exception as e:
+            print(f"[WARN] image parse failed: {e}")
+
+    def _on_image_compressed(self, sample):
+        try:
+            img = parse_compressed_image(bytes(sample.payload))
+            if img is not None:
+                with self.lock:
+                    self.latest_rgb = img
+                    self._frame_count += 1
+        except Exception as e:
+            print(f"[WARN] compressed image parse failed: {e}")
+
+    def _on_depth(self, sample):
+        try:
+            d = parse_image(bytes(sample.payload))
+            if d is not None and d.ndim == 2:
+                with self.lock:
+                    self.latest_depth = d
+                    self.latest_depth_t = time.time()
+        except Exception as e:
+            print(f"[WARN] depth parse failed: {e}")
+
+    def _on_goal(self, sample):
+        try:
+            text = parse_string(bytes(sample.payload)).strip()
+            if text and text != self.target:
+                print(f"[INFO] New target: '{text}'")
+                self.target = text
+                self._goal_reached = False
+                self._stop_streak = 0
+                self.pipe.reset()
+        except Exception:
+            pass
+
+    # ---------------- publishing ---------------- #
+    def _heartbeat_loop(self):
+        while self._running:
+            time.sleep(self.HEARTBEAT_PERIOD_S)
+            with self.lock:
+                lin, ang = self._last_cmd
+            self.pub_cmd.put(serialize_twist(lin, ang))
+
+    def publish_cmd(self, lin: float, ang: float):
+        with self.lock:
+            self._last_cmd = (lin, ang)
+        self.pub_cmd.put(serialize_twist(lin, ang))
+
+    # ---------------- main loop ---------------- #
+    def spin(self):
+        period = 1.0 / self.predict_hz
+        last_status = time.time()
+        print(f"[INFO] Loop at {self.predict_hz} Hz | target: '{self.target}'")
+        print("[INFO] Waiting for camera frames via Zenoh...")
+        try:
+            while self._running:
+                t0 = time.time()
+                self._tick()
+                if time.time() - last_status > 10.0:
+                    print(f"[STATUS] frames_rx={self._frame_count} inferences={self._infer_count} "
+                          f"goal={'REACHED' if self._goal_reached else 'tracking'}")
+                    last_status = time.time()
+                dt = period - (time.time() - t0)
+                if dt > 0:
+                    time.sleep(dt)
+        except KeyboardInterrupt:
+            print("\n[INFO] Shutting down...")
+        finally:
+            self._running = False
+            self.publish_cmd(0.0, 0.0)
+            time.sleep(0.1)
+            self.publish_cmd(0.0, 0.0)
+            print("[INFO] Sent zero velocity. Goodbye.")
+
+    def _tick(self):
+        with self.lock:
+            rgb = self.latest_rgb
+            depth = self.latest_depth
+            depth_age = time.time() - self.latest_depth_t
+        if rgb is None:
+            return
+        if self._goal_reached:
+            self.publish_cmd(0.0, 0.0)
+            return
+        if depth is not None and (depth_age > self.DEPTH_STALE_S or depth.shape[:2] != rgb.shape[:2]):
+            depth = None  # stale or mismatched -> monocular fallback
+
+        t0 = time.time()
+        try:
+            res = self.pipe.step(rgb, self.target, depth=depth)
+        except Exception as e:
+            print(f"[ERROR] pipeline step failed: {e}")
+            self.publish_cmd(0.0, 0.0)
+            return
+        infer_ms = (time.time() - t0) * 1000.0
+
+        if res.state == "STOP":
+            self._stop_streak += 1
+            if self._stop_streak >= self.stop_confirm_count:
+                print(f"\n{'=' * 50}\n  GOAL REACHED: '{self.target}'\n{'=' * 50}\n")
+                self._goal_reached = True
+                self.publish_cmd(0.0, 0.0)
+                self.pub_explain.put(serialize_string(f"GOAL REACHED: '{self.target}'. Stopping."))
+                return
+            self.publish_cmd(0.0, 0.0)
+        else:
+            self._stop_streak = 0
+            self.publish_cmd(res.linear, res.angular)
+
+        if res.trajectory is not None:
+            self.pub_path.put(serialize_path([(p[0], p[1]) for p in res.trajectory]))
+
+        score = f"{res.detection.score:.2f}" if res.detection else "-"
+        goal = np.round(res.goal_point, 2).tolist() if res.goal_point is not None else None
+        self.pub_explain.put(serialize_string(
+            f"DINO+NavDP [{res.state}] det={score} goal={goal} -> lin={res.linear:.3f} ang={res.angular:.3f} "
+            f"| target='{self.target}'"
+        ))
+        self._infer_count += 1
+        if self._infer_count <= 5 or self._infer_count % 20 == 0:
+            print(f"[PRED #{self._infer_count}] {res.state} det={score} goal={goal} "
+                  f"lin={res.linear:.3f} ang={res.angular:+.3f} ({infer_ms:.0f}ms)")
+
+
+def main():
+    p = argparse.ArgumentParser(description="DINO+NavDP Zenoh navigation node",
+                                formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("--pi-ip", type=str, default=None,
+                   help="Pi/Isaac IP for explicit Zenoh peer; omit for multicast scouting")
+    p.add_argument("--target", type=str, default="trash bin", help="object to navigate to (free text)")
+    p.add_argument("--predict-hz", type=float, default=3.0)
+    p.add_argument("--max-linear", type=float, default=0.15)
+    p.add_argument("--max-angular", type=float, default=0.25)
+    p.add_argument("--fov", type=float, default=90.0, help="camera horizontal FOV (deg)")
+    p.add_argument("--stop-distance", type=float, default=0.8)
+    p.add_argument("--invert-angular", action="store_true",
+                   help="flip turn direction (use if the rover steers away from the target)")
+    p.add_argument("--device", type=str, default="cuda:0")
+    args = p.parse_args()
+
+    cfg = PipelineConfig(
+        device=args.device,
+        horizontal_fov_deg=args.fov,
+        max_linear=args.max_linear,
+        max_angular=args.max_angular,
+        stop_distance=args.stop_distance,
+        invert_angular=args.invert_angular,
+    )
+    pipeline = DinoNavDPPipeline(cfg)
+
+    config = zenoh.Config()
+    if args.pi_ip:
+        config.insert_json5("connect/endpoints", f'["tcp/{args.pi_ip}:7447"]')
+        print(f"[INFO] Zenoh: connecting to tcp/{args.pi_ip}:7447")
+    else:
+        print("[INFO] Zenoh: multicast scouting (auto-discover)")
+    session = zenoh.open(config)
+    print("[INFO] Zenoh session opened.")
+
+    node = DinoNavDPZenohNode(session, pipeline, args.target, args.predict_hz)
+    node.spin()
+    session.close()
+
+
+if __name__ == "__main__":
+    main()

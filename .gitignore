@@ -1,0 +1,22 @@
+# Nested repos (already independently version-controlled)
+MARS/habitat-lab/
+MARS/mars-habitatsim/
+
+# Vendored third-party project
+third_party/InternNav/
+
+# Model checkpoints / weights (large binaries, some are broken symlinks
+# to another project's path outside this repo)
+checkpoints/
+*.ckpt
+*.pth
+
+# Training run artifacts
+navdp-cross-modal/
+
+# Python
+__pycache__/
+*.pyc
+
+# Data directories (large scene assets)
+MARS/data/

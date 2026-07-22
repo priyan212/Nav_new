@@ -1,0 +1,1 @@
+Collect all images in out folder , even the one claude is testing for.

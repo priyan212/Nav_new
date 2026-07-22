@@ -1,0 +1,18 @@
+{
+  "zenoh": {
+    "connect_endpoint": "",
+    "camera_keys": ["rover_camera", "rt/rover_camera"],
+    "cmd_keys": ["cmd_vel", "rt/cmd_vel"],
+    "goal_keys": ["omnivla/goal_text"],
+    "explanation_keys": ["omnivla/explanation"]
+  },
+  "internvla_n1": {
+    "instruction": "go straight down the hallway and stop at the door",
+    "predict_hz": 2.0,
+    "max_linear": 0.35,
+    "max_angular": 0.55,
+    "model_path": "/mnt/bigdisk/hf_cache/transformers/models--InternRobotics--InternVLA-N1-DualVLN/snapshots/a698a9e898b4001621a319e1bc89f02ec715cc86",
+    "internnav_repo": "/mnt/bigdisk/Priyan/OmniVLA_safe/third_party/InternNav",
+    "stop_confirm_count": 2
+  }
+}
