@@ -649,6 +649,11 @@ class App:
 
         self.cam_label = ttk.Label(main)
         self.cam_label.grid(row=0, column=0, padx=4, pady=4)
+        # Seed a blank image so the label already occupies its final size —
+        # otherwise the column is 0-width until the first camera frame
+        # arrives, and the window jumps when it does.
+        self._blank_photo = ImageTk.PhotoImage(Image.new("RGB", (self.CAM_SIZE, self.CAM_SIZE), "#222"))
+        self.cam_label.configure(image=self._blank_photo)
         self.plot = tk.Canvas(main, width=self.PLOT_SIZE, height=self.PLOT_SIZE, bg="white")
         self.plot.grid(row=0, column=1, padx=4, pady=4)
 
@@ -671,9 +676,14 @@ class App:
         for p in PRESETS:
             ttk.Button(presets, text=p, command=lambda t=p: self.send_target(t)).pack(side="left", padx=2)
 
-        self.status = ttk.Label(main, text="starting...", font=("TkDefaultFont", 11, "bold"))
+        # Fixed character width on the two dynamic-text rows: their content
+        # (state name, counters, latency numbers) changes length on every
+        # refresh tick, and an unconstrained Label makes the whole window
+        # resize to match on every tick.
+        self.status = ttk.Label(main, text="starting...", font=("TkDefaultFont", 11, "bold"),
+                                 width=110, anchor="w")
         self.status.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        self.info = ttk.Label(main, text="")
+        self.info = ttk.Label(main, text="", width=110, anchor="w")
         self.info.grid(row=4, column=0, columnspan=2, sticky="w")
 
         self._photo = None
