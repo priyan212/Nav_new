@@ -1,1 +1,1 @@
-Collect all images in out folder , even the one claude is testing for.We need them to prepare reports
+Collect all images in "/mnt/bigdisk/Priyan/Nav_new/data" folder , even the one claude is testing for.We need them to prepare reports

@@ -1,6 +1,7 @@
 ```
 Hello new user of this repo, I'm Priyan an intern at this lab.
 If you need any help contact through GitHub: priyan212
+
 ```
 
 # Nav_new — 6WD Rover Navigation: Grounding DINO + NavDP
