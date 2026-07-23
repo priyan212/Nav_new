@@ -49,6 +49,7 @@ from mars_gui import (  # noqa: E402
     SharedState,
     StepResult,
     apply_avoid_cooldown,
+    bearing_to_angular,
     depth_to_obstacle_points,
     forward_guard,
     goal_point_from_detection,
@@ -247,13 +248,11 @@ class BeliefOnlyPipeline(MarsPipeline):
             res.linear *= max(0.25, res.min_forward / cfg.guard.slow_dist)
         else:
             bearing = float(np.arctan2(goal[1], goal[0]))
-            if abs(bearing) < cfg.servo_deadband:
-                res.angular = 0.0
-                res.linear = cfg.max_linear
-            else:
-                res.angular = float(np.clip(cfg.kp_angular * bearing,
-                                            -cfg.max_angular, cfg.max_angular))
-                res.linear = cfg.max_linear * max(0.2, 1.0 - 0.8 * abs(res.angular) / cfg.max_angular)
+            res.angular = bearing_to_angular(
+                bearing, cfg.max_angular, cfg.ang_min_cmd,
+                cfg.servo_deadband, np.radians(cfg.servo_ramp_deg),
+            )
+            res.linear = cfg.max_linear * max(0.2, 1.0 - 0.8 * abs(res.angular) / cfg.max_angular)
         res.angular, self._avoid_cooldown = apply_avoid_cooldown(
             res.angular, res.state, self._avoid_side, self._avoid_cooldown,
             cfg.avoid_bias_gain, cfg.max_angular,

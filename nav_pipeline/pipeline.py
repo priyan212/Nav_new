@@ -71,9 +71,14 @@ class PipelineConfig:
     # Steering in open space is a DETERMINISTIC visual servo on the detection
     # bearing (stable tick to tick), not the resampled diffusion heading.
     servo_deadband: float = 0.05     # |bearing| below this -> drive straight (OmniVLA value)
-    ang_boost: float = 0.05          # constant added in the turn direction (OmniVLA value)
     ang_min_cmd: float = 0.12        # stiction floor: minimum |angular| outside the deadband —
     #                                  the 6WD skid-steer won't yaw at all on smaller commands
+    servo_ramp_deg: float = 35.0     # heading error (past the deadband) at which the smooth
+    #                                  bearing->angular curve reaches ~96% of max_angular -- the
+    #                                  width of the actual proportional steering range (see
+    #                                  bearing_to_angular; a plain linear-gain-then-clip-and-floor
+    #                                  controller saturates within a few degrees, which reads as
+    #                                  the rover snapping to full-rate turns instead of easing in)
     smoothing: float = 0.5           # cross-tick EMA on (lin, ang); 0 = off
     avoid_confirm_ticks: int = 2     # consecutive guard hits before AVOID engages
     avoid_cooldown_ticks: int = 8    # keep biasing steering away from the escape side for this many
@@ -92,6 +97,36 @@ class PipelineConfig:
     # target loss behavior
     search_angular: float = 0.2      # spin to re-acquire when target not seen
     lost_patience: int = 5           # frames to keep last goal before searching
+
+
+def bearing_to_angular(bearing: float, max_angular: float, ang_min_cmd: float,
+                       deadband: float, ramp_rad: float) -> float:
+    """Smooth, monotonic heading-error -> angular-velocity command.
+
+    Below `deadband`, commands 0 (drive straight). Above it, ramps
+    CONTINUOUSLY via tanh from `ang_min_cmd` (the minimum that actually
+    overcomes the rover's yaw stiction) up toward `max_angular` as the
+    heading error grows, reaching ~96% of max_angular by `ramp_rad` past
+    the deadband.
+
+    This replaces a linear gain (kp_angular * bearing) that gets clipped to
+    max_angular and then has a stiction floor/boost added on top after the
+    fact: with kp_angular=2.2 and max_angular=0.25 (real-rover defaults),
+    that combination saturates within about 5 degrees of heading error, and
+    the floor/boost addition makes the command jump straight from 0 to
+    ~64% of max_angular the instant the deadband is crossed -- there is
+    almost no actual proportional range, so steering reads as snapping
+    between "straight" and "turning at full rate" instead of easing in
+    gradually with how far off the target is. Baking the floor into a smooth
+    saturation curve instead gives a real, wide, continuous ramp.
+    """
+    mag = abs(bearing)
+    if mag < deadband:
+        return 0.0
+    span = max(max_angular - ang_min_cmd, 0.0)
+    x = 2.0 * (mag - deadband) / max(ramp_rad, 1e-6)   # tanh(2) ~= 0.964
+    magnitude = min(ang_min_cmd + span * float(np.tanh(x)), max_angular)
+    return float(np.copysign(magnitude, bearing))
 
 
 @dataclass
@@ -198,26 +233,27 @@ class DinoNavDPPipeline:
         """Look-ahead waypoint -> (v, w), matching the rover's velocity caps.
 
         Angular authority scales with obstacle urgency: near obstacles the
-        gain is boosted (saturating at max_angular) and the look-ahead uses
-        the widest heading over the horizon so a curving escape trajectory
-        commands an immediate, committed turn instead of a lazy drift.
+        heading->angular ramp is steepened (saturating sooner, at a smaller
+        heading error) and the look-ahead uses the widest heading over the
+        horizon so a curving escape trajectory commands an immediate,
+        committed turn instead of a lazy drift.
         """
         wp = traj[min(self.cfg.waypoint_index, len(traj) - 1)]
         dist = float(np.linalg.norm(wp[:2]))
         heading = float(np.arctan2(wp[1], wp[0]))
 
         urgent = min_forward < self.cfg.guard.slow_dist
+        ramp_deg = self.cfg.servo_ramp_deg
         if urgent:
             # widest waypoint heading over the horizon = the turn the policy
             # actually intends; act on it NOW rather than easing into it
             xs, ys = traj[1:, 0], traj[1:, 1]
             headings = np.arctan2(ys, np.maximum(xs, 1e-3))
             heading = float(headings[np.argmax(np.abs(headings))])
+            ramp_deg /= 1.0 + self.cfg.urgency_gain * (1.0 - min_forward / self.cfg.guard.slow_dist)
 
-        gain = self.cfg.kp_angular
-        if urgent:
-            gain *= 1.0 + self.cfg.urgency_gain * (1.0 - min_forward / self.cfg.guard.slow_dist)
-        angular = np.clip(gain * heading, -self.cfg.max_angular, self.cfg.max_angular)
+        angular = bearing_to_angular(heading, self.cfg.max_angular, self.cfg.ang_min_cmd,
+                                     0.0, np.radians(ramp_deg))
 
         linear = np.clip(self.cfg.kp * dist, 0.0, self.cfg.max_linear)
         # slow down while turning hard (fraction of angular authority in use)
@@ -227,13 +263,10 @@ class DinoNavDPPipeline:
     # ------------------------------------------------------------------ #
     def step(self, rgb: np.ndarray, target_text: str, depth: Optional[np.ndarray] = None) -> StepResult:
         res = self._step_inner(rgb, target_text, depth)
-        # angular boost + stiction floor: guarantee real yaw on the skid-steer
-        # chassis (proven necessary on this rover — small commands do not rotate it)
-        if res.state in ("TRACK", "AVOID", "SEARCH") and abs(res.angular) > 0.01:
-            boosted = abs(res.angular) + self.cfg.ang_boost
-            boosted = max(boosted, self.cfg.ang_min_cmd)
-            res.angular = float(np.clip(np.copysign(boosted, res.angular),
-                                        -self.cfg.max_angular, self.cfg.max_angular))
+        # stiction floor is now baked into bearing_to_angular's smooth ramp
+        # for TRACK; AVOID commands max_angular directly and SEARCH's
+        # search_angular is already comfortably above ang_min_cmd, so
+        # neither needs a separate post-hoc boost (see bearing_to_angular).
         if self.cfg.invert_angular:
             res.angular = -res.angular
         # cross-tick EMA smoothing (ported from the OmniVLA node's damping)
@@ -388,15 +421,13 @@ class DinoNavDPPipeline:
             # stable tick to tick (the diffusion heading resamples every tick,
             # which read as random wandering on the real rover)
             bearing = float(np.arctan2(goal[1], goal[0]))  # +left, ROS convention
-            if abs(bearing) < self.cfg.servo_deadband:
-                res.angular = 0.0
-                res.linear = self.cfg.max_linear
-            else:
-                res.angular = float(np.clip(self.cfg.kp_angular * bearing,
-                                            -self.cfg.max_angular, self.cfg.max_angular))
-                res.linear = self.cfg.max_linear * max(
-                    0.2, 1.0 - 0.8 * abs(res.angular) / self.cfg.max_angular
-                )
+            res.angular = bearing_to_angular(
+                bearing, self.cfg.max_angular, self.cfg.ang_min_cmd,
+                self.cfg.servo_deadband, np.radians(self.cfg.servo_ramp_deg),
+            )
+            res.linear = self.cfg.max_linear * max(
+                0.2, 1.0 - 0.8 * abs(res.angular) / self.cfg.max_angular
+            )
         res.angular, self._avoid_cooldown = apply_avoid_cooldown(
             res.angular, res.state, self._avoid_side, self._avoid_cooldown,
             self.cfg.avoid_bias_gain, self.cfg.max_angular,

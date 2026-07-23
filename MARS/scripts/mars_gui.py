@@ -46,7 +46,12 @@ sys.path.insert(0, NAV_ROOT)
 NAVDP_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "mars-habitatsim", "navdp"))
 sys.path.insert(0, NAVDP_ROOT)
 
-from nav_pipeline.pipeline import DinoNavDPPipeline, PipelineConfig, StepResult  # noqa: E402
+from nav_pipeline.pipeline import (  # noqa: E402
+    DinoNavDPPipeline,
+    PipelineConfig,
+    StepResult,
+    bearing_to_angular,
+)
 from nav_pipeline.goal_utils import (  # noqa: E402
     goal_point_from_detection,
     intrinsics_from_fov,
@@ -125,12 +130,9 @@ class MarsPipeline(DinoNavDPPipeline):
 
     def step_point(self, rgb: np.ndarray, goal_xy, depth: Optional[np.ndarray] = None) -> StepResult:
         res = self._step_point_inner(rgb, goal_xy, depth)
-        # same command shaping as DinoNavDPPipeline.step()
-        if res.state in ("TRACK", "AVOID", "SEARCH") and abs(res.angular) > 0.01:
-            boosted = abs(res.angular) + self.cfg.ang_boost
-            boosted = max(boosted, self.cfg.ang_min_cmd)
-            res.angular = float(np.clip(np.copysign(boosted, res.angular),
-                                        -self.cfg.max_angular, self.cfg.max_angular))
+        # same command shaping as DinoNavDPPipeline.step() -- stiction floor
+        # is baked into bearing_to_angular's smooth ramp for TRACK; AVOID/
+        # SEARCH don't need a separate post-hoc boost (see pipeline.py)
         if self.cfg.invert_angular:
             res.angular = -res.angular
         a = self.cfg.smoothing
@@ -224,13 +226,11 @@ class MarsPipeline(DinoNavDPPipeline):
             res.linear *= max(0.25, res.min_forward / cfg.guard.slow_dist)
         else:
             bearing = float(np.arctan2(goal[1], goal[0]))
-            if abs(bearing) < cfg.servo_deadband:
-                res.angular = 0.0
-                res.linear = cfg.max_linear
-            else:
-                res.angular = float(np.clip(cfg.kp_angular * bearing,
-                                            -cfg.max_angular, cfg.max_angular))
-                res.linear = cfg.max_linear * max(0.2, 1.0 - 0.8 * abs(res.angular) / cfg.max_angular)
+            res.angular = bearing_to_angular(
+                bearing, cfg.max_angular, cfg.ang_min_cmd,
+                cfg.servo_deadband, np.radians(cfg.servo_ramp_deg),
+            )
+            res.linear = cfg.max_linear * max(0.2, 1.0 - 0.8 * abs(res.angular) / cfg.max_angular)
         res.angular, self._avoid_cooldown = apply_avoid_cooldown(
             res.angular, res.state, self._avoid_side, self._avoid_cooldown,
             cfg.avoid_bias_gain, cfg.max_angular,
@@ -394,13 +394,11 @@ class MarsPipeline(DinoNavDPPipeline):
             res.linear *= max(0.25, res.min_forward / cfg.guard.slow_dist)
         else:
             bearing = float(np.arctan2(goal[1], goal[0]))
-            if abs(bearing) < cfg.servo_deadband:
-                res.angular = 0.0
-                res.linear = cfg.max_linear
-            else:
-                res.angular = float(np.clip(cfg.kp_angular * bearing,
-                                            -cfg.max_angular, cfg.max_angular))
-                res.linear = cfg.max_linear * max(0.2, 1.0 - 0.8 * abs(res.angular) / cfg.max_angular)
+            res.angular = bearing_to_angular(
+                bearing, cfg.max_angular, cfg.ang_min_cmd,
+                cfg.servo_deadband, np.radians(cfg.servo_ramp_deg),
+            )
+            res.linear = cfg.max_linear * max(0.2, 1.0 - 0.8 * abs(res.angular) / cfg.max_angular)
         res.angular, self._avoid_cooldown = apply_avoid_cooldown(
             res.angular, res.state, self._avoid_side, self._avoid_cooldown,
             cfg.avoid_bias_gain, cfg.max_angular,
