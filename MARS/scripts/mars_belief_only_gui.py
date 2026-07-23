@@ -271,7 +271,7 @@ def main():
     ap.add_argument("--fov", type=float, default=90.0)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--max-linear", type=float, default=0.5)
-    ap.add_argument("--max-angular", type=float, default=0.6)
+    ap.add_argument("--max-angular", type=float, default=0.4)
     ap.add_argument("--invert-angular", action="store_true")
     ap.add_argument("--distractor-gate", type=float, default=DISTRACTOR_GATE_M,
                      help="meters: detections farther than this from the belief's predicted "
@@ -288,7 +288,7 @@ def main():
         horizontal_fov_deg=args.fov,
         max_linear=args.max_linear,
         max_angular=args.max_angular,
-        search_angular=min(0.3, args.max_angular),
+        search_angular=min(0.15, args.max_angular),
         invert_angular=args.invert_angular,
         guard=GuardConfig(max_climb_deg=args.max_climb_deg),
     ), distractor_gate_m=args.distractor_gate)
@@ -297,6 +297,8 @@ def main():
     print("[INFO] zenoh session opened")
 
     st = SharedState(args.target)
+    st.max_linear = args.max_linear
+    st.max_angular = args.max_angular
     _subs, pubs = zenoh_setup(session, st)
     running = {"on": True}
 

@@ -426,7 +426,7 @@ class SharedState:
         self.latest_depth: Optional[np.ndarray] = None
         self.latest_depth_t = 0.0
         self.frame_count = 0
-        self.mode = "text"                      # "text" | "point"
+        self.mode = "text"                      # "text" | "point" | "manual"
         self.target = target
         self.world_goal = None                  # (gx, gz) habitat world, point mode
         self.pose = None                        # {"x","z","yaw","t"} from earth/pose
@@ -436,6 +436,8 @@ class SharedState:
         self.goal_reached = False
         self.reset_pipeline = False
         self.last_cmd = (0.0, 0.0)
+        self.max_linear = 0.5                   # manual-drive caps; set from CLI args in main()
+        self.max_angular = 0.6
         # display
         self.display_rgb: Optional[np.ndarray] = None
         self.detection = None
@@ -556,6 +558,20 @@ def inference_loop(pipe: EarthPipeline, st: SharedState, pubs, running,
             stop_streak = 0
         if rgb is None:
             time.sleep(0.1)
+            continue
+        if mode == "manual":
+            # bypass detection/NavDP entirely -- last_cmd is set directly by
+            # the GUI's manual-drive button/key handlers; this loop only
+            # keeps the camera preview and status text current, and still
+            # honors STOP as an emergency zero
+            with st.lock:
+                if st.stopped:
+                    st.last_cmd = (0.0, 0.0)
+                lin, ang = st.last_cmd
+                st.display_rgb = rgb
+                st.state_text = "MANUAL (stopped)" if st.stopped else "MANUAL DRIVE"
+                st.vel_text = f"lin {lin:.3f}  ang {ang:+.3f}"
+            time.sleep(0.05)
             continue
         if paused:
             with st.lock:
@@ -685,15 +701,33 @@ class App:
         for p in PRESETS:
             ttk.Button(presets, text=p, command=lambda t=p: self.send_target(t)).pack(side="left", padx=2)
 
+        # Manual drive: hold a button (or an arrow key, once the window has
+        # focus) to drive directly, bypassing detection/NavDP entirely.
+        # Releasing zeros that axis; it does NOT hand control back to
+        # whatever autonomous mode was running before -- send a target,
+        # random goal, or "Go home" for that. STOP still works as usual.
+        self._manual_held: set = set()
+        drive = ttk.Frame(main)
+        drive.grid(row=3, column=0, columnspan=2, sticky="w", pady=2)
+        ttk.Label(drive, text="Manual drive (hold, or arrow keys):").pack(side="left")
+        for label, direction in (("◄", "left"), ("▲", "fwd"), ("▼", "back"), ("►", "right")):
+            b = ttk.Button(drive, text=label, width=3)
+            b.bind("<ButtonPress-1>", lambda e, d=direction: self.manual_press(d))
+            b.bind("<ButtonRelease-1>", lambda e, d=direction: self.manual_release(d))
+            b.pack(side="left", padx=2)
+        for key, direction in (("Up", "fwd"), ("Down", "back"), ("Left", "left"), ("Right", "right")):
+            root.bind(f"<KeyPress-{key}>", lambda e, d=direction: self.manual_press(d))
+            root.bind(f"<KeyRelease-{key}>", lambda e, d=direction: self.manual_release(d))
+
         # Fixed character width on the two dynamic-text rows: their content
         # (state name, counters, latency numbers) changes length on every
         # refresh tick, and an unconstrained Label makes the whole window
         # resize to match on every tick.
         self.status = ttk.Label(main, text="starting...", font=("TkDefaultFont", 11, "bold"),
                                  width=110, anchor="w")
-        self.status.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.status.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
         self.info = ttk.Label(main, text="", width=110, anchor="w")
-        self.info.grid(row=4, column=0, columnspan=2, sticky="w")
+        self.info.grid(row=5, column=0, columnspan=2, sticky="w")
 
         self._photo = None
         self.root.after(66, self.refresh)
@@ -706,6 +740,7 @@ class App:
         if text is not None:
             self.entry.delete(0, "end")
             self.entry.insert(0, t)
+        self._manual_held.clear()
         with self.st.lock:
             self.st.mode = "text"
             self.st.target = t
@@ -725,6 +760,7 @@ class App:
         theta = pose["yaw"] + rel
         gx = float(np.clip(pose["x"] - dist * math.sin(theta), *WORLD_X_LIMIT))
         gz = float(np.clip(pose["z"] - dist * math.cos(theta), *WORLD_Z_LIMIT))
+        self._manual_held.clear()
         with self.st.lock:
             self.st.mode = "point"
             self.st.world_goal = (gx, gz)
@@ -738,6 +774,7 @@ class App:
         if home is None:
             self.status.configure(text="no earth/pose yet — is habitat_sim_node running?")
             return
+        self._manual_held.clear()
         with self.st.lock:
             self.st.mode = "point"
             self.st.world_goal = home
@@ -747,15 +784,43 @@ class App:
 
     def reset_rover(self):
         self.pubs["reset"].put(serialize_string(""))
+        self._manual_held.clear()
         with self.st.lock:
             self.st.stopped = True
             self.st.world_goal = None
             self.st.last_cmd = (0.0, 0.0)
 
     def stop(self):
+        self._manual_held.clear()
         with self.st.lock:
             self.st.stopped = True
             self.st.last_cmd = (0.0, 0.0)
+
+    # ---------------- manual drive ---------------- #
+    def manual_press(self, direction: str):
+        self._manual_held.add(direction)
+        self._manual_update()
+
+    def manual_release(self, direction: str):
+        self._manual_held.discard(direction)
+        self._manual_update()
+
+    def _manual_update(self):
+        with self.st.lock:
+            lin = 0.0
+            ang = 0.0
+            if "fwd" in self._manual_held:
+                lin += self.st.max_linear
+            if "back" in self._manual_held:
+                lin -= 0.5 * self.st.max_linear
+            if "left" in self._manual_held:
+                ang += self.st.max_angular
+            if "right" in self._manual_held:
+                ang -= self.st.max_angular
+            self.st.mode = "manual"
+            self.st.stopped = False
+            self.st.goal_reached = False
+            self.st.last_cmd = (lin, ang)
 
     def on_close(self):
         self.closed = True
@@ -820,6 +885,8 @@ class App:
         if mode == "point" and world_goal is not None and pose is not None:
             dist = math.hypot(world_goal[0] - pose["x"], world_goal[1] - pose["z"])
             goal_txt = f"point ({world_goal[0]:.1f}, {world_goal[1]:.1f})  dist {dist:.2f}m"
+        elif mode == "manual":
+            goal_txt = "manual drive"
         else:
             goal_txt = f"'{target}'"
         fwd = f"   fwd-clear {min_fwd:.2f}m" if np.isfinite(min_fwd) else ""
@@ -836,7 +903,7 @@ def main():
     ap.add_argument("--fov", type=float, default=90.0)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--max-linear", type=float, default=0.5)
-    ap.add_argument("--max-angular", type=float, default=0.6)
+    ap.add_argument("--max-angular", type=float, default=0.4)
     ap.add_argument("--invert-angular", action="store_true")
     ap.add_argument("--belief-confidence-min", type=float, default=BELIEF_CONFIDENCE_MIN,
                      help="target-out-of-view belief confidence floor below which the rover "
@@ -853,7 +920,7 @@ def main():
         horizontal_fov_deg=args.fov,
         max_linear=args.max_linear,
         max_angular=args.max_angular,
-        search_angular=min(0.3, args.max_angular),
+        search_angular=min(0.15, args.max_angular),
         invert_angular=args.invert_angular,
         guard=GuardConfig(max_climb_deg=args.max_climb_deg),
     ), belief_confidence_min=args.belief_confidence_min)
@@ -862,6 +929,8 @@ def main():
     print("[INFO] zenoh session opened")
 
     st = SharedState(args.target)
+    st.max_linear = args.max_linear
+    st.max_angular = args.max_angular
     _subs, pubs = zenoh_setup(session, st)
     running = {"on": True}
 

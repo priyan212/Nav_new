@@ -54,7 +54,7 @@ from nav_pipeline.zenoh_node import (  # noqa: E402
     serialize_twist,
 )
 
-PRESETS = ["trash bin", "cardboard box", "wooden pallet", "forklift", "door", "chair"]
+PRESETS = ["trash bin", "cardboard box", "wooden pallet", "door", "chair"]
 HEARTBEAT_PERIOD_S = 0.15
 DEPTH_STALE_S = 1.0
 
@@ -66,10 +66,13 @@ class SharedState:
         self.latest_depth: Optional[np.ndarray] = None
         self.latest_depth_t = 0.0
         self.frame_count = 0
+        self.mode = "text"                      # "text" | "manual"
         self.target = target
         self.stopped = False
         self.goal_reached = False
         self.last_cmd = (0.0, 0.0)
+        self.max_linear = 0.5                   # manual-drive caps; set from CLI args in main()
+        self.max_angular = 0.6
         # for display
         self.display_rgb: Optional[np.ndarray] = None
         self.detection = None
@@ -141,10 +144,25 @@ def inference_loop(pipe: DinoNavDPPipeline, st: SharedState, pubs, running,
             rgb = st.latest_rgb
             depth = st.latest_depth
             depth_age = time.time() - st.latest_depth_t
+            mode = st.mode
             target = st.target
             paused = st.stopped or st.goal_reached
         if rgb is None:
             time.sleep(0.1)
+            continue
+        if mode == "manual":
+            # bypass detection/NavDP entirely -- last_cmd is set directly by
+            # the GUI's manual-drive button/key handlers; this loop only
+            # keeps the camera preview and status text current, and still
+            # honors STOP as an emergency zero
+            with st.lock:
+                if st.stopped:
+                    st.last_cmd = (0.0, 0.0)
+                lin, ang = st.last_cmd
+                st.display_rgb = rgb
+                st.state_text = "MANUAL (stopped)" if st.stopped else "MANUAL DRIVE"
+                st.vel_text = f"lin {lin:.3f}  ang {ang:+.3f}"
+            time.sleep(0.05)
             continue
         if paused:
             with st.lock:
@@ -248,6 +266,24 @@ class App:
         for p in PRESETS:
             ttk.Button(presets, text=p, command=lambda t=p: self.send_target(t)).pack(side="left", padx=2)
 
+        # Manual drive: hold a button (or an arrow key, once the window has
+        # focus) to drive directly, bypassing detection/NavDP entirely.
+        # Releasing zeros that axis; it does NOT hand control back to
+        # whatever autonomous target was running before -- send a target
+        # for that. STOP still works as usual.
+        self._manual_held: set = set()
+        drive = ttk.Frame(main)
+        drive.grid(row=3, column=0, columnspan=2, sticky="w", pady=2)
+        ttk.Label(drive, text="Manual drive (hold, or arrow keys):").pack(side="left")
+        for label, direction in (("◄", "left"), ("▲", "fwd"), ("▼", "back"), ("►", "right")):
+            b = ttk.Button(drive, text=label, width=3)
+            b.bind("<ButtonPress-1>", lambda e, d=direction: self.manual_press(d))
+            b.bind("<ButtonRelease-1>", lambda e, d=direction: self.manual_release(d))
+            b.pack(side="left", padx=2)
+        for key, direction in (("Up", "fwd"), ("Down", "back"), ("Left", "left"), ("Right", "right")):
+            root.bind(f"<KeyPress-{key}>", lambda e, d=direction: self.manual_press(d))
+            root.bind(f"<KeyRelease-{key}>", lambda e, d=direction: self.manual_release(d))
+
         # Fixed character width on the two dynamic-text rows: their content
         # (state name, counters, latency numbers) changes length on every
         # refresh tick, and an unconstrained Label makes the whole window
@@ -256,9 +292,9 @@ class App:
         # back below it.
         self.status = ttk.Label(main, text="starting...", font=("TkDefaultFont", 11, "bold"),
                                  width=100, anchor="w")
-        self.status.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.status.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
         self.info = ttk.Label(main, text="", width=100, anchor="w")
-        self.info.grid(row=4, column=0, columnspan=2, sticky="w")
+        self.info.grid(row=5, column=0, columnspan=2, sticky="w")
 
         self._photo = None
         self.root.after(66, self.refresh)
@@ -270,15 +306,44 @@ class App:
         if text is not None:
             self.entry.delete(0, "end")
             self.entry.insert(0, t)
+        self._manual_held.clear()
         with self.st.lock:
+            self.st.mode = "text"
             self.st.target = t
             self.st.stopped = False
             self.st.goal_reached = False
 
     def stop(self):
+        self._manual_held.clear()
         with self.st.lock:
             self.st.stopped = True
             self.st.last_cmd = (0.0, 0.0)
+
+    # ---------------- manual drive ---------------- #
+    def manual_press(self, direction: str):
+        self._manual_held.add(direction)
+        self._manual_update()
+
+    def manual_release(self, direction: str):
+        self._manual_held.discard(direction)
+        self._manual_update()
+
+    def _manual_update(self):
+        with self.st.lock:
+            lin = 0.0
+            ang = 0.0
+            if "fwd" in self._manual_held:
+                lin += self.st.max_linear
+            if "back" in self._manual_held:
+                lin -= 0.5 * self.st.max_linear
+            if "left" in self._manual_held:
+                ang += self.st.max_angular
+            if "right" in self._manual_held:
+                ang -= self.st.max_angular
+            self.st.mode = "manual"
+            self.st.stopped = False
+            self.st.goal_reached = False
+            self.st.last_cmd = (lin, ang)
 
     def on_close(self):
         self.closed = True
@@ -296,6 +361,7 @@ class App:
             obstacles, min_fwd = self.st.obstacles, self.st.min_forward
             state_text, vel_text, lat = self.st.state_text, self.st.vel_text, self.st.lat_text
             frames, infers, target = self.st.frame_count, self.st.infer_count, self.st.target
+            drive_mode = self.st.mode
             stopped = self.st.stopped
 
         if rgb is not None:
@@ -337,9 +403,10 @@ class App:
             gx, gy = to_px(goal[0], goal[1])
             self.plot.create_text(gx, gy, text="★", fill="#d4a017", font=("TkDefaultFont", 22))
 
-        mode = "STOPPED" if stopped else state_text
+        mode_txt = "STOPPED" if stopped else state_text
+        target_txt = "manual drive" if drive_mode == "manual" else f"'{target}'"
         fwd = f"   fwd-clear {min_fwd:.2f}m" if np.isfinite(min_fwd) else ""
-        self.status.configure(text=f"[{mode}]  target: '{target}'   {vel_text}{fwd}")
+        self.status.configure(text=f"[{mode_txt}]  target: {target_txt}   {vel_text}{fwd}")
         self.info.configure(text=f"frames {frames}   inferences {infers}   {lat}")
         self.root.after(66, self.refresh)
 
@@ -353,7 +420,7 @@ def main():
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--max-linear", type=float, default=0.5,
                     help="m/s cap (sim default; use 0.15 on the real rover)")
-    ap.add_argument("--max-angular", type=float, default=0.6,
+    ap.add_argument("--max-angular", type=float, default=0.4,
                     help="rad/s cap (sim default; use 0.25 on the real rover)")
     ap.add_argument("--invert-angular", action="store_true",
                     help="flip turn direction (use if the rover steers away from the target)")
@@ -367,7 +434,7 @@ def main():
         horizontal_fov_deg=args.fov,
         max_linear=args.max_linear,
         max_angular=args.max_angular,
-        search_angular=min(0.3, args.max_angular),
+        search_angular=min(0.15, args.max_angular),
         invert_angular=args.invert_angular,
     ))
 
@@ -378,6 +445,8 @@ def main():
     print("[INFO] zenoh session opened")
 
     st = SharedState(args.target)
+    st.max_linear = args.max_linear
+    st.max_angular = args.max_angular
     _subs, pubs = zenoh_setup(session, st, compressed_only=args.compressed_only)
     running = {"on": True}
 

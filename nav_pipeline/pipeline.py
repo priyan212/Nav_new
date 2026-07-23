@@ -89,13 +89,13 @@ class PipelineConfig:
     avoid_bias_gain: float = 0.15    # rad/s added toward the escape side during the cooldown window
     # SAM 2.1 segmentation layer (DINO bbox -> instance mask -> goal)
     use_sam: bool = True
-    mask_stop_frac: float = 0.30     # mask area fraction of image -> stop
+    mask_stop_frac: float = 0.20     # mask area fraction of image -> stop
     # goal / stopping
     stop_distance: float = 0.8       # meters from object at which to stop
     bbox_stop_frac: float = 0.55     # bbox height fraction of image -> stop (no-SAM fallback)
     detect_score_min: float = 0.3
     # target loss behavior
-    search_angular: float = 0.2      # spin to re-acquire when target not seen
+    search_angular: float = 0.15     # spin to re-acquire when target not seen
     lost_patience: int = 5           # frames to keep last goal before searching
 
 
