@@ -12,9 +12,10 @@ way. No LiDAR, no wheel odometry, a single RGB camera. The whole stack
 (detection, depth, driving policy) runs in **≈1.3 GB of GPU memory**, about
 1/13th of the full InternVLA-N1 dual-system it was distilled from.
 
-It runs unmodified against three different bodies — the real rover, an Isaac
-Sim digital twin, and a Habitat-Sim Mars yard — because every one of them
-speaks the same Zenoh/ROS 2 wire contract described below.
+It runs unmodified against four different bodies — the real rover, an Isaac
+Sim digital twin, a Habitat-Sim Mars yard, and a Habitat-Sim real-world
+photogrammetry scan — because every one of them speaks the same Zenoh/ROS 2
+wire contract described below.
 
 ## How a frame becomes a motor command
 
@@ -52,9 +53,9 @@ trusting either one blindly) is what makes the combination reliable. See
 → rotate to re-acquire) → `AVOID` (obstacle inside the hard-stop corridor →
 stop + escape turn) → `STOP` (goal close enough, or its mask fills the view).
 
-## The three worlds it runs in
+## The four worlds it runs in
 
-The same `nav_pipeline` code drives all three — only the transport peer and
+The same `nav_pipeline` code drives all four — only the transport peer and
 the speed caps change:
 
 | Target | Launcher | Camera/depth source | Notes |
@@ -62,9 +63,10 @@ the speed caps change:
 | **Real rover** (6WD, ESP32 + micro-ROS) | `./launch_rover.sh` | Pi camera (compressed JPEG only — raw RGB saturates the rover's Wi-Fi) | Brings the Pi's systemd services up, waits for camera + ESP32 heartbeat, then starts the GUI at real-world speed caps |
 | **Isaac Sim** digital twin | `./launch_gui.sh` | Isaac's simulated camera + depth over Zenoh | Needs the Isaac scene playing and its ROS 2 bridge scripts running first (see script header) |
 | **Mars habitat sim** (Habitat-Sim, ERC Marsyard terrain) | `./MARS/launch_mars.sh --rocks` | Habitat's simulated camera + perfect depth | Separate `mars_habitat` conda env for the sim node; see [MARS/README.md](MARS/README.md) |
+| **Earth habitat sim** (Habitat-Sim, real-world photogrammetry scan) | `./EARTH/launch_earth.sh` | Habitat's simulated camera + perfect depth | Same `mars_habitat` conda env, a Sketchfab scan instead of generated terrain; see [EARTH/README.md](EARTH/README.md) |
 
-All three publish/subscribe the identical Zenoh topics, so a policy change in
-`nav_pipeline/` is tested once offline, once in Isaac or Mars, then run on
+All four publish/subscribe the identical Zenoh topics, so a policy change in
+`nav_pipeline/` is tested once offline, once in Isaac/Mars/Earth, then run on
 the real rover with nothing else touched.
 
 ## Repo layout
@@ -80,7 +82,8 @@ Nav_new/
 ├── third_party/InternNav/  vendored InternNav source (checkpoints symlinked in)
 ├── esp32/                rover firmware + Pi-side serial/handshake helpers
 ├── MARS/                 Habitat-Sim Mars sub-project (own README)
-└── launch_*.sh           one-command entry points for each of the 3 worlds
+├── EARTH/                Habitat-Sim real-world photogrammetry sub-project (own README)
+└── launch_*.sh           one-command entry points for each of the 4 worlds
 ```
 
 ### `nav_pipeline/` — the package
@@ -132,6 +135,16 @@ A self-contained sub-project: a Habitat-Sim recreation of the ERC Marsyard
 mesh) used to stress-test the same nav stack with GPS-quality ground truth
 and a rock obstacle field. Full detail in [MARS/README.md](MARS/README.md).
 
+### `EARTH/`
+
+A second self-contained Habitat-Sim sub-project, sharing MARS's conda env
+and node/GUI pattern but loading a real-world Sketchfab photogrammetry scan
+("Indian Bend and Pima", Scottsdale AZ — a construction/retail-intersection
+site) instead of generated terrain. Needs its own Y-up→Z-up axis fix (the
+opposite gotcha from MARS's hand-built Z-up mesh) and a generated sky dome,
+since the scan ships with no lights. Full detail in
+[EARTH/README.md](EARTH/README.md).
+
 ## Running it
 
 ```bash
@@ -143,6 +156,9 @@ and a rock obstacle field. Full detail in [MARS/README.md](MARS/README.md).
 
 # Mars habitat sim (spins up both the sim node and the GUI for you)
 ./MARS/launch_mars.sh --rocks
+
+# Earth habitat sim (real-world photogrammetry scan, same conda env as Mars)
+./EARTH/launch_earth.sh --target "target sign"
 
 # Headless node only (no GUI), auto-discovers the rover/Isaac peer
 ./launch_dino_navdp.sh --target "trash bin"
