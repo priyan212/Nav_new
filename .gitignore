@@ -1,6 +1,6 @@
 # Nested repos (already independently version-controlled)
-MARS/habitat-lab/
-MARS/mars-habitatsim/
+#MARS/habitat-lab/
+#MARS/mars-habitatsim/
 
 # Vendored third-party project
 third_party/InternNav/
