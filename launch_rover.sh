@@ -9,13 +9,13 @@
 #  top-down trajectory/obstacle plot — with real-rover speed caps.
 #
 #  Examples:
-#    ./launch_rover.sh                          # default Pi IP (10.83.108.125)
-#    ./launch_rover.sh 10.83.108.125 --target "trash bin"
+#    ./launch_rover.sh                          # default Pi IP (192.168.36.125)
+#    ./launch_rover.sh 192.168.36.125 --target "trash bin"
 # ============================================================
 set -uo pipefail
 cd "$(dirname "$0")"
 
-PI_IP=${1:-10.83.108.125}; shift 2>/dev/null || true
+PI_IP=${1:-192.168.36.125}; shift 2>/dev/null || true
 PI_USER=pi
 PI_PASS=${PI_PASS:-hri}
 SSH="sshpass -p $PI_PASS ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no $PI_USER@$PI_IP"
