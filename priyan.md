@@ -22,6 +22,14 @@ cd /mnt/bigdisk/Priyan/Nav_new
 ##  MARS (Habitat sim)
 
 ```bash
+cd /mnt/bigdisk/Priyan/Nav_new/MARS
 ./launch_mars.sh
 ./launch_mars.sh --belief-only --rocks
+```
+
+# Earth habitat sim (real-world photogrammetry scan, same conda env as Mars)
+
+```
+./EARTH/launch_earth.sh
+
 ```
