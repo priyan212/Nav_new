@@ -30,6 +30,7 @@ cd /mnt/bigdisk/Priyan/Nav_new/MARS
 # Earth habitat sim (real-world photogrammetry scan, same conda env as Mars)
 
 ```
+cd /mnt/bigdisk/Priyan/Nav_new
 ./EARTH/launch_earth.sh
 
 ```

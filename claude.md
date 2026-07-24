@@ -1,1 +1,2 @@
-Collect all images in "/mnt/bigdisk/Priyan/Nav_new/data" folder , even the one claude is testing for.We need them to prepare reports
+Collect all images in "/mnt/bigdisk/Priyan/Nav_new/data" folder , even the one claude is testing for.We need them to prepare reports.
+Also before edidting any code, make sure it doesnt introduces any bugs , or breaks some other logic in other file.

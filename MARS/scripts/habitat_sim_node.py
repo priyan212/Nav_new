@@ -189,19 +189,33 @@ def ground_height(sim, x: float, z: float):
 
 
 class RoverAgent:
+    # Real rover footprint ~0.482 x 0.380 m (see nav_pipeline guard) -- these
+    # are the front/back and left/right raycast offsets used to estimate the
+    # ground slope under the chassis (approx. wheel-contact points).
+    WHEELBASE = 0.42
+    TRACK = 0.34
+    SUSPENSION_TAU = 0.25   # s, low-pass time constant for slope-driven pitch/roll/bounce
+    VIB_TAU = 0.07          # s, time constant for the high-freq vibration component
+    VIB_DEG = 1.2           # deg, vibration amplitude at full speed
+    VIB_M = 0.010           # m, vertical vibration amplitude at full speed
+    MAX_TILT = math.radians(12)   # clamp so a degenerate/edge raycast can't flip the camera
+
     def __init__(self, sim, x: float, z: float, yaw: float):
         self.sim = sim
         self.agent = sim.get_agent(0)
         self.lock = Lock()
         self.cmd = (0.0, 0.0)
         self.cmd_t = 0.0
+        self._rng = np.random.default_rng()
         self.reset(x, z, yaw)
 
     def reset(self, x: float, z: float, yaw: float):
         with self.lock:
             self.x, self.z, self.yaw = x, z, yaw
             self.cmd = (0.0, 0.0)
-        self._apply()
+        self._pitch, self._roll, self._bounce = self._raw_shake_target()
+        self._vib_p = self._vib_r = self._vib_y = 0.0
+        self._apply(dt=0.1)
 
     def set_cmd(self, lin: float, ang: float):
         with self.lock:
@@ -219,16 +233,64 @@ class RoverAgent:
         fx, fz = -math.sin(self.yaw), -math.cos(self.yaw)   # yaw=0 faces -Z
         self.x = float(np.clip(self.x + lin * fx * dt, -YARD_LIMIT, YARD_LIMIT))
         self.z = float(np.clip(self.z + lin * fz * dt, -YARD_LIMIT, YARD_LIMIT))
-        self._apply()
+        self._apply(dt)
 
-    def _apply(self):
-        y = ground_height(self.sim, self.x, self.z)
-        if y is None:
-            y = getattr(self, "_last_y", 0.0)
+    def _raw_shake_target(self):
+        """Instantaneous (unfiltered) pitch/roll/bounce from the ground under
+        the chassis, sampled at the four wheel-contact points + center."""
+        fx, fz = -math.sin(self.yaw), -math.cos(self.yaw)   # forward
+        rx, rz = fz, -fx                                     # rover-right
+        hb, ht = self.WHEELBASE / 2.0, self.TRACK / 2.0
+        y_c = ground_height(self.sim, self.x, self.z)
+        fallback = y_c if y_c is not None else getattr(self, "_last_y", 0.0)
+        y_f = ground_height(self.sim, self.x + fx * hb, self.z + fz * hb)
+        y_b = ground_height(self.sim, self.x - fx * hb, self.z - fz * hb)
+        y_r = ground_height(self.sim, self.x + rx * ht, self.z + rz * ht)
+        y_l = ground_height(self.sim, self.x - rx * ht, self.z - rz * ht)
+        y_c, y_f, y_b, y_r, y_l = (v if v is not None else fallback
+                                   for v in (y_c, y_f, y_b, y_r, y_l))
+
+        # positive pitch = nose/camera tilts up (climbing); positive roll = right side down
+        pitch = np.clip(math.atan2(y_f - y_b, self.WHEELBASE), -self.MAX_TILT, self.MAX_TILT)
+        roll = np.clip(math.atan2(y_l - y_r, self.TRACK), -self.MAX_TILT, self.MAX_TILT)
+        bounce = (y_c + y_f + y_b + y_r + y_l) / 5.0
+        return pitch, roll, bounce
+
+    def _terrain_shake(self, dt: float):
+        """Camera-only pitch/roll/bounce from the ground under the chassis
+        (suspension-style low-pass) plus a small speed-scaled vibration --
+        mimics the real rover's camera shake over uneven terrain, which a
+        single ground-point + pure-yaw pose can't reproduce. Does not touch
+        self.x/z/yaw, so pose_json()/nav logic stays on the clean GT track."""
+        target_pitch, target_roll, target_bounce = self._raw_shake_target()
+
+        a = min(1.0, dt / self.SUSPENSION_TAU)
+        self._pitch += (target_pitch - self._pitch) * a
+        self._roll += (target_roll - self._roll) * a
+        self._bounce += (target_bounce - self._bounce) * a
+
+        with self.lock:
+            lin, ang = self.cmd
+        speed = min(1.0, abs(lin) / 0.3 + abs(ang) / 0.6)   # normalized vs. typical sim caps
+        b = min(1.0, dt / self.VIB_TAU)
+        self._vib_p += (self._rng.normal(0.0, speed) - self._vib_p) * b
+        self._vib_r += (self._rng.normal(0.0, speed) - self._vib_r) * b
+        self._vib_y += (self._rng.normal(0.0, speed) - self._vib_y) * b
+
+        pitch = self._pitch + self._vib_p * math.radians(self.VIB_DEG)
+        roll = self._roll + self._vib_r * math.radians(self.VIB_DEG)
+        y = self._bounce + self._vib_y * self.VIB_M
+        return y, pitch, roll
+
+    def _apply(self, dt: float = 0.1):
+        y, pitch, roll = self._terrain_shake(dt)
         self._last_y = y
+        q_yaw = np.quaternion(math.cos(self.yaw / 2), 0, math.sin(self.yaw / 2), 0)
+        q_pitch = np.quaternion(math.cos(pitch / 2), math.sin(pitch / 2), 0, 0)
+        q_roll = np.quaternion(math.cos(roll / 2), 0, 0, math.sin(roll / 2))
         state = habitat_sim.AgentState()
         state.position = np.array([self.x, y, self.z], dtype=np.float32)
-        state.rotation = np.quaternion(math.cos(self.yaw / 2), 0, math.sin(self.yaw / 2), 0)
+        state.rotation = q_yaw * q_pitch * q_roll
         self.agent.set_state(state, reset_sensors=False)
 
     def pose_json(self) -> str:
