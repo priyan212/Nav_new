@@ -7,6 +7,7 @@ checkpoints/
 *.ckpt
 *.pth
 *.pt
+!MARS/mars-habitatsim/navdp/belief_adapter.pt
 
 # Training run artifacts
 navdp-cross-modal/
