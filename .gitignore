@@ -1,7 +1,3 @@
-# Nested repos (already independently version-controlled)
-#MARS/habitat-lab/
-#MARS/mars-habitatsim/
-
 # Vendored third-party project
 third_party/InternNav/
 
@@ -10,6 +6,7 @@ third_party/InternNav/
 checkpoints/
 *.ckpt
 *.pth
+*.pt
 
 # Training run artifacts
 navdp-cross-modal/
