@@ -392,7 +392,7 @@ class DinoNavDPZenohNode:
 
         t0 = time.time()
         try:
-            res = self.pipe.step(rgb, self.target, depth=depth)
+            res = self.pipe.step(rgb, self.target, depth=depth, pose=(self.odom.x, self.odom.y, self.odom.theta))
         except Exception as e:
             print(f"[ERROR] pipeline step failed: {e}")
             self.publish_cmd(0.0, 0.0)

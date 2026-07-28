@@ -373,8 +373,14 @@ class DinoNavDPPipeline:
         return float(linear), float(angular)
 
     # ------------------------------------------------------------------ #
-    def step(self, rgb: np.ndarray, target_text: str, depth: Optional[np.ndarray] = None) -> StepResult:
-        res = self._step_inner(rgb, target_text, depth)
+    def step(self, rgb: np.ndarray, target_text: str, depth: Optional[np.ndarray] = None,
+             pose: Optional[tuple] = None) -> StepResult:
+        """pose, if given: (x, y, theta) odometry at capture time -- stamped onto
+        this tick's scene_log entry (see PipelineConfig.use_scene_tagger). Note
+        OdometryLogger resets to (0,0,0) at the start of every goal, so poses
+        from different goals are in different local frames, not one global map.
+        """
+        res = self._step_inner(rgb, target_text, depth, pose)
         # stiction floor is now baked into bearing_to_angular's smooth ramp
         # for TRACK; AVOID commands max_angular directly and SEARCH's
         # search_angular is already comfortably above ang_min_cmd, so
@@ -394,7 +400,8 @@ class DinoNavDPPipeline:
         self._prev_cmd = (res.linear, res.angular)
         return res
 
-    def _step_inner(self, rgb: np.ndarray, target_text: str, depth: Optional[np.ndarray] = None) -> StepResult:
+    def _step_inner(self, rgb: np.ndarray, target_text: str, depth: Optional[np.ndarray] = None,
+                     pose: Optional[tuple] = None) -> StepResult:
         res = StepResult()
         H, W = rgb.shape[:2]
         timing = {}
@@ -417,10 +424,13 @@ class DinoNavDPPipeline:
                 objects = self.scene_tagger.tag(rgb)
                 timing["scene_tag"] = time.time() - t0
                 entry = {"t": now, "objects": objects}
+                if pose is not None:
+                    entry["pose"] = {"x": float(pose[0]), "y": float(pose[1]), "theta": float(pose[2])}
                 self.scene_log.append(entry)
                 self._last_tag_t = now
                 summary = ", ".join(f"{k}:{v}" for k, v in sorted(objects.items())) or "(nothing detected)"
-                print(f"[scene] {time.strftime('%H:%M:%S', time.localtime(now))}  {summary}")
+                pose_txt = f"  pose=({pose[0]:.2f}, {pose[1]:.2f}, {pose[2]:+.2f})" if pose is not None else ""
+                print(f"[scene] {time.strftime('%H:%M:%S', time.localtime(now))}  {summary}{pose_txt}")
                 if self._scene_log_file is not None:
                     self._scene_log_file.write(json.dumps(entry) + "\n")
                     self._scene_log_file.flush()

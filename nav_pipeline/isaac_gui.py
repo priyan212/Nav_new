@@ -205,7 +205,8 @@ def inference_loop(pipe: DinoNavDPPipeline, st: SharedState, pubs, running,
             depth = None
 
         try:
-            res = pipe.step(rgb, target, depth=depth)
+            pose = (odom.x, odom.y, odom.theta) if odom is not None else None
+            res = pipe.step(rgb, target, depth=depth, pose=pose)
         except Exception as e:
             print(f"[ERROR] pipeline step: {e}")
             with st.lock:
