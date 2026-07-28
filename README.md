@@ -8,9 +8,12 @@ If you need any help contact through GitHub: priyan212
 
 Point a 6-wheeled rover at anything you can name — "trash bin", "red chair",
 "boulder" — and it drives there on its own, swerving around whatever's in the
-way. No LiDAR, no wheel odometry, a single RGB camera. The whole stack
-(detection, depth, driving policy) runs in **≈1.3 GB of GPU memory**, about
-1/13th of the full InternVLA-N1 dual-system it was distilled from.
+way. No LiDAR, a single RGB camera for perception — the only other sensing
+is the ESP32's signed wheel-encoder RPM feed (`/rover/rpm`), which the GPU
+side dead-reckons into a logged pose for diagnostics/safety (see
+[Odometry logging](#odometry-logging)), not for navigation itself. The whole
+stack (detection, depth, driving policy) runs in **≈1.3 GB of GPU memory**,
+about 1/13th of the full InternVLA-N1 dual-system it was distilled from.
 
 It runs unmodified against four different bodies — the real rover, an Isaac
 Sim digital twin, a Habitat-Sim Mars yard, and a Habitat-Sim real-world
@@ -20,8 +23,10 @@ wire contract described below.
 ## How a frame becomes a motor command
 
 ```
-camera RGB ──► Grounding DINO ──► bbox ──► SAM 2.1 small ──► instance mask
-    │                                                          │
+camera RGB ──► Grounding DINO ──► bbox ──► SAM 2.1 small ──► instance mask ──► CLIP
+    │                                        (throttled ~1 Hz;         crop vs. target text;
+    │                                    cached mask reused           below threshold ->
+    │                                    between refreshes)            treated as no detection
     │                      mask centroid + mask-median depth + intrinsics
     ▼                                                          ▼
 depth (sensor, or Depth Anything V2 ─────────────► 3D point goal (robot frame)
@@ -49,9 +54,47 @@ together with a goal-progress + safety-critic selection layer (rather than
 trusting either one blindly) is what makes the combination reliable. See
 `nav_pipeline/pipeline.py` for the exact per-frame logic.
 
+**SAM+CLIP verification:** SAM re-segments the DINO box at most once per
+second (`PipelineConfig.sam_period_s`) — the mask is cached and reused on
+ticks in between, as long as the current DINO box still overlaps the one SAM
+last saw. Every fresh SAM pass is paired with a CLIP check: the masked crop
+is scored against the target phrase (softmax vs. generic "background/wall"
+negatives), and a crop scoring below `clip_min_similarity` is rejected —
+treated as no detection that tick — instead of letting the rover commit to a
+confident DINO false positive.
+
 **State machine:** `TRACK` (target detected → drive) → `SEARCH` (target lost
 → rotate to re-acquire) → `AVOID` (obstacle inside the hard-stop corridor →
 stop + escape turn) → `STOP` (goal close enough, or its mask fills the view).
+
+## Odometry logging
+
+The real rover has no LiDAR and no dedicated odometry node, but the ESP32
+firmware (`esp32/rover_6wd_complete.ino`) does have real quadrature encoders
+on the mid wheel of each side, publishing signed L/R RPM on `/rover/rpm` (10
+Hz, +ve = drives forward). `nav_pipeline/odometry_logger.py` dead-reckons
+that into a differential-drive pose (x, y, θ) and appends a CSV row per
+sample — no GPS/SLAM involved, so it drifts over long runs, but it's good
+enough for per-attempt diagnostics.
+
+- **One file per goal, not per run.** Every time the target text changes
+  (GUI Send/preset button, or a new `omnivla/goal_text` message), the logger
+  closes the current file and starts a fresh one — `odometry_log/odom_
+  <slugified-target>_<timestamp>.csv` — resetting x/y/θ back to the origin,
+  so each file is a self-contained record of "how did the rover move while
+  pursuing this specific goal."
+- **Spin-stall watchdog** (`isaac_gui.py`): a generic, multi-instance target
+  (e.g. "chair" in a room full of chairs) can make Grounding DINO's
+  re-acquire-on-loss hop between different physical objects each time the
+  tracked one scrolls out of frame — the rover keeps turning the same way
+  chasing "whichever one is in view now" without ever closing distance on
+  any of them. If the dead-reckoned pose racks up more than a full rotation
+  within 15 s (`SPIN_WINDOW_S`) while translating less than 0.3 m
+  (`SPIN_DIST_THRESH_M`), the GUI force-stops and shows `SPIN STALL` instead
+  of spinning indefinitely — latched until a new target is sent. Caught a
+  real ~145 s / 17-turn incident during testing; see the CSV history for how
+  to recognize the signature (θ monotonically running away while x, y barely
+  move).
 
 ## The four worlds it runs in
 
@@ -78,6 +121,7 @@ Nav_new/
 ├── scripts/              offline tests, diagnostics, Pi provisioning
 ├── configs/               yaml configs (isaac / real rover)
 ├── data/                 saved test frames + pipeline output snapshots
+├── odometry_log/         dead-reckoned pose CSVs, one per goal (own README)
 ├── reference/            prior OmniVLA/InternVLA-N1 nodes, kept for reference
 ├── third_party/InternNav/  vendored InternNav source (checkpoints symlinked in)
 ├── esp32/                rover firmware + Pi-side serial/handshake helpers
@@ -89,12 +133,14 @@ Nav_new/
 ### `nav_pipeline/` — the package
 
 - `dino_detector.py` — Grounding DINO wrapper (`IDEA-Research/grounding-dino-base`, local HF cache)
-- `sam_segmenter.py` — SAM 2.1 hiera-small, box-prompted → instance mask
+- `sam_segmenter.py` — SAM 2.1 hiera-small, box-prompted → instance mask, throttled ~1 Hz (`PipelineConfig.sam_period_s`)
+- `clip_verifier.py` — CLIP (`openai/clip-vit-base-patch32`) scores the SAM crop against the target phrase; below-threshold crops are rejected as false positives (paired 1:1 with each SAM refresh)
 - `obstacle_guard.py` — depth → obstacle points, footprint-swept trajectory clearance veto, forward hard-stop corridor
 - `navdp_crossmodal.py` — wrapper for the official standalone NavDP checkpoint (**default policy**)
 - `navdp_net.py`, `navdp_backbone.py`, `depth_anything/` — standalone/extracted NavDP + Depth Anything V2, vendored from InternNav with imports fixed (InternNav's own package breaks under this repo's transformers version)
 - `depth_estimator.py` — Depth Anything V2 metric monocular depth for the RGB-only real rover
 - `goal_utils.py` — preprocessing + bbox→3D-goal math
+- `odometry_logger.py` — dead-reckons `/rover/rpm` (real wheel-encoder RPM) into a pose, one CSV per goal under `odometry_log/`; also backs the GUI's spin-stall watchdog (see [Odometry logging](#odometry-logging))
 - `pipeline.py` — the full perception→policy step, state machine, trajectory selection (the diagram above, as code)
 - `isaac_gui.py` — the control panel: camera + mask/bbox overlay, top-down trajectories + obstacles, live target entry
 - `zenoh_node.py` — headless transport node, same Zenoh/CDR contract as the old OmniVLA node
@@ -124,9 +170,12 @@ where noted:
 ### `esp32/`
 
 Micro-ROS firmware for the 6-wheel differential drive base
-(`rover_6wd_complete.ino`, subscribes `/cmd_vel`, publishes `/rover/rpm`),
-plus Pi-side helpers (`rover_handshake_manager.py`, `serial_bridge.py`) for
-talking to the ESP32 over `/dev/ttyUSB0`.
+(`rover_6wd_complete.ino`, subscribes `/cmd_vel`, publishes `/rover/rpm` —
+signed L/R wheel RPM from the real quadrature encoders on each side's mid
+wheel, 10 Hz, consumed by `nav_pipeline/odometry_logger.py`; `WHEEL_RADIUS_M`
+/ `TRACK_WIDTH_M` must stay in sync between the two), plus Pi-side helpers
+(`rover_handshake_manager.py`, `serial_bridge.py`) for talking to the ESP32
+over `/dev/ttyUSB0`.
 
 ### `MARS/`
 
@@ -172,10 +221,12 @@ Only ever run **one** controller against a given peer at a time
 (`isaac_gui.py`, `mars_gui.py`, `zenoh_node.py` all publish `cmd_vel` and will
 fight each other for it).
 
-### Zenoh transport contract (unchanged from the OmniVLA project this was distilled from)
+### Zenoh transport contract (mostly unchanged from the OmniVLA project this was distilled from)
 
 - **in:** `image_raw` / `rt/image_raw` / `rover_camera` (+ `/compressed`),
-  optional `depth_raw` (32FC1 metres or 16UC1 millimetres), `omnivla/goal_text`
+  optional `depth_raw` (32FC1 metres or 16UC1 millimetres), `omnivla/goal_text`,
+  `rover/rpm` / `rt/rover/rpm` (`std_msgs/Float32MultiArray [left_rpm,
+  right_rpm]`, real rover only — logged, not used for control)
 - **out:** `cmd_vel` (Twist), `omnivla/explanation`, `omnivla/waypoints` (`nav_msgs/Path`)
 
 All CDR-encoded ROS 2 messages, so any of the three worlds — or a brand new
@@ -219,3 +270,7 @@ bbox-size thresholds) — neither checkpoint learned to stop on its own.
   velocity if it doesn't hear from the node within ~500 ms.
 - `navdp-cross-modal/` (an unzipped copy of the `.ckpt` torch archive) is
   redundant with `navdp-cross-modal.ckpt` and can be deleted to save ~540 MB.
+- CLIP (`openai/clip-vit-base-patch32`, ~600 MB, downloaded once into
+  `HF_HOME` on first run) is loaded with `use_safetensors=True` —
+  `transformers` refuses `torch.load`-based checkpoint loading below torch
+  2.6, which this env (torch 2.5.1) is under.

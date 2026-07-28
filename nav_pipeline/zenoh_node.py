@@ -46,6 +46,7 @@ except ImportError:
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from nav_pipeline.odometry_logger import OdometryLogger  # noqa: E402
 from nav_pipeline.pipeline import DinoNavDPPipeline, PipelineConfig  # noqa: E402
 
 
@@ -79,6 +80,12 @@ class CDRReader:
     def read_uint32(self) -> int:
         self._align(4)
         (v,) = struct.unpack_from(self.end + "I", self.data, self.offset)
+        self.offset += 4
+        return v
+
+    def read_float32(self) -> float:
+        self._align(4)
+        (v,) = struct.unpack_from(self.end + "f", self.data, self.offset)
         self.offset += 4
         return v
 
@@ -188,6 +195,19 @@ def parse_string(cdr_data: bytes) -> str:
     return CDRReader(cdr_data).read_string()
 
 
+def parse_float32_multiarray(cdr_data: bytes) -> List[float]:
+    """std_msgs/Float32MultiArray CDR -> list[float] (the .data field)."""
+    r = CDRReader(cdr_data)
+    dim_count = r.read_uint32()
+    for _ in range(dim_count):
+        r.read_string()   # label
+        r.read_uint32()    # size
+        r.read_uint32()    # stride
+    r.read_uint32()        # data_offset
+    n = r.read_uint32()
+    return [r.read_float32() for _ in range(n)]
+
+
 def serialize_twist(linear_x: float, angular_z: float) -> bytes:
     w = CDRWriter()
     w.write_float64(linear_x); w.write_float64(0.0); w.write_float64(0.0)
@@ -219,6 +239,8 @@ CAMERA_KEYS = ["image_raw", "rt/image_raw", "rover_camera", "rt/rover_camera"]
 CAMERA_COMPRESSED_KEYS = ["image_raw/compressed", "rt/image_raw/compressed"]
 DEPTH_KEYS = ["depth_raw", "rt/depth_raw", "rover_camera_depth", "rt/rover_camera_depth"]
 GOAL_KEYS = ["omnivla/goal_text", "rt/omnivla/goal_text"]
+# ESP32 signed wheel-encoder RPM (see esp32/rover_6wd_complete.ino) -> odometry
+RPM_KEYS = ["rover/rpm", "rt/rover/rpm"]
 
 
 class DinoNavDPZenohNode:
@@ -228,12 +250,14 @@ class DinoNavDPZenohNode:
     DEPTH_STALE_S = 1.0  # external depth older than this -> fall back to monocular
 
     def __init__(self, session: zenoh.Session, pipeline: DinoNavDPPipeline, target: str, predict_hz: float,
-                 stop_confirm_count: int = 3):
+                 stop_confirm_count: int = 3, odometry_log_dir: str = "odometry_log"):
         self.session = session
         self.pipe = pipeline
         self.target = target
         self.predict_hz = predict_hz
         self.stop_confirm_count = stop_confirm_count
+        self.odom = OdometryLogger(odometry_log_dir)
+        self.odom.start_new_goal(target)
 
         self.lock = Lock()
         self.latest_rgb: Optional[np.ndarray] = None
@@ -254,8 +278,9 @@ class DinoNavDPZenohNode:
             + [session.declare_subscriber(k, self._on_image_compressed) for k in CAMERA_COMPRESSED_KEYS]
             + [session.declare_subscriber(k, self._on_depth) for k in DEPTH_KEYS]
             + [session.declare_subscriber(k, self._on_goal) for k in GOAL_KEYS]
+            + [session.declare_subscriber(k, self._on_rpm) for k in RPM_KEYS]
         )
-        print(f"[INFO] Zenoh subs: {CAMERA_KEYS + CAMERA_COMPRESSED_KEYS + DEPTH_KEYS + GOAL_KEYS}")
+        print(f"[INFO] Zenoh subs: {CAMERA_KEYS + CAMERA_COMPRESSED_KEYS + DEPTH_KEYS + GOAL_KEYS + RPM_KEYS}")
         print("[INFO] Zenoh pubs: cmd_vel, omnivla/explanation, omnivla/waypoints")
 
         Thread(target=self._heartbeat_loop, daemon=True).start()
@@ -291,6 +316,14 @@ class DinoNavDPZenohNode:
         except Exception as e:
             print(f"[WARN] depth parse failed: {e}")
 
+    def _on_rpm(self, sample):
+        try:
+            data = parse_float32_multiarray(bytes(sample.payload))
+            if len(data) >= 2:
+                self.odom.update(data[0], data[1])
+        except Exception as e:
+            print(f"[WARN] rpm parse failed: {e}")
+
     def _on_goal(self, sample):
         try:
             text = parse_string(bytes(sample.payload)).strip()
@@ -300,6 +333,7 @@ class DinoNavDPZenohNode:
                 self._goal_reached = False
                 self._stop_streak = 0
                 self.pipe.reset()
+                self.odom.start_new_goal(text)
         except Exception:
             pass
 
@@ -340,6 +374,7 @@ class DinoNavDPZenohNode:
             self.publish_cmd(0.0, 0.0)
             time.sleep(0.1)
             self.publish_cmd(0.0, 0.0)
+            self.odom.close()
             print("[INFO] Sent zero velocity. Goodbye.")
 
     def _tick(self):
@@ -406,6 +441,8 @@ def main():
     p.add_argument("--invert-angular", action="store_true",
                    help="flip turn direction (use if the rover steers away from the target)")
     p.add_argument("--device", type=str, default="cuda:0")
+    p.add_argument("--odometry-log-dir", type=str, default="odometry_log",
+                   help="dead-reckoned pose CSV log dir (from /rover/rpm)")
     args = p.parse_args()
 
     cfg = PipelineConfig(
@@ -427,7 +464,8 @@ def main():
     session = zenoh.open(config)
     print("[INFO] Zenoh session opened.")
 
-    node = DinoNavDPZenohNode(session, pipeline, args.target, args.predict_hz)
+    node = DinoNavDPZenohNode(session, pipeline, args.target, args.predict_hz,
+                              odometry_log_dir=args.odometry_log_dir)
     node.spin()
     session.close()
 

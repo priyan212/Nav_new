@@ -9,13 +9,13 @@
 #  top-down trajectory/obstacle plot — with real-rover speed caps.
 #
 #  Examples:
-#    ./launch_rover.sh                          # default Pi IP (192.168.36.125)
-#    ./launch_rover.sh 192.168.36.125 --target "trash bin"
+#    ./launch_rover.sh                          # default Pi IP (10.47.234.125)
+#    ./launch_rover.sh 10.47.234.125 --target "trash bin"
 # ============================================================
 set -uo pipefail
 cd "$(dirname "$0")"
 
-PI_IP=${1:-192.168.36.125}; shift 2>/dev/null || true
+PI_IP=${1:-10.47.234.125}; shift 2>/dev/null || true
 PI_USER=pi
 PI_PASS=${PI_PASS:-hri}
 SSH="sshpass -p $PI_PASS ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no $PI_USER@$PI_IP"
@@ -52,14 +52,21 @@ for i in $(seq 1 25); do
 done
 $CAM_OK || warn "camera topic missing — check: ssh $PI_USER@$PI_IP 'journalctl -u rover-camera -n 20'"
 
-info "Checking ESP32 heartbeat (/rover/rpm, up to 20 s)..."
-RPM_OK=false
-for i in $(seq 1 20); do
-    sleep 1
-    $SSH 'bash -lc "source /opt/ros/humble/setup.bash; timeout 2 ros2 topic echo /rover/rpm --once 2>/dev/null | head -1"' 2>/dev/null \
-        | grep -q "layout\|data" && { RPM_OK=true; ok "ESP32 alive (/rover/rpm publishing) [${i}s]"; break; }
-done
-$RPM_OK || warn "No /rover/rpm — check: ssh $PI_USER@$PI_IP 'journalctl -u rover-agent -n 20'"
+info "Checking ESP32 heartbeat (/rover/rpm, up to 25 s)..."
+# ONE continuous `ros2 topic echo`, not a loop of fresh 2s attempts: the
+# ESP32 gets hardware-reset (RTS pulse) on every rover-agent restart, so it
+# needs real time to reboot + re-handshake micro-ROS before /rover/rpm even
+# exists, and each fresh `ros2 topic echo` process has to redo DDS discovery
+# of the remote publisher from cold -- a loop of short-timeout attempts pays
+# that discovery cost repeatedly and reliably times out even when the topic
+# is publishing fine (confirmed: odometry_log/ fills with real rows on runs
+# where this check reported no /rover/rpm).
+if $SSH 'bash -lc "source /opt/ros/humble/setup.bash; timeout 25 ros2 topic echo /rover/rpm --once 2>/dev/null"' 2>/dev/null \
+    | grep -q "layout\|data"; then
+    ok "ESP32 alive (/rover/rpm publishing)"
+else
+    warn "No /rover/rpm — check: ssh $PI_USER@$PI_IP 'journalctl -u rover-agent -n 20'"
+fi
 # ── 6. Launch the Nav_new GUI (real-rover caps) ───────────────
 # conda activation hooks (isaacsim setup_conda_env.sh) reference unbound
 # vars like ZSH_VERSION — relax nounset while sourcing them.
@@ -76,9 +83,19 @@ pkill -f "nav_pipeline.zenoh_node" 2>/dev/null && sleep 1
 # max-angular 1.2 matches the working OmniVLA node — the ESP32 firmware
 # normalizes angular by this value, so 0.25 gave only ~1/5 of real steering.
 # fov 60 matches the Logitech camera (90 was mis-scaling every bearing).
-info "Starting Nav_new GUI (pi-ip=$PI_IP, caps 0.15 m/s / 1.2 rad/s, fov 60)..."
+# search-angular 0.13 (down from the 0.15 default) — the real rover was
+# spinning past the target between DINO detection frames while searching;
+# keep this just above PipelineConfig.ang_min_cmd (0.12), the stiction
+# floor below which the rover won't turn at all.
+# servo-ramp-deg 70 (up from the 35 default) — at fov 60 / predict-hz 2.5,
+# a 35deg ramp put a frame-edge detection (bearing ~30deg) at ~94% of
+# max_angular, sweeping ~26deg in a single 0.4s tick -- almost the whole
+# visible half-frame in one shot, so corner detections got spun straight
+# out of view. 70deg brings that down to ~70% of max_angular at the edge.
+info "Starting Nav_new GUI (pi-ip=$PI_IP, caps 0.15 m/s / 1.2 rad/s, fov 60, search 0.13 rad/s, ramp 70deg)..."
 exec python -u -m nav_pipeline.isaac_gui \
     --pi-ip "$PI_IP" \
     --max-linear 0.15 --max-angular 1.2 --fov 60 \
+    --search-angular 0.13 --servo-ramp-deg 70 \
     --compressed-only \
     "$@"

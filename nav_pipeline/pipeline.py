@@ -23,7 +23,7 @@ from typing import Optional
 import numpy as np
 import torch
 
-from .dino_detector import GroundingDinoDetector
+from .dino_detector import Detection, GroundingDinoDetector
 from .goal_utils import (
     goal_point_from_detection,
     intrinsics_from_fov,
@@ -89,7 +89,18 @@ class PipelineConfig:
     avoid_bias_gain: float = 0.15    # rad/s added toward the escape side during the cooldown window
     # SAM 2.1 segmentation layer (DINO bbox -> instance mask -> goal)
     use_sam: bool = True
+    sam_period_s: float = 1.0        # min seconds between SAM re-segmentations (real-rover
+    #                                  latency: DINO + bbox-goal still run every tick; the
+    #                                  mask is cached and reused in between as long as the
+    #                                  current DINO box still overlaps the one SAM last saw)
     mask_stop_frac: float = 0.20     # mask area fraction of image -> stop
+    # CLIP verification of the SAM-segmented crop against the target phrase,
+    # paired 1:1 with each SAM re-segmentation (see sam_period_s). Catches a
+    # confident DINO false positive before the rover commits to a goal: a
+    # crop scoring below threshold is treated as no detection this tick.
+    use_clip: bool = True
+    clip_model_id: str = "openai/clip-vit-base-patch32"
+    clip_min_similarity: float = 0.5  # softmax prob vs generic negatives; empirical starting point
     # goal / stopping
     stop_distance: float = 0.8       # meters from object at which to stop
     bbox_stop_frac: float = 0.55     # bbox height fraction of image -> stop (no-SAM fallback)
@@ -97,6 +108,19 @@ class PipelineConfig:
     # target loss behavior
     search_angular: float = 0.15     # spin to re-acquire when target not seen
     lost_patience: int = 5           # frames to keep last goal before searching
+
+
+def _box_iou(a: np.ndarray, b: np.ndarray) -> float:
+    """IoU of two [x0, y0, x1, y1] boxes."""
+    x0, y0 = max(a[0], b[0]), max(a[1], b[1])
+    x1, y1 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+    if inter <= 0.0:
+        return 0.0
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0.0 else 0.0
 
 
 def bearing_to_angular(bearing: float, max_angular: float, ang_min_cmd: float,
@@ -164,6 +188,11 @@ class DinoNavDPPipeline:
             from .sam_segmenter import Sam2Segmenter
 
             self.segmenter = Sam2Segmenter(device=cfg.device)
+        self.clip = None
+        if cfg.use_sam and cfg.use_clip:
+            from .clip_verifier import ClipVerifier
+
+            self.clip = ClipVerifier(model_id=cfg.clip_model_id, device=cfg.device)
         self.depther = None
         if use_depth_estimator:
             from .depth_estimator import MetricDepthEstimator
@@ -175,19 +204,80 @@ class DinoNavDPPipeline:
         self._memory_d: list = []
         self._lost_count = 0
         self._last_goal: Optional[np.ndarray] = None
+        self._last_box: Optional[np.ndarray] = None
+        self._box_miss_count = 0
         self._avoid_streak = 0
         self._avoid_side = 0.0
         self._avoid_cooldown = 0
         self._prev_cmd = (0.0, 0.0)
+        self._last_sam_t = 0.0
+        self._last_mask: Optional[np.ndarray] = None
+        self._last_mask_box: Optional[np.ndarray] = None
 
     def reset(self):
         self._memory, self._memory_d = [], []
         self._lost_count = 0
         self._last_goal = None
+        self._last_box = None
+        self._box_miss_count = 0
         self._avoid_streak = 0
         self._avoid_side = 0.0
         self._avoid_cooldown = 0
-        self._prev_cmd = (0.0, 0.0)
+        self._last_sam_t = 0.0
+        self._last_mask = None
+        self._last_mask_box = None
+
+    # weight given to a newly matched box when updating the tracked-box
+    # reference. With several same-class objects close together, adjacent
+    # boxes can each have decent overlap with the reference, and per-frame
+    # detector jitter can flip which one "wins" the overlap comparison. If
+    # the reference snaps to the raw winner every frame, one flip teleports
+    # it onto the neighbor and biases the *next* comparison the same way --
+    # a ping-pong between the two objects' goal points that reads as
+    # continuous "TRACK" while the rover oscillates toward each in turn.
+    # Blending instead of snapping means a single noisy frame only nudges
+    # the reference a little, so the genuinely-locked object (which wins
+    # most frames, not just one) keeps dominating it.
+    _BOX_TRACK_ALPHA = 0.3
+
+    def _select_detection(self, dets: list) -> Optional[Detection]:
+        """Pick which detection to track this frame.
+
+        detect() returns boxes sorted by score, but with several instances of
+        the same class in view, the top score flips between different physical
+        objects frame-to-frame (viewing angle, partial occlusion). Each flip
+        yanks the 3D goal to a different object and the rover lurches toward
+        it. Prefer whichever box overlaps the previously tracked one (a
+        greedy nearest-neighbor tracker) so the rover keeps heading toward
+        whatever it first locked onto -- NOT whatever currently scores/looks
+        closest. A single frame with no overlap (occlusion, edge clipping)
+        doesn't concede the lock: it coasts (returns None, same as "not
+        detected this frame") for up to lost_patience frames before falling
+        back to a fresh top-score pick, so a momentary drop-out can't hand
+        the lock to a different, often physically closer, object.
+        """
+        if self._last_box is None:
+            self._box_miss_count = 0
+            det = dets[0] if dets else None
+            self._last_box = det.box if det is not None else None
+            return det
+        best, best_iou = None, 0.0
+        for d in dets:
+            iou = _box_iou(d.box, self._last_box)
+            if iou > best_iou:
+                best, best_iou = d, iou
+        if best is not None and best_iou > 0.1:
+            self._box_miss_count = 0
+            a = self._BOX_TRACK_ALPHA
+            self._last_box = a * best.box + (1 - a) * self._last_box
+            return best
+        self._box_miss_count += 1
+        if self._box_miss_count > self.cfg.lost_patience:
+            self._box_miss_count = 0
+            det = dets[0] if dets else None
+            self._last_box = det.box if det is not None else self._last_box
+            return det
+        return None
 
     # ------------------------------------------------------------------ #
     def _select_trajectory(self, trajs: np.ndarray, critic: np.ndarray, goal: np.ndarray,
@@ -269,9 +359,13 @@ class DinoNavDPPipeline:
         # neither needs a separate post-hoc boost (see bearing_to_angular).
         if self.cfg.invert_angular:
             res.angular = -res.angular
-        # cross-tick EMA smoothing (ported from the OmniVLA node's damping)
+        # cross-tick EMA smoothing (ported from the OmniVLA node's damping).
+        # Excluded for SEARCH too: search_angular is deliberately tuned low,
+        # but blending it with a leftover fast TRACK turn (up to max_angular)
+        # dragged the effective search speed up for several ticks after the
+        # target was lost.
         a = self.cfg.smoothing
-        if a > 0 and res.state != "STOP":
+        if a > 0 and res.state not in ("STOP", "SEARCH"):
             pl, pa = self._prev_cmd
             res.linear = (1 - a) * res.linear + a * pl
             res.angular = (1 - a) * res.angular + a * pa
@@ -284,7 +378,7 @@ class DinoNavDPPipeline:
         timing = {}
 
         t0 = time.time()
-        det = self.detector.detect_best(rgb, target_text)
+        det = self._select_detection(self.detector.detect(rgb, target_text))
         timing["dino"] = time.time() - t0
 
         t0 = time.time()
@@ -307,10 +401,32 @@ class DinoNavDPPipeline:
         if det is not None:
             res.detection = det
             close_by_size = False
+            clip_rejected = False
             if self.segmenter is not None:
-                t0 = time.time()
-                mask = self.segmenter.segment_box(rgb, det.box)
-                timing["sam"] = time.time() - t0
+                now = time.time()
+                due = (now - self._last_sam_t) >= self.cfg.sam_period_s
+                mask = None
+                if due:
+                    t0 = time.time()
+                    mask = self.segmenter.segment_box(rgb, det.box)
+                    timing["sam"] = time.time() - t0
+                    if mask is not None and self.clip is not None:
+                        from .sam_segmenter import mask_bbox
+
+                        t0 = time.time()
+                        score = self.clip.verify(rgb, mask_bbox(mask), target_text)
+                        timing["clip"] = time.time() - t0
+                        if score < self.cfg.clip_min_similarity:
+                            clip_rejected = True
+                            mask = None
+                    self._last_sam_t = now
+                    self._last_mask = mask
+                    self._last_mask_box = det.box.copy() if mask is not None else None
+                elif self._last_mask is not None and _box_iou(det.box, self._last_mask_box) > 0.1:
+                    # not due for a fresh SAM/CLIP pass -- reuse the cached mask as
+                    # long as the current DINO box still overlaps the one it was
+                    # segmented from
+                    mask = self._last_mask
                 if mask is not None:
                     from .sam_segmenter import mask_centroid, mask_median_depth
 
@@ -322,7 +438,7 @@ class DinoNavDPPipeline:
 
                         goal = pixel_depth_to_point(u, v, d, fx, fy, cx, cy)
                     close_by_size = mask.mean() > self.cfg.mask_stop_frac
-            if goal is None:  # SAM disabled, empty mask, or no valid mask depth
+            if not clip_rejected and goal is None:  # SAM disabled, empty mask, or no valid mask depth
                 goal = goal_point_from_detection(det.box, depth, fx, fy, cx, cy)
                 close_by_size = (det.box[3] - det.box[1]) / H > self.cfg.bbox_stop_frac
             if goal is not None:

@@ -42,12 +42,15 @@ except ImportError:
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from nav_pipeline.odometry_logger import OdometryLogger  # noqa: E402
 from nav_pipeline.pipeline import DinoNavDPPipeline, PipelineConfig  # noqa: E402
 from nav_pipeline.zenoh_node import (  # noqa: E402
     CAMERA_COMPRESSED_KEYS,
     CAMERA_KEYS,
     DEPTH_KEYS,
+    RPM_KEYS,
     parse_compressed_image,
+    parse_float32_multiarray,
     parse_image,
     serialize_path,
     serialize_string,
@@ -57,6 +60,17 @@ from nav_pipeline.zenoh_node import (  # noqa: E402
 PRESETS = ["trash bin", "cardboard box", "wooden pallet", "door", "chair"]
 HEARTBEAT_PERIOD_S = 0.15
 DEPTH_STALE_S = 1.0
+# Spin-stall watchdog: with a generic/multi-instance target (e.g. "chair" in a
+# room full of chairs), DINO's re-acquire-on-loss can hop to a different
+# physical object each time the tracked one scrolls out of frame, so the
+# rover keeps turning the same way chasing "whichever chair is now in view"
+# without ever closing distance on one -- a real 145s/17-turn incident this
+# caught via odometry_log. If it racks up more than a full turn within this
+# window while translating less than SPIN_DIST_THRESH_M, force a stop instead
+# of spinning indefinitely; latched until a new target is sent.
+SPIN_WINDOW_S = 15.0
+SPIN_ROT_THRESH_RAD = 2.0 * np.pi
+SPIN_DIST_THRESH_M = 0.3
 
 
 class SharedState:
@@ -88,7 +102,8 @@ class SharedState:
         self.infer_count = 0
 
 
-def zenoh_setup(session: zenoh.Session, st: SharedState, compressed_only: bool = False):
+def zenoh_setup(session: zenoh.Session, st: SharedState, compressed_only: bool = False,
+                odom: Optional[OdometryLogger] = None):
     def on_image(sample):
         img = parse_image(bytes(sample.payload))
         if img is not None and img.ndim == 3:
@@ -110,6 +125,16 @@ def zenoh_setup(session: zenoh.Session, st: SharedState, compressed_only: bool =
                 st.latest_depth = d
                 st.latest_depth_t = time.time()
 
+    def on_rpm(sample):
+        if odom is None:
+            return
+        try:
+            data = parse_float32_multiarray(bytes(sample.payload))
+            if len(data) >= 2:
+                odom.update(data[0], data[1])
+        except Exception as e:
+            print(f"[WARN] rpm parse failed: {e}")
+
     # On the real rover Wi-Fi, raw 640x480 rgb8 (~8 MB/s) saturates the link
     # (starving cmd_vel/rpm and even SSH) — subscribe compressed JPEG only.
     raw_keys = [] if compressed_only else CAMERA_KEYS
@@ -117,6 +142,7 @@ def zenoh_setup(session: zenoh.Session, st: SharedState, compressed_only: bool =
         [session.declare_subscriber(k, on_image) for k in raw_keys]
         + [session.declare_subscriber(k, on_compressed) for k in CAMERA_COMPRESSED_KEYS]
         + [session.declare_subscriber(k, on_depth) for k in DEPTH_KEYS]
+        + [session.declare_subscriber(k, on_rpm) for k in RPM_KEYS]
     )
     pubs = {
         "cmd": session.declare_publisher("cmd_vel"),
@@ -135,9 +161,10 @@ def heartbeat_loop(st: SharedState, pubs, running):
 
 
 def inference_loop(pipe: DinoNavDPPipeline, st: SharedState, pubs, running,
-                   predict_hz: float, stop_confirm: int = 3):
+                   predict_hz: float, stop_confirm: int = 3, odom: Optional[OdometryLogger] = None):
     period = 1.0 / predict_hz
     stop_streak = 0
+    last_target = None  # None so the first tick's target starts its own odometry file
     while running["on"]:
         t0 = time.time()
         with st.lock:
@@ -147,6 +174,9 @@ def inference_loop(pipe: DinoNavDPPipeline, st: SharedState, pubs, running,
             mode = st.mode
             target = st.target
             paused = st.stopped or st.goal_reached
+        if odom is not None and target != last_target:
+            odom.start_new_goal(target)
+            last_target = target
         if rgb is None:
             time.sleep(0.1)
             continue
@@ -181,6 +211,22 @@ def inference_loop(pipe: DinoNavDPPipeline, st: SharedState, pubs, running,
             with st.lock:
                 st.last_cmd = (0.0, 0.0)
             time.sleep(0.5)
+            continue
+
+        spin = odom.spin_delta(SPIN_WINDOW_S) if odom is not None else None
+        if spin is not None and spin[0] > SPIN_ROT_THRESH_RAD and spin[1] < SPIN_DIST_THRESH_M:
+            print(f"[WARN] spin-stall watchdog: turned {spin[0]:.1f}rad in {SPIN_WINDOW_S:.0f}s, "
+                  f"only {spin[1]:.2f}m net travel -- forcing stop until a new target is sent")
+            with st.lock:
+                st.goal_reached = True  # reuses the existing pause-until-new-target gate
+                st.last_cmd = (0.0, 0.0)
+                st.display_rgb = rgb
+                st.state_text = (f"SPIN STALL: {np.degrees(spin[0]):.0f}° turned, "
+                                 f"{spin[1]:.2f}m travel -- send a new target")
+                st.vel_text = "lin 0.000  ang +0.000"
+            dt = period - (time.time() - t0)
+            if dt > 0:
+                time.sleep(dt)
             continue
 
         if res.state == "STOP":
@@ -422,10 +468,26 @@ def main():
                     help="m/s cap (sim default; use 0.15 on the real rover)")
     ap.add_argument("--max-angular", type=float, default=0.4,
                     help="rad/s cap (sim default; use 0.25 on the real rover)")
+    ap.add_argument("--search-angular", type=float, default=0.15,
+                    help="rad/s spin rate while re-acquiring a lost target (must stay "
+                         "above PipelineConfig.ang_min_cmd, the rover's stiction floor, "
+                         "or it won't turn at all; lower this if fast spins sweep past "
+                         "the target between detection frames)")
+    ap.add_argument("--servo-ramp-deg", type=float, default=35.0,
+                    help="heading error (degrees) at which TRACK steering reaches ~96%% "
+                         "of max_angular. With a narrow fov and slow predict-hz, a small "
+                         "ramp means edge-of-frame detections already command near-max "
+                         "angular speed -- one inference tick can then sweep the target "
+                         "clean out of frame before the next correction. Widen this "
+                         "(e.g. 70-90 on a 60deg-fov real rover) so bearings near the "
+                         "frame edge get a proportionally gentler command instead of a "
+                         "near-max snap turn.")
     ap.add_argument("--invert-angular", action="store_true",
                     help="flip turn direction (use if the rover steers away from the target)")
     ap.add_argument("--compressed-only", action="store_true",
                     help="subscribe only the JPEG camera stream (REQUIRED over rover Wi-Fi)")
+    ap.add_argument("--odometry-log-dir", type=str, default="odometry_log",
+                    help="dead-reckoned pose CSV log dir (from /rover/rpm)")
     args = ap.parse_args()
 
     print("[INFO] loading models...")
@@ -434,7 +496,8 @@ def main():
         horizontal_fov_deg=args.fov,
         max_linear=args.max_linear,
         max_angular=args.max_angular,
-        search_angular=min(0.15, args.max_angular),
+        search_angular=min(args.search_angular, args.max_angular),
+        servo_ramp_deg=args.servo_ramp_deg,
         invert_angular=args.invert_angular,
     ))
 
@@ -447,11 +510,13 @@ def main():
     st = SharedState(args.target)
     st.max_linear = args.max_linear
     st.max_angular = args.max_angular
-    _subs, pubs = zenoh_setup(session, st, compressed_only=args.compressed_only)
+    odom = OdometryLogger(args.odometry_log_dir)
+    _subs, pubs = zenoh_setup(session, st, compressed_only=args.compressed_only, odom=odom)
     running = {"on": True}
 
     Thread(target=heartbeat_loop, args=(st, pubs, running), daemon=True).start()
-    Thread(target=inference_loop, args=(pipe, st, pubs, running, args.predict_hz), daemon=True).start()
+    Thread(target=inference_loop, args=(pipe, st, pubs, running, args.predict_hz),
+           kwargs={"odom": odom}, daemon=True).start()
 
     root = tk.Tk()
     App(root, st)
@@ -474,7 +539,11 @@ def main():
         pubs["cmd"].put(serialize_twist(0.0, 0.0))
         time.sleep(0.1)
         pubs["cmd"].put(serialize_twist(0.0, 0.0))
-        session.close()
+        try:
+            session.close()
+        except zenoh.ZError as e:
+            print(f"[WARN] zenoh session close timed out/failed: {e}")
+        odom.close()
         print("[INFO] zero velocity sent, session closed")
 
 

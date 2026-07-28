@@ -53,3 +53,9 @@ def mask_centroid(mask: np.ndarray) -> np.ndarray:
     """Mask centroid as [u, v] pixels."""
     ys, xs = np.nonzero(mask)
     return np.array([xs.mean(), ys.mean()], dtype=np.float32)
+
+
+def mask_bbox(mask: np.ndarray) -> np.ndarray:
+    """Tight [x0, y0, x1, y1] box around the mask's true pixels."""
+    ys, xs = np.nonzero(mask)
+    return np.array([xs.min(), ys.min(), xs.max() + 1, ys.max() + 1], dtype=np.float32)

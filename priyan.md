@@ -34,3 +34,5 @@ cd /mnt/bigdisk/Priyan/Nav_new
 ./EARTH/launch_earth.sh
 
 ```
+# Launch script for the repeat is isaac sim
+./ISAAC/launch_isaac_topo_repeat.sh --arrival-sim 0.85
