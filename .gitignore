@@ -18,3 +18,6 @@ __pycache__/
 
 # Data directories (large scene assets)
 MARS/data/
+
+# Per-run scene tag logs (see scene_log/README.md)
+scene_log/*.jsonl

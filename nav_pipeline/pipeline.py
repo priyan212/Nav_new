@@ -16,9 +16,11 @@ Per frame:
 Returns a (linear, angular) velocity command plus rich debug info.
 """
 
+import json
+import os
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -38,6 +40,7 @@ from .obstacle_guard import (
     forward_guard,
     swept_clearance,
 )
+from .scene_tagger import DEFAULT_VOCAB
 
 
 @dataclass
@@ -101,6 +104,13 @@ class PipelineConfig:
     use_clip: bool = True
     clip_model_id: str = "openai/clip-vit-base-patch32"
     clip_min_similarity: float = 0.5  # softmax prob vs generic negatives; empirical starting point
+    # Periodic open-vocabulary scene inventory (independent of the goal
+    # target): "what's in the frame right now", counted per label and logged
+    # for later route-finding. Reuses the DINO detector already loaded above.
+    use_scene_tagger: bool = True
+    scene_tag_period_s: float = 1.0
+    scene_vocab: List[str] = field(default_factory=lambda: list(DEFAULT_VOCAB))
+    scene_log_dir: str = "scene_log"   # one JSONL file per run; set to None/"" to disable file logging
     # goal / stopping
     stop_distance: float = 0.8       # meters from object at which to stop
     bbox_stop_frac: float = 0.55     # bbox height fraction of image -> stop (no-SAM fallback)
@@ -193,6 +203,18 @@ class DinoNavDPPipeline:
             from .clip_verifier import ClipVerifier
 
             self.clip = ClipVerifier(model_id=cfg.clip_model_id, device=cfg.device)
+        self.scene_tagger = None
+        if cfg.use_scene_tagger:
+            from .scene_tagger import SceneTagger
+
+            self.scene_tagger = SceneTagger(self.detector, vocab=cfg.scene_vocab)
+        self.scene_log: list = []   # [{"t": float, "objects": {label: count}}, ...]
+        self._last_tag_t = 0.0
+        self._scene_log_file = None
+        if self.scene_tagger is not None and cfg.scene_log_dir:
+            os.makedirs(cfg.scene_log_dir, exist_ok=True)
+            fname = f"scene_{time.strftime('%Y%m%d_%H%M%S')}.jsonl"
+            self._scene_log_file = open(os.path.join(cfg.scene_log_dir, fname), "a")
         self.depther = None
         if use_depth_estimator:
             from .depth_estimator import MetricDepthEstimator
@@ -387,6 +409,21 @@ class DinoNavDPPipeline:
                 raise ValueError("no depth given and depth estimator disabled")
             depth = self.depther.estimate(rgb)
         timing["depth"] = time.time() - t0
+
+        if self.scene_tagger is not None:
+            now = time.time()
+            if (now - self._last_tag_t) >= self.cfg.scene_tag_period_s:
+                t0 = time.time()
+                objects = self.scene_tagger.tag(rgb)
+                timing["scene_tag"] = time.time() - t0
+                entry = {"t": now, "objects": objects}
+                self.scene_log.append(entry)
+                self._last_tag_t = now
+                summary = ", ".join(f"{k}:{v}" for k, v in sorted(objects.items())) or "(nothing detected)"
+                print(f"[scene] {time.strftime('%H:%M:%S', time.localtime(now))}  {summary}")
+                if self._scene_log_file is not None:
+                    self._scene_log_file.write(json.dumps(entry) + "\n")
+                    self._scene_log_file.flush()
 
         # update observation memory (up to policy.memory_size frames)
         rgb_p, dep_p = preprocess_rgb(rgb), preprocess_depth(depth)
