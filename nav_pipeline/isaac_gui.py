@@ -105,25 +105,34 @@ class SharedState:
 def zenoh_setup(session: zenoh.Session, st: SharedState, compressed_only: bool = False,
                 odom: Optional[OdometryLogger] = None):
     def on_image(sample):
-        img = parse_image(bytes(sample.payload))
-        if img is not None and img.ndim == 3:
-            with st.lock:
-                st.latest_rgb = img
-                st.frame_count += 1
+        try:
+            img = parse_image(bytes(sample.payload))
+            if img is not None and img.ndim == 3:
+                with st.lock:
+                    st.latest_rgb = img
+                    st.frame_count += 1
+        except Exception as e:
+            print(f"[WARN] image parse failed: {e}")
 
     def on_compressed(sample):
-        img = parse_compressed_image(bytes(sample.payload))
-        if img is not None:
-            with st.lock:
-                st.latest_rgb = img
-                st.frame_count += 1
+        try:
+            img = parse_compressed_image(bytes(sample.payload))
+            if img is not None:
+                with st.lock:
+                    st.latest_rgb = img
+                    st.frame_count += 1
+        except Exception as e:
+            print(f"[WARN] compressed image parse failed: {e}")
 
     def on_depth(sample):
-        d = parse_image(bytes(sample.payload))
-        if d is not None and d.ndim == 2:
-            with st.lock:
-                st.latest_depth = d
-                st.latest_depth_t = time.time()
+        try:
+            d = parse_image(bytes(sample.payload))
+            if d is not None and d.ndim == 2:
+                with st.lock:
+                    st.latest_depth = d
+                    st.latest_depth_t = time.time()
+        except Exception as e:
+            print(f"[WARN] depth parse failed: {e}")
 
     def on_rpm(sample):
         if odom is None:
@@ -211,6 +220,14 @@ def inference_loop(pipe: DinoNavDPPipeline, st: SharedState, pubs, running,
             print(f"[ERROR] pipeline step: {e}")
             with st.lock:
                 st.last_cmd = (0.0, 0.0)
+                # keep the preview live even while inference is erroring --
+                # otherwise refresh() keeps showing the last successful
+                # display_rgb forever (it only falls back to latest_rgb when
+                # display_rgb is None), which reads as a frozen camera feed
+                # even though frames are still arriving fine over Zenoh.
+                st.display_rgb = rgb
+                st.state_text = f"ERROR: {e}"
+                st.vel_text = "lin 0.000  ang +0.000"
             time.sleep(0.5)
             continue
 
@@ -402,7 +419,15 @@ class App:
         if self.closed:
             return
         with self.st.lock:
-            rgb = self.st.display_rgb if self.st.display_rgb is not None else self.st.latest_rgb
+            # Show the freshest camera frame (updated on every Zenoh image,
+            # i.e. the camera's native rate), not display_rgb (only updated
+            # once per inference tick, i.e. predict_hz -- ~2.5 Hz by default).
+            # Overlaying the last-computed detection/mask/trajectory on a
+            # newer frame can lag them slightly behind the rover's actual
+            # motion, but that's far less noticeable than the whole picture
+            # visibly jumping between camera frames ~400ms apart, which is
+            # what showing display_rgb here produced during movement.
+            rgb = self.st.latest_rgb if self.st.latest_rgb is not None else self.st.display_rgb
             det = self.st.detection
             mask = self.st.mask
             trajs, chosen, goal = self.st.trajs, self.st.chosen, self.st.goal_pt
