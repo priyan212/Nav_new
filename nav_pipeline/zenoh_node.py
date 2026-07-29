@@ -248,6 +248,15 @@ class DinoNavDPZenohNode:
     # heartbeat re-sends the last command well under that deadline.
     HEARTBEAT_PERIOD_S = 0.15
     DEPTH_STALE_S = 1.0  # external depth older than this -> fall back to monocular
+    # Spin-stall watchdog, ported from isaac_gui.py (which has always had
+    # this -- see its comment for the real 145s/17-turn incident it guards
+    # against). Replayed against odom_chair_20260729_170317.csv: this run
+    # alone would have tripped it in 70 separate 15s windows, peak 493deg
+    # turned for 0.36m net travel -- real-rover runs currently have NO
+    # protection against this at all.
+    SPIN_WINDOW_S = 15.0
+    SPIN_ROT_THRESH_RAD = 2.0 * np.pi
+    SPIN_DIST_THRESH_M = 0.3
 
     def __init__(self, session: zenoh.Session, pipeline: DinoNavDPPipeline, target: str, predict_hz: float,
                  stop_confirm_count: int = 3, odometry_log_dir: str = "odometry_log"):
@@ -399,6 +408,17 @@ class DinoNavDPZenohNode:
             return
         infer_ms = (time.time() - t0) * 1000.0
 
+        spin = self.odom.spin_delta(self.SPIN_WINDOW_S)
+        if spin is not None and spin[0] > self.SPIN_ROT_THRESH_RAD and spin[1] < self.SPIN_DIST_THRESH_M:
+            print(f"[WARN] spin-stall watchdog: turned {spin[0]:.1f}rad in {self.SPIN_WINDOW_S:.0f}s, "
+                  f"only {spin[1]:.2f}m net travel -- forcing stop until a new target is sent")
+            self._goal_reached = True
+            self.publish_cmd(0.0, 0.0)
+            self.pub_explain.put(serialize_string(
+                f"SPIN STALL: {np.degrees(spin[0]):.0f} deg turned, {spin[1]:.2f}m travel -- send a new target"
+            ))
+            return
+
         if res.state == "STOP":
             self._stop_streak += 1
             if self._stop_streak >= self.stop_confirm_count:
@@ -417,8 +437,9 @@ class DinoNavDPZenohNode:
 
         score = f"{res.detection.score:.2f}" if res.detection else "-"
         goal = np.round(res.goal_point, 2).tolist() if res.goal_point is not None else None
+        amb = f" [AMBIGUOUS x{res.candidate_count}]" if res.ambiguous else ""
         self.pub_explain.put(serialize_string(
-            f"DINO+NavDP [{res.state}] det={score} goal={goal} -> lin={res.linear:.3f} ang={res.angular:.3f} "
+            f"DINO+NavDP [{res.state}]{amb} det={score} goal={goal} -> lin={res.linear:.3f} ang={res.angular:.3f} "
             f"| target='{self.target}'"
         ))
         self._infer_count += 1

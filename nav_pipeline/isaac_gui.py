@@ -253,7 +253,7 @@ def inference_loop(pipe: DinoNavDPPipeline, st: SharedState, pubs, running,
                 st.vel_text = "lin 0.000  ang +0.000"
             else:
                 st.last_cmd = (res.linear, res.angular) if res.state != "STOP" else (0.0, 0.0)
-                st.state_text = res.state
+                st.state_text = f"{res.state} [AMBIGUOUS x{res.candidate_count}]" if res.ambiguous else res.state
                 st.vel_text = f"lin {res.linear:.3f}  ang {res.angular:+.3f}"
             st.lat_text = "  ".join(f"{k} {v*1000:.0f}ms" for k, v in res.timing.items())
 
@@ -262,8 +262,9 @@ def inference_loop(pipe: DinoNavDPPipeline, st: SharedState, pubs, running,
         if res.trajectory is not None:
             pubs["path"].put(serialize_path([(p[0], p[1]) for p in res.trajectory]))
         score = f"{res.detection.score:.2f}" if res.detection else "-"
+        amb = f" [AMBIGUOUS x{res.candidate_count}]" if res.ambiguous else ""
         pubs["explain"].put(serialize_string(
-            f"DINO+NavDP [{res.state}] det={score} -> lin={res.linear:.3f} ang={res.angular:.3f} "
+            f"DINO+NavDP [{res.state}]{amb} det={score} -> lin={res.linear:.3f} ang={res.angular:.3f} "
             f"| target='{target}'"
         ))
 

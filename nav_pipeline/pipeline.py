@@ -22,10 +22,18 @@ import time
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+import cv2
 import numpy as np
 import torch
 
 from .dino_detector import Detection, GroundingDinoDetector
+from .relational_target import (
+    clean_label,
+    parse_positional_target,
+    parse_relational_target,
+    select_by_position,
+    select_by_relation,
+)
 from .goal_utils import (
     goal_point_from_detection,
     intrinsics_from_fov,
@@ -118,6 +126,30 @@ class PipelineConfig:
     # target loss behavior
     search_angular: float = 0.15     # spin to re-acquire when target not seen
     lost_patience: int = 5           # frames to keep last goal before searching
+    # Target-ambiguity detection: a bare category prompt ("chair") is
+    # genuinely underspecified when several same-class objects score
+    # comparably -- there's no visual evidence for which one the operator
+    # meant, so a "top-score wins" pick is a guess, not a decision. Flag it
+    # (StepResult.ambiguous/candidate_count) instead of picking silently.
+    # Empirical starting point; detector scores here typically span
+    # ~0.3-0.95, so 0.15 counts two candidates within ~a third of that range
+    # of each other as "comparably confident."
+    ambiguity_score_margin: float = 0.15
+    # Appearance re-identification for the TRACKED detection (distinct from
+    # use_clip above, which verifies goal-text match, not instance identity).
+    # DINOv2, not CLIP: CLIP embeddings are global/class-level and measured
+    # unusable for this -- solid red vs. solid blue crops scored 0.93 cosine
+    # similarity, an almost-flat band with no headroom to threshold in.
+    # DINOv2 crop embeddings measured a real gap on rover-camera crops: same
+    # object ~1.0, the HARDEST case (two visually near-identical doors, the
+    # closest real analog to two identical chairs) ~0.77, clearly different
+    # objects ~0.40. A same-class candidate must clear
+    # appearance_min_similarity against the cached locked-object embedding to
+    # be accepted as a continuation of the current track, geometric IoU
+    # match or not -- otherwise it's rejected (a miss), not blindly taken.
+    use_appearance_reid: bool = True
+    dinov2_model_id: str = "facebook/dinov2-small"
+    appearance_min_similarity: float = 0.85  # sits above the measured 0.77 near-identical-twin score
 
 
 def _box_iou(a: np.ndarray, b: np.ndarray) -> float:
@@ -131,6 +163,62 @@ def _box_iou(a: np.ndarray, b: np.ndarray) -> float:
     area_b = (b[2] - b[0]) * (b[3] - b[1])
     union = area_a + area_b - inter
     return inter / union if union > 0.0 else 0.0
+
+
+def _ambiguous_candidates(dets: list, margin: float) -> int:
+    """Count detections that share the top-scoring label and sit within
+    `margin` of its score -- genuinely comparable candidates for the same
+    category, not just detector noise around a single clear winner. dets
+    must be score-sorted descending (detect()'s contract); count includes
+    the top detection itself, so >=2 means the target is ambiguous."""
+    if not dets:
+        return 0
+    top = dets[0]
+    return sum(1 for d in dets if d.label == top.label and (top.score - d.score) <= margin)
+
+
+def _estimate_motion_affine(prev_gray: np.ndarray, curr_gray: np.ndarray) -> Optional[np.ndarray]:
+    """Camera motion between two frames as a 2x3 affine (rotation/scale/
+    translation, no shear), estimated from sparse optical flow + RANSAC --
+    same technique as BoT-SORT's camera motion compensation (CMC).
+
+    Track a scatter of distinctive points (goodFeaturesToTrack) from prev
+    into curr (Lucas-Kanade optical flow), then fit the single affine
+    transform that explains most of those point motions (estimateAffine-
+    Partial2D's built-in RANSAC). Points sitting on independently-moving
+    objects (a person walking, a nudged chair) get rejected as outliers
+    automatically, leaving a clean estimate of pure camera rotation/pan.
+
+    Returns None if there aren't enough reliable points to trust (e.g. a
+    blank wall) -- caller should fall back to no compensation.
+    """
+    pts0 = cv2.goodFeaturesToTrack(prev_gray, maxCorners=200, qualityLevel=0.01, minDistance=8)
+    if pts0 is None or len(pts0) < 10:
+        return None
+    pts1, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, pts0, None)
+    if pts1 is None or status is None:
+        return None
+    keep = status.reshape(-1).astype(bool)
+    pts0, pts1 = pts0[keep], pts1[keep]
+    if len(pts0) < 10:
+        return None
+    M, inliers = cv2.estimateAffinePartial2D(pts0, pts1, method=cv2.RANSAC, ransacReprojThreshold=3.0)
+    if M is None or inliers is None or int(inliers.sum()) < 8:
+        return None
+    return M
+
+
+def _warp_box(box: np.ndarray, M: np.ndarray) -> np.ndarray:
+    """Apply a 2x3 affine to a [x0,y0,x1,y1] box: warp all 4 corners (not
+    just the center) and take the new axis-aligned bounding box, so a
+    rotation component reshapes the box instead of only sliding it."""
+    corners = np.array(
+        [[box[0], box[1]], [box[2], box[1]], [box[0], box[3]], [box[2], box[3]]], dtype=np.float32
+    ).reshape(-1, 1, 2)
+    warped = cv2.transform(corners, M).reshape(-1, 2)
+    x0, y0 = warped[:, 0].min(), warped[:, 1].min()
+    x1, y1 = warped[:, 0].max(), warped[:, 1].max()
+    return np.array([x0, y0, x1, y1], dtype=np.float32)
 
 
 def bearing_to_angular(bearing: float, max_angular: float, ang_min_cmd: float,
@@ -169,6 +257,8 @@ class StepResult:
     angular: float = 0.0
     state: str = "SEARCH"            # SEARCH | TRACK | AVOID | STOP
     detection: Optional[object] = None
+    ambiguous: bool = False           # >=2 comparably-scored same-class candidates in view
+    candidate_count: int = 0          # how many (see PipelineConfig.ambiguity_score_margin)
     mask: Optional[np.ndarray] = None
     goal_point: Optional[np.ndarray] = None
     trajectory: Optional[np.ndarray] = None
@@ -203,6 +293,11 @@ class DinoNavDPPipeline:
             from .clip_verifier import ClipVerifier
 
             self.clip = ClipVerifier(model_id=cfg.clip_model_id, device=cfg.device)
+        self.reid = None
+        if cfg.use_appearance_reid:
+            from .dinov2_embedder import Dinov2Embedder
+
+            self.reid = Dinov2Embedder(model_id=cfg.dinov2_model_id, device=cfg.device)
         self.scene_tagger = None
         if cfg.use_scene_tagger:
             from .scene_tagger import SceneTagger
@@ -235,6 +330,10 @@ class DinoNavDPPipeline:
         self._last_sam_t = 0.0
         self._last_mask: Optional[np.ndarray] = None
         self._last_mask_box: Optional[np.ndarray] = None
+        self._prev_gray: Optional[np.ndarray] = None
+        self._last_candidate_count = 0
+        self._ambiguity_warned = False
+        self._locked_embed: Optional[np.ndarray] = None
 
     def reset(self):
         self._memory, self._memory_d = [], []
@@ -248,6 +347,10 @@ class DinoNavDPPipeline:
         self._last_sam_t = 0.0
         self._last_mask = None
         self._last_mask_box = None
+        self._prev_gray = None
+        self._last_candidate_count = 0
+        self._ambiguity_warned = False
+        self._locked_embed = None
 
     # weight given to a newly matched box when updating the tracked-box
     # reference. With several same-class objects close together, adjacent
@@ -261,8 +364,15 @@ class DinoNavDPPipeline:
     # the reference a little, so the genuinely-locked object (which wins
     # most frames, not just one) keeps dominating it.
     _BOX_TRACK_ALPHA = 0.3
+    # slower than _BOX_TRACK_ALPHA on purpose: the locked-object embedding
+    # should drift with gradual viewing-angle changes but stay dominated by
+    # the appearance history, not the newest crop (which is exactly what a
+    # wrong-object steal would try to overwrite it with).
+    _EMBED_TRACK_ALPHA = 0.15
 
-    def _select_detection(self, dets: list) -> Optional[Detection]:
+    def _select_detection(self, dets: list, motion: Optional[np.ndarray] = None,
+                          rgb: Optional[np.ndarray] = None,
+                          initial_pick: Optional[Detection] = None) -> Optional[Detection]:
         """Pick which detection to track this frame.
 
         detect() returns boxes sorted by score, but with several instances of
@@ -277,29 +387,105 @@ class DinoNavDPPipeline:
         detected this frame") for up to lost_patience frames before falling
         back to a fresh top-score pick, so a momentary drop-out can't hand
         the lock to a different, often physically closer, object.
+
+        motion (optional 2x3 affine, from _estimate_motion_affine -- no-op,
+        exact prior behavior, if None): the reference box lives in the
+        PREVIOUS frame's pixel space. If the camera panned/rotated since
+        then, the same physical object shifts in the image even though
+        nothing about the detection changed, and raw IoU against a stale
+        reference can drop below the match threshold for no real reason.
+        Warp the reference by the estimated camera motion before matching,
+        so a same-object match under rotation isn't lost.
+
+        rgb (optional -- no-op, exact prior behavior, if missing or
+        use_appearance_reid is off): geometric IoU alone isn't enough in a
+        room with several of the target class close together -- a
+        NEIGHBORING same-class object can overlap the reference box on an
+        ordinary tick (no miss ever counted, box never even coasts) and
+        silently steal the lock outright, especially as the rover approaches
+        a cluster and boxes drift/grow. Gate BOTH the ordinary IoU match and
+        the lost_patience fallback on appearance (DINOv2 crop embedding
+        cosine similarity, see PipelineConfig.appearance_min_similarity):
+        the winning candidate must also look like the object we locked onto,
+        or it's rejected (counted as a miss) instead of blindly accepted.
+
+        initial_pick (optional): which detection to lock onto FIRST, overriding
+        the plain top-score default -- e.g. from select_by_relation() when the
+        target phrase named an anchor ("chair near the door"). Only consulted
+        on the very first lock; once tracking, the same IoU/CMC/appearance
+        machinery above takes over regardless of how the initial pick was made.
         """
+        self._last_candidate_count = _ambiguous_candidates(dets, self.cfg.ambiguity_score_margin)
+
         if self._last_box is None:
             self._box_miss_count = 0
-            det = dets[0] if dets else None
+            det = initial_pick if initial_pick is not None else (dets[0] if dets else None)
             self._last_box = det.box if det is not None else None
+            self._locked_embed = self._embed_or_none(rgb, det.box) if det is not None else None
             return det
+
+        ref = self._last_box if motion is None else _warp_box(self._last_box, motion)
+
         best, best_iou = None, 0.0
         for d in dets:
-            iou = _box_iou(d.box, self._last_box)
+            iou = _box_iou(d.box, ref)
             if iou > best_iou:
                 best, best_iou = d, iou
         if best is not None and best_iou > 0.1:
-            self._box_miss_count = 0
-            a = self._BOX_TRACK_ALPHA
-            self._last_box = a * best.box + (1 - a) * self._last_box
-            return best
+            emb = self._embed_or_none(rgb, best.box)
+            appearance_ok = (
+                self._locked_embed is None or emb is None
+                or float(np.dot(emb, self._locked_embed)) >= self.cfg.appearance_min_similarity
+            )
+            if appearance_ok:
+                self._box_miss_count = 0
+                a = self._BOX_TRACK_ALPHA
+                self._last_box = a * best.box + (1 - a) * ref
+                if emb is not None:
+                    self._locked_embed = self._blend_embed(self._locked_embed, emb)
+                return best
         self._box_miss_count += 1
         if self._box_miss_count > self.cfg.lost_patience:
             self._box_miss_count = 0
-            det = dets[0] if dets else None
+            det = self._select_by_appearance(dets, rgb) if (dets and self._locked_embed is not None) \
+                else (dets[0] if dets else None)
             self._last_box = det.box if det is not None else self._last_box
+            if det is not None:
+                new_embed = self._embed_or_none(rgb, det.box)
+                if new_embed is not None:
+                    self._locked_embed = new_embed
             return det
         return None
+
+    def _embed_or_none(self, rgb: Optional[np.ndarray], box: np.ndarray) -> Optional[np.ndarray]:
+        if self.reid is None or rgb is None:
+            return None
+        return self.reid.embed(rgb, box)
+
+    def _blend_embed(self, prior: Optional[np.ndarray], new: np.ndarray) -> np.ndarray:
+        if prior is None:
+            return new
+        e = self._EMBED_TRACK_ALPHA
+        blended = e * new + (1 - e) * prior
+        return blended / max(np.linalg.norm(blended), 1e-6)
+
+    def _select_by_appearance(self, dets: list, rgb: Optional[np.ndarray]) -> Optional[Detection]:
+        """Reacquisition tiebreak: among same-class candidates with no spatial
+        continuity left to lean on, prefer whichever one's crop looks most
+        like the object we had locked before losing it (DINOv2 cosine
+        similarity), instead of blind top detector score.
+        """
+        if self.reid is None or rgb is None or not dets:
+            return dets[0] if dets else None
+        best, best_sim = None, -1.0
+        for d in dets:
+            emb = self.reid.embed(rgb, d.box)
+            if emb is None:
+                continue
+            sim = float(np.dot(emb, self._locked_embed))
+            if sim > best_sim:
+                best, best_sim = d, sim
+        return best if best is not None else dets[0]
 
     # ------------------------------------------------------------------ #
     def _select_trajectory(self, trajs: np.ndarray, critic: np.ndarray, goal: np.ndarray,
@@ -407,8 +593,41 @@ class DinoNavDPPipeline:
         timing = {}
 
         t0 = time.time()
-        det = self._select_detection(self.detector.detect(rgb, target_text))
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        motion = _estimate_motion_affine(self._prev_gray, gray) if self._prev_gray is not None else None
+        self._prev_gray = gray
+        timing["cmc"] = time.time() - t0
+
+        t0 = time.time()
+        relation = parse_relational_target(target_text)
+        positional = None if relation is not None else parse_positional_target(target_text)
+        if relation is not None:
+            target_class, anchor_class = relation
+            raw_dets = self.detector.detect(rgb, f"{target_class}. {anchor_class}.")
+            target_dets = [d for d in raw_dets if clean_label(d.label) == target_class]
+            anchor_dets = [d for d in raw_dets if clean_label(d.label) == anchor_class]
+            initial_pick = select_by_relation(target_dets, anchor_dets) if self._last_box is None else None
+            det = self._select_detection(target_dets, motion=motion, rgb=rgb, initial_pick=initial_pick)
+        elif positional is not None:
+            target_class, position = positional
+            raw_dets = self.detector.detect(rgb, f"{target_class}.")
+            target_dets = [d for d in raw_dets if clean_label(d.label) == target_class]
+            initial_pick = select_by_position(target_dets, position) if self._last_box is None else None
+            det = self._select_detection(target_dets, motion=motion, rgb=rgb, initial_pick=initial_pick)
+        else:
+            det = self._select_detection(self.detector.detect(rgb, target_text), motion=motion, rgb=rgb)
         timing["dino"] = time.time() - t0
+
+        res.candidate_count = self._last_candidate_count
+        res.ambiguous = self._last_candidate_count >= 2
+        if res.ambiguous:
+            if not self._ambiguity_warned:
+                self._ambiguity_warned = True
+                print(f"[WARN] ambiguous target '{target_text}': {self._last_candidate_count} comparably-"
+                      f"scored candidates in view -- locking onto top score by default. Resend a more "
+                      f"specific phrase (e.g. '{target_text} near the window') if it picks the wrong one.")
+        else:
+            self._ambiguity_warned = False
 
         t0 = time.time()
         if depth is None:
