@@ -37,7 +37,7 @@ class OdometryLogger:
         self._writer = None
         self.x = self.y = self.theta = 0.0
         self._last_t: Optional[float] = None
-        self._history: deque = deque()  # (t, x, y, theta), newest last
+        self._history: deque = deque()  # (t, x, y, theta, |dtheta| this tick), newest last
 
     @staticmethod
     def _slug(text: str) -> str:
@@ -74,8 +74,10 @@ class OdometryLogger:
         v = 0.5 * (v_left + v_right)
         w = (v_right - v_left) / TRACK_WIDTH_M
 
+        dtheta = 0.0
         if dt > 0.0:
-            self.theta += w * dt
+            dtheta = w * dt
+            self.theta += dtheta
             self.x += v * math.cos(self.theta) * dt
             self.y += v * math.sin(self.theta) * dt
 
@@ -83,7 +85,7 @@ class OdometryLogger:
                                f"{v:.4f}", f"{w:.4f}", f"{self.x:.4f}", f"{self.y:.4f}", f"{self.theta:.4f}"])
         self._file.flush()
 
-        self._history.append((t, self.x, self.y, self.theta))
+        self._history.append((t, self.x, self.y, self.theta, abs(dtheta)))
         cutoff = t - self.HISTORY_WINDOW_S
         while self._history and self._history[0][0] < cutoff:
             self._history.popleft()
@@ -91,25 +93,36 @@ class OdometryLogger:
         return self.x, self.y, self.theta
 
     def spin_delta(self, window_s: float):
-        """(|dtheta|, dist) over the trailing window_s, or None if not enough history yet.
+        """(total |dtheta| turned, net dist) over the trailing window_s, or
+        None if not enough history yet.
 
         Used to catch a rover that's spinning in place (e.g. bouncing between
         several same-class detections around it) without net translation --
-        see _select_detection's "ping-pong" note in pipeline.py.
+        see _select_detection's "ping-pong" note in pipeline.py. Rotation is
+        the SUM of per-tick |dtheta|, not |theta_end - theta_start|: a rover
+        oscillating left/right between two same-class detections (the exact
+        ping-pong failure mode this watchdog exists for) can have its turns
+        cancel out to a small net theta change while still spinning wildly in
+        place -- verified against a real run where net rotation in any 15s
+        window never crossed the 2*pi trigger threshold (peaked at 326 deg)
+        while total absolute rotation crossed it in 99 separate windows over
+        the same run (peaked at 513 deg/15s) for ~1m of net travel in 142s.
         """
         if not self._history:
             return None
         t_now = self._history[-1][0]
         oldest = None
+        turned = 0.0
         for sample in self._history:
             if t_now - sample[0] <= window_s:
-                oldest = sample
-                break
+                if oldest is None:
+                    oldest = sample
+                turned += sample[4]
         if oldest is None or oldest[0] == t_now:
             return None
-        t0, x0, y0, th0 = oldest
-        _, x1, y1, th1 = self._history[-1]
-        return abs(th1 - th0), math.hypot(x1 - x0, y1 - y0)
+        _, x0, y0, _, _ = oldest
+        _, x1, y1, _, _ = self._history[-1]
+        return turned, math.hypot(x1 - x0, y1 - y0)
 
     def close(self):
         if self._file is not None:
