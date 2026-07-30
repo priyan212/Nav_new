@@ -11,7 +11,7 @@ Per frame:
      distance toward goal) and the NavDP critic (collision safety). This keeps
      the rover goal-directed even though the extracted checkpoint's learned
      point conditioning is weak.
-  6. Stop when the goal is within stop_distance or the bbox fills the view.
+  6. Stop when the depth-estimated goal point is within stop_distance.
 
 Returns a (linear, angular) velocity command plus rich debug info.
 """
@@ -104,7 +104,9 @@ class PipelineConfig:
     #                                  latency: DINO + bbox-goal still run every tick; the
     #                                  mask is cached and reused in between as long as the
     #                                  current DINO box still overlaps the one SAM last saw)
-    mask_stop_frac: float = 0.20     # mask area fraction of image -> stop
+    mask_stop_frac: float = 0.20     # mask area fraction of image -> stop (unused by this real-rover
+    #                                  pipeline's STOP decision, which is depth-only; kept for the
+    #                                  MARS/EARTH sim GUIs that still read it)
     # CLIP verification of the SAM-segmented crop against the target phrase,
     # paired 1:1 with each SAM re-segmentation (see sam_period_s). Catches a
     # confident DINO false positive before the rover commits to a goal: a
@@ -120,8 +122,9 @@ class PipelineConfig:
     scene_vocab: List[str] = field(default_factory=lambda: list(DEFAULT_VOCAB))
     scene_log_dir: str = "scene_log"   # one JSONL file per run; set to None/"" to disable file logging
     # goal / stopping
-    stop_distance: float = 0.8       # meters from object at which to stop
-    bbox_stop_frac: float = 0.55     # bbox height fraction of image -> stop (no-SAM fallback)
+    stop_distance: float = 1.5       # meters from object at which to stop (depth-only; no pixel/mask-size fallback)
+    bbox_stop_frac: float = 0.55     # bbox height fraction of image -> stop; same as mask_stop_frac,
+    #                                  unused here now, kept for the sim GUIs
     detect_score_min: float = 0.3
     # target loss behavior
     search_angular: float = 0.15     # spin to re-acquire when target not seen
@@ -433,10 +436,8 @@ class DinoNavDPPipeline:
                 best, best_iou = d, iou
         if best is not None and best_iou > 0.1:
             emb = self._embed_or_none(rgb, best.box)
-            appearance_ok = (
-                self._locked_embed is None or emb is None
-                or float(np.dot(emb, self._locked_embed)) >= self.cfg.appearance_min_similarity
-            )
+            sim = float(np.dot(emb, self._locked_embed)) if (emb is not None and self._locked_embed is not None) else None
+            appearance_ok = sim is None or sim >= self.cfg.appearance_min_similarity
             if appearance_ok:
                 self._box_miss_count = 0
                 a = self._BOX_TRACK_ALPHA
@@ -444,6 +445,12 @@ class DinoNavDPPipeline:
                 if emb is not None:
                     self._locked_embed = self._blend_embed(self._locked_embed, emb)
                 return best
+            size_frac = (best.box[3] - best.box[1]) / rgb.shape[0] if rgb is not None else float("nan")
+            print(f"[reid-debug] REJECTED sim={sim:.3f} < {self.cfg.appearance_min_similarity} "
+                  f"iou={best_iou:.2f} box_h_frac={size_frac:.2f} miss_count={self._box_miss_count + 1}")
+        elif dets:
+            print(f"[reid-debug] NO-IOU-MATCH best_iou={best_iou:.2f} miss_count={self._box_miss_count + 1} "
+                  f"(occlusion/edge-clip/lock lost, not a reid rejection)")
         self._box_miss_count += 1
         if self._box_miss_count > self.cfg.lost_patience:
             self._box_miss_count = 0
@@ -666,7 +673,6 @@ class DinoNavDPPipeline:
         goal = None
         if det is not None:
             res.detection = det
-            close_by_size = False
             clip_rejected = False
             if self.segmenter is not None:
                 now = time.time()
@@ -685,6 +691,9 @@ class DinoNavDPPipeline:
                         if score < self.cfg.clip_min_similarity:
                             clip_rejected = True
                             mask = None
+                            size_frac = (det.box[3] - det.box[1]) / H
+                            print(f"[reid-debug] CLIP REJECTED score={score:.3f} < {self.cfg.clip_min_similarity} "
+                                  f"box_h_frac={size_frac:.2f}")
                     self._last_sam_t = now
                     self._last_mask = mask
                     self._last_mask_box = det.box.copy() if mask is not None else None
@@ -703,13 +712,11 @@ class DinoNavDPPipeline:
                         from .goal_utils import pixel_depth_to_point
 
                         goal = pixel_depth_to_point(u, v, d, fx, fy, cx, cy)
-                    close_by_size = mask.mean() > self.cfg.mask_stop_frac
             if not clip_rejected and goal is None:  # SAM disabled, empty mask, or no valid mask depth
                 goal = goal_point_from_detection(det.box, depth, fx, fy, cx, cy)
-                close_by_size = (det.box[3] - det.box[1]) / H > self.cfg.bbox_stop_frac
             if goal is not None:
                 self._last_goal, self._lost_count = goal, 0
-                if np.linalg.norm(goal[:2]) < self.cfg.stop_distance or close_by_size:
+                if np.linalg.norm(goal[:2]) < self.cfg.stop_distance:
                     res.state = "STOP"
                     res.goal_point = goal
                     res.timing = timing

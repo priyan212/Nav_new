@@ -458,7 +458,7 @@ def main():
     p.add_argument("--max-linear", type=float, default=0.15)
     p.add_argument("--max-angular", type=float, default=0.25)
     p.add_argument("--fov", type=float, default=90.0, help="camera horizontal FOV (deg)")
-    p.add_argument("--stop-distance", type=float, default=0.8)
+    p.add_argument("--stop-distance", type=float, default=1.5)
     p.add_argument("--invert-angular", action="store_true",
                    help="flip turn direction (use if the rover steers away from the target)")
     p.add_argument("--device", type=str, default="cuda:0")
