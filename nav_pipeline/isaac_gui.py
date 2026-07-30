@@ -509,6 +509,10 @@ def main():
                          "(e.g. 70-90 on a 60deg-fov real rover) so bearings near the "
                          "frame edge get a proportionally gentler command instead of a "
                          "near-max snap turn.")
+    ap.add_argument("--angular-slew-max", type=float, default=0.10,
+                    help="rad/s hard cap on how much the angular command can change per tick, "
+                         "in every state -- bounds abrupt snap turns (e.g. entering/leaving "
+                         "SEARCH, or AVOID's full-authority turn). 0 disables.")
     ap.add_argument("--invert-angular", action="store_true",
                     help="flip turn direction (use if the rover steers away from the target)")
     ap.add_argument("--compressed-only", action="store_true",
@@ -525,6 +529,7 @@ def main():
         max_angular=args.max_angular,
         search_angular=min(args.search_angular, args.max_angular),
         servo_ramp_deg=args.servo_ramp_deg,
+        angular_slew_max=args.angular_slew_max,
         invert_angular=args.invert_angular,
     ))
 

@@ -91,6 +91,12 @@ class PipelineConfig:
     #                                  controller saturates within a few degrees, which reads as
     #                                  the rover snapping to full-rate turns instead of easing in)
     smoothing: float = 0.5           # cross-tick EMA on (lin, ang); 0 = off
+    angular_slew_max: float = 0.10   # hard cap on |Δangular| per tick (rad/s), applied to the
+    #                                  FINAL command in every state (unlike smoothing above, which
+    #                                  skips STOP/SEARCH) -- bounds how fast the turn rate itself can
+    #                                  change tick to tick, e.g. the snap when entering/leaving SEARCH
+    #                                  or AVOID's full-authority turn. 0 = off. At predict_hz≈3, 0.10
+    #                                  reaches max_angular (0.25 real-rover default) in ~3 ticks.
     avoid_confirm_ticks: int = 2     # consecutive guard hits before AVOID engages
     avoid_cooldown_ticks: int = 8    # keep biasing steering away from the escape side for this many
     #                                  more ticks after AVOID releases, so the rover actually clears the
@@ -590,6 +596,13 @@ class DinoNavDPPipeline:
             pl, pa = self._prev_cmd
             res.linear = (1 - a) * res.linear + a * pl
             res.angular = (1 - a) * res.angular + a * pa
+        # hard slew-rate limit on the final angular command, ALL states
+        # included (this is what catches the SEARCH/STOP snap that the EMA
+        # above deliberately skips) -- see PipelineConfig.angular_slew_max.
+        slew = self.cfg.angular_slew_max
+        if slew > 0:
+            prev_a = self._prev_cmd[1]
+            res.angular = max(prev_a - slew, min(prev_a + slew, res.angular))
         self._prev_cmd = (res.linear, res.angular)
         return res
 

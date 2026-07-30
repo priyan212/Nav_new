@@ -459,6 +459,8 @@ def main():
     p.add_argument("--max-angular", type=float, default=0.25)
     p.add_argument("--fov", type=float, default=90.0, help="camera horizontal FOV (deg)")
     p.add_argument("--stop-distance", type=float, default=1.5)
+    p.add_argument("--angular-slew-max", type=float, default=0.10,
+                   help="rad/s hard cap on angular command change per tick, all states (0 disables)")
     p.add_argument("--invert-angular", action="store_true",
                    help="flip turn direction (use if the rover steers away from the target)")
     p.add_argument("--device", type=str, default="cuda:0")
@@ -472,6 +474,7 @@ def main():
         max_linear=args.max_linear,
         max_angular=args.max_angular,
         stop_distance=args.stop_distance,
+        angular_slew_max=args.angular_slew_max,
         invert_angular=args.invert_angular,
     )
     pipeline = DinoNavDPPipeline(cfg)
