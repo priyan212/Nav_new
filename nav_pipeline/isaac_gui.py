@@ -80,7 +80,9 @@ class SharedState:
         self.latest_depth: Optional[np.ndarray] = None
         self.latest_depth_t = 0.0
         self.frame_count = 0
-        self.mode = "text"                      # "text" | "manual"
+        self.mode = "manual"                    # "text" | "manual" -- starts inert: no
+        #                                          target means nothing to autonomously
+        #                                          navigate to; send one to switch to "text"
         self.target = target
         self.stopped = False
         self.goal_reached = False
@@ -183,8 +185,15 @@ def inference_loop(pipe: DinoNavDPPipeline, st: SharedState, pubs, running,
             mode = st.mode
             target = st.target
             paused = st.stopped or st.goal_reached
-        if odom is not None and target != last_target:
-            odom.start_new_goal(target)
+        if target and target != last_target:
+            if last_target is not None:
+                # new goal: don't let tracked-box/goal-belief state from the
+                # PREVIOUS target leak into this one (stale pose across the
+                # odom reset below was corrupting belief's first ego-motion
+                # delta on a target switch)
+                pipe.reset()
+            if odom is not None:
+                odom.start_new_goal(target)
             last_target = target
         if rgb is None:
             time.sleep(0.1)
@@ -486,7 +495,9 @@ class App:
 
 def main():
     ap = argparse.ArgumentParser(description="Nav_new DINO+NavDP Isaac GUI")
-    ap.add_argument("--target", default="trash bin")
+    ap.add_argument("--target", default="",
+                    help="starts empty -- rover stays in manual drive with nothing to "
+                         "navigate to until a target is sent from the GUI (or passed here)")
     ap.add_argument("--pi-ip", default=None)
     ap.add_argument("--predict-hz", type=float, default=2.5)
     ap.add_argument("--fov", type=float, default=90.0)
@@ -515,6 +526,15 @@ def main():
                          "SEARCH, or AVOID's full-authority turn). 0 disables.")
     ap.add_argument("--invert-angular", action="store_true",
                     help="flip turn direction (use if the rover steers away from the target)")
+    ap.add_argument("--no-belief-goal", action="store_true",
+                    help="disable ego-motion goal belief (see goal_belief.py); reverts to "
+                         "coasting on the frozen last-seen goal while the target is lost")
+    ap.add_argument("--depth-encoder", choices=["vits", "vitb"], default="vits",
+                    help="RGB-only metric depth model size (no depth sensor on the real "
+                         "rover): vits is the default/fast one; vitb is more accurate "
+                         "(~2x slower) -- worth it since depth error feeds directly into "
+                         "the STOP distance decision. Needs checkpoints/depth_anything_v2_"
+                         "metric_hypersim_vitb.pth (scripts/download_models.py --depth-encoder vitb).")
     ap.add_argument("--compressed-only", action="store_true",
                     help="subscribe only the JPEG camera stream (REQUIRED over rover Wi-Fi)")
     ap.add_argument("--odometry-log-dir", type=str, default="odometry_log",
@@ -531,6 +551,8 @@ def main():
         servo_ramp_deg=args.servo_ramp_deg,
         angular_slew_max=args.angular_slew_max,
         invert_angular=args.invert_angular,
+        use_belief_goal=not args.no_belief_goal,
+        depth_encoder=args.depth_encoder,
     ))
 
     config = zenoh.Config()

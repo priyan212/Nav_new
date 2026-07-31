@@ -36,3 +36,12 @@ cd /mnt/bigdisk/Priyan/Nav_new
 ```
 # Launch script for the repeat is isaac sim
 ./ISAAC/launch_isaac_topo_repeat.sh --arrival-sim 0.85
+
+# Supervised live-rover A/B test (once 1-3 look right, with you present):
+
+./launch_rover.sh                        # belief ON (new default)
+./launch_rover.sh --no-belief-goal        # old frozen-goal behavior, for comparison
+
+# newlaunch file: launch_rover_vitb.sh — thin wrapper around launch_rover.sh (same Pi bringup/health checks) that just adds --depth-encoder vitb:
+./launch_rover_vitb.sh                          # default Pi IP
+./launch_rover_vitb.sh 10.47.234.125 --target "trash bin"

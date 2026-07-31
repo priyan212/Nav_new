@@ -463,6 +463,9 @@ def main():
                    help="rad/s hard cap on angular command change per tick, all states (0 disables)")
     p.add_argument("--invert-angular", action="store_true",
                    help="flip turn direction (use if the rover steers away from the target)")
+    p.add_argument("--no-belief-goal", action="store_true",
+                   help="disable ego-motion goal belief (see goal_belief.py); reverts to "
+                        "coasting on the frozen last-seen goal while the target is lost")
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--odometry-log-dir", type=str, default="odometry_log",
                    help="dead-reckoned pose CSV log dir (from /rover/rpm)")
@@ -476,6 +479,7 @@ def main():
         stop_distance=args.stop_distance,
         angular_slew_max=args.angular_slew_max,
         invert_angular=args.invert_angular,
+        use_belief_goal=not args.no_belief_goal,
     )
     pipeline = DinoNavDPPipeline(cfg)
 

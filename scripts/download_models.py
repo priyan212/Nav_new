@@ -11,7 +11,10 @@ can't be automated: it's gated behind InternRobotics/NavDP's checkpoint
 request form. This script just prints where it must go.
 
 Usage:
-  python scripts/download_models.py                # depth anything only
+  python scripts/download_models.py                # depth anything (vits) only
+  python scripts/download_models.py --depth-encoder vitb  # + the more accurate
+                                                      #   metric-hypersim base checkpoint
+                                                      #   (see nav_pipeline/depth_estimator.py)
   python scripts/download_models.py --vlm           # + InternVLA-N1-w-NavDP,
                                                       #   then auto-extracts
                                                       #   navdp_extracted.pth
@@ -31,25 +34,38 @@ DEPTH_ANYTHING_FILES = [
     ("depth-anything/Depth-Anything-V2-Metric-Hypersim-Small", "depth_anything_v2_metric_hypersim_vits.pth"),
 ]
 
+# additive per --depth-encoder value, matching nav_pipeline/depth_estimator.py's
+# _ENCODER_CONFIGS keys ("vits" is always downloaded above; this only adds more)
+METRIC_DEPTH_FILES = {
+    "vitb": ("depth-anything/Depth-Anything-V2-Metric-Hypersim-Base", "depth_anything_v2_metric_hypersim_vitb.pth"),
+}
+
 VLM_REPO = "InternRobotics/InternVLA-N1-w-NavDP"
 VLM_DIR = os.path.join(CKPT_DIR, "InternVLA-N1-w-NavDP")
 
 
-def download_depth_anything():
+def _download_one(repo_id, filename):
     from huggingface_hub import hf_hub_download
 
     os.makedirs(CKPT_DIR, exist_ok=True)
+    dest = os.path.join(CKPT_DIR, filename)
+    if os.path.exists(dest):
+        print(f"[skip] {filename} already present")
+        return
+    print(f"Downloading {filename} from {repo_id} ...")
+    path = hf_hub_download(repo_id=repo_id, filename=filename)
+    if os.path.islink(dest) or os.path.exists(dest):
+        os.remove(dest)
+    os.symlink(os.path.abspath(path), dest)
+    print(f"  -> {dest}")
+
+
+def download_depth_anything(extra_encoder: str = None):
     for repo_id, filename in DEPTH_ANYTHING_FILES:
-        dest = os.path.join(CKPT_DIR, filename)
-        if os.path.exists(dest):
-            print(f"[skip] {filename} already present")
-            continue
-        print(f"Downloading {filename} from {repo_id} ...")
-        path = hf_hub_download(repo_id=repo_id, filename=filename)
-        if os.path.islink(dest) or os.path.exists(dest):
-            os.remove(dest)
-        os.symlink(os.path.abspath(path), dest)
-        print(f"  -> {dest}")
+        _download_one(repo_id, filename)
+    if extra_encoder:
+        repo_id, filename = METRIC_DEPTH_FILES[extra_encoder]
+        _download_one(repo_id, filename)
 
 
 def download_vlm():
@@ -89,6 +105,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--vlm", action="store_true", help="also download InternVLA-N1-w-NavDP (~16 GB) and extract navdp_extracted.pth")
     parser.add_argument("--all", action="store_true", help="shorthand for --vlm")
+    parser.add_argument("--depth-encoder", choices=list(METRIC_DEPTH_FILES), default=None,
+                        help="also download this metric-depth checkpoint size (see "
+                             "nav_pipeline/depth_estimator.py); vits is always downloaded")
     args = parser.parse_args()
 
     try:
@@ -96,7 +115,7 @@ def main():
     except ImportError:
         sys.exit("huggingface_hub is required: pip install huggingface_hub")
 
-    download_depth_anything()
+    download_depth_anything(extra_encoder=args.depth_encoder)
 
     if args.vlm or args.all:
         download_vlm()

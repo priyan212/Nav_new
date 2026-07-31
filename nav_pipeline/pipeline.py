@@ -34,6 +34,7 @@ from .relational_target import (
     select_by_position,
     select_by_relation,
 )
+from .goal_belief import GoalBelief
 from .goal_utils import (
     goal_point_from_detection,
     intrinsics_from_fov,
@@ -127,6 +128,9 @@ class PipelineConfig:
     scene_tag_period_s: float = 1.0
     scene_vocab: List[str] = field(default_factory=lambda: list(DEFAULT_VOCAB))
     scene_log_dir: str = "scene_log"   # one JSONL file per run; set to None/"" to disable file logging
+    # RGB-only depth (no depth sensor): "vits" (default, fast) or "vitb"
+    # (more accurate, ~2x slower) -- see depth_estimator.py's _ENCODER_CONFIGS
+    depth_encoder: str = "vits"
     # goal / stopping
     stop_distance: float = 1.5       # meters from object at which to stop (depth-only; no pixel/mask-size fallback)
     bbox_stop_frac: float = 0.55     # bbox height fraction of image -> stop; same as mask_stop_frac,
@@ -135,6 +139,21 @@ class PipelineConfig:
     # target loss behavior
     search_angular: float = 0.15     # spin to re-acquire when target not seen
     lost_patience: int = 5           # frames to keep last goal before searching
+    # Ego-motion goal belief (see goal_belief.py): while the target isn't
+    # detected, propagate the goal by the rover's own dead-reckoned motion
+    # instead of coasting on a frozen last-seen point. False reverts to the
+    # exact pre-belief behavior (goal frozen at self._last_goal). Still
+    # bounded by lost_patience above either way -- belief only changes what
+    # the goal IS while coasting, not how many frames coasting is allowed.
+    use_belief_goal: bool = True
+    belief_sigma_init: float = 1000.0
+    belief_sigma_visible: float = 0.05
+    belief_odom_noise: float = 0.01
+    # see goal_belief.py's module docstring for where this starting point
+    # comes from (real spin-accuracy trials, not a physical constant)
+    belief_rot_noise_gain: float = 0.35
+    belief_max_sigma: float = 1.0    # above this, distrust belief and go to SEARCH
+    belief_decay_factor: float = 0.95
     # Target-ambiguity detection: a bare category prompt ("chair") is
     # genuinely underspecified when several same-class objects score
     # comparably -- there's no visual evidence for which one the operator
@@ -159,6 +178,17 @@ class PipelineConfig:
     use_appearance_reid: bool = True
     dinov2_model_id: str = "facebook/dinov2-small"
     appearance_min_similarity: float = 0.85  # sits above the measured 0.77 near-identical-twin score
+    # Very high IoU against the tracked reference box is itself overwhelming
+    # positional evidence of identity -- two DISTINCT physical objects
+    # essentially never land within this much overlap of the previous
+    # frame's box. Bypass the appearance check above this IoU: real-rover
+    # test 2026-07-31 ("chair near door") measured a genuine same-object
+    # re-acquisition (iou=0.88) scoring only sim=0.698 once the chair had
+    # gotten smaller/farther in frame (box_h_frac 0.18) -- DINOv2 crop
+    # embeddings aren't scale/distance-invariant enough to stay above
+    # appearance_min_similarity for a real match once apparent size changes,
+    # which was repeatedly rejecting valid re-locks and cycling into SEARCH.
+    appearance_iou_override: float = 0.6
 
 
 def _box_iou(a: np.ndarray, b: np.ndarray) -> float:
@@ -323,8 +353,15 @@ class DinoNavDPPipeline:
         if use_depth_estimator:
             from .depth_estimator import MetricDepthEstimator
 
-            self.depther = MetricDepthEstimator(device=cfg.device)
+            self.depther = MetricDepthEstimator(encoder=cfg.depth_encoder, device=cfg.device)
         print(f"[pipeline] models loaded in {time.time() - t0:.1f}s")
+
+        self.belief = GoalBelief(
+            sigma_init=cfg.belief_sigma_init, sigma_visible=cfg.belief_sigma_visible,
+            odom_noise=cfg.belief_odom_noise, rot_noise_gain=cfg.belief_rot_noise_gain,
+            decay_factor=cfg.belief_decay_factor,
+        )
+        self._prev_pose: Optional[tuple] = None   # (x, y, theta) last tick, for odom_delta
 
         self._memory: list = []      # last processed RGB frames (max 2)
         self._memory_d: list = []
@@ -345,6 +382,8 @@ class DinoNavDPPipeline:
         self._locked_embed: Optional[np.ndarray] = None
 
     def reset(self):
+        self.belief.reset()
+        self._prev_pose = None
         self._memory, self._memory_d = [], []
         self._lost_count = 0
         self._last_goal = None
@@ -443,7 +482,8 @@ class DinoNavDPPipeline:
         if best is not None and best_iou > 0.1:
             emb = self._embed_or_none(rgb, best.box)
             sim = float(np.dot(emb, self._locked_embed)) if (emb is not None and self._locked_embed is not None) else None
-            appearance_ok = sim is None or sim >= self.cfg.appearance_min_similarity
+            appearance_ok = (best_iou >= self.cfg.appearance_iou_override
+                             or sim is None or sim >= self.cfg.appearance_min_similarity)
             if appearance_ok:
                 self._box_miss_count = 0
                 a = self._BOX_TRACK_ALPHA
@@ -487,9 +527,16 @@ class DinoNavDPPipeline:
         continuity left to lean on, prefer whichever one's crop looks most
         like the object we had locked before losing it (DINOv2 cosine
         similarity), instead of blind top detector score.
+
+        Must still clear appearance_min_similarity -- picking whichever
+        candidate is merely LEAST dissimilar (with no floor) means once the
+        original object is gone for good, this happily locks onto a
+        DIFFERENT physical instance of the same class instead of continuing
+        to search for the one first locked onto. Returns None (refuse to
+        reacquire, caller falls through to SEARCH) if nothing clears it.
         """
         if self.reid is None or rgb is None or not dets:
-            return dets[0] if dets else None
+            return None
         best, best_sim = None, -1.0
         for d in dets:
             emb = self.reid.embed(rgb, d.box)
@@ -498,7 +545,9 @@ class DinoNavDPPipeline:
             sim = float(np.dot(emb, self._locked_embed))
             if sim > best_sim:
                 best, best_sim = d, sim
-        return best if best is not None else dets[0]
+        if best is None or best_sim < self.cfg.appearance_min_similarity:
+            return None
+        return best
 
     # ------------------------------------------------------------------ #
     def _select_trajectory(self, trajs: np.ndarray, critic: np.ndarray, goal: np.ndarray,
@@ -681,6 +730,25 @@ class DinoNavDPPipeline:
         self._memory = self._memory[-self._memory_size:]
         self._memory_d = self._memory_d[-self._memory_size:]
 
+        # --- odometry delta, for belief's ego-motion propagation -------- #
+        # pose is (x, y, theta) dead-reckoned odometry in a fixed world frame
+        # anchored to wherever the rover was when this goal started (see
+        # OdometryLogger). Convert the world-frame step since last tick into
+        # the rover's OWN previous-tick local frame (forward/left), which is
+        # what GoalBelief.propagate/ego_motion_update expects -- matches
+        # belief_bank.py's contract exactly, just fed from real wheel
+        # odometry instead of a sim step.
+        odom_delta = None
+        if pose is not None:
+            if self._prev_pose is not None:
+                x0, y0, th0 = self._prev_pose
+                x1, y1, th1 = pose
+                dxw, dyw = x1 - x0, y1 - y0
+                dx = dxw * np.cos(th0) + dyw * np.sin(th0)
+                dy = -dxw * np.sin(th0) + dyw * np.cos(th0)
+                odom_delta = (dx, dy, th1 - th0)
+            self._prev_pose = pose
+
         # --- goal ------------------------------------------------------ #
         fx, fy, cx, cy = intrinsics_from_fov(W, H, self.cfg.horizontal_fov_deg)
         goal = None
@@ -729,6 +797,8 @@ class DinoNavDPPipeline:
                 goal = goal_point_from_detection(det.box, depth, fx, fy, cx, cy)
             if goal is not None:
                 self._last_goal, self._lost_count = goal, 0
+                if self.cfg.use_belief_goal:
+                    self.belief.observe(goal, confidence=float(det.score))
                 if np.linalg.norm(goal[:2]) < self.cfg.stop_distance:
                     res.state = "STOP"
                     res.goal_point = goal
@@ -736,10 +806,42 @@ class DinoNavDPPipeline:
                     return res
         if goal is None:
             self._lost_count += 1
-            if self._last_goal is not None and self._lost_count <= self.cfg.lost_patience:
-                goal = self._last_goal
+            if self.cfg.use_belief_goal:
+                if odom_delta is not None:
+                    self.belief.propagate(*odom_delta)
+                belief_ok = self.belief.initialized and self.belief.sigma <= self.cfg.belief_max_sigma
+                # lost_patience (a frame-count cap) is NOT applied here on
+                # purpose: it predates belief, from when the goal was
+                # frozen and coasting too long on a stale point was the
+                # risk. Belief's sigma already grows with real elapsed
+                # ticks AND rotation (see goal_belief.py), so it's a more
+                # principled cutoff than an arbitrary tick count -- ANDing
+                # lost_patience=5 (~2s) on top of it was cutting off a
+                # still-confident, correctly-tracking belief after just a
+                # couple seconds regardless of how low sigma actually was.
             else:
-                # search: rotate in place toward the last known side
+                belief_ok = self._last_goal is not None and self._lost_count <= self.cfg.lost_patience
+            if belief_ok:
+                goal = self.belief.mu if self.cfg.use_belief_goal else self._last_goal
+                if self.cfg.use_belief_goal:
+                    print(f"[belief-debug] coasting tick {self._lost_count} "
+                          f"sigma={self.belief.sigma:.3f}/{self.cfg.belief_max_sigma}")
+            else:
+                if self.cfg.use_belief_goal:
+                    reason = "sigma too high" if self.belief.initialized else "belief not initialized"
+                    sigma_txt = f"{self.belief.sigma:.3f}" if self.belief.initialized else "n/a"
+                    print(f"[belief-debug] -> SEARCH: {reason} (sigma={sigma_txt} "
+                          f"max={self.cfg.belief_max_sigma}, lost_count={self._lost_count})")
+                # search: rotate in place toward the last known side. This
+                # MUST come from self._last_goal (frozen at the last real
+                # detection), never from self.belief.mu -- belief keeps
+                # rotating every occluded tick (including all through
+                # SEARCH, since propagate() above runs unconditionally), so
+                # using it here made the chosen side flip mid-sweep as the
+                # propagated estimate crossed y=0, and the rover reversed
+                # direction before ever completing a look-around (real
+                # rover test 2026-07-31: theta swung +116deg then reversed
+                # to -77deg hunting for a chair, never finding it).
                 res.state = "SEARCH"
                 side = 1.0
                 if self._last_goal is not None and self._last_goal[1] < 0:
@@ -770,7 +872,24 @@ class DinoNavDPPipeline:
                 if self._avoid_streak >= self.cfg.avoid_confirm_ticks:
                     res.state = "AVOID"
                     res.linear = -0.5 * self.cfg.max_linear if min_fwd < self.cfg.guard.reverse_dist else 0.0
-                    res.angular = escape * self.cfg.max_angular  # full turn authority
+                    # graduated turn-rate: full max_angular used to fire the
+                    # instant hard_stop_dist was crossed, regardless of
+                    # whether the obstacle was barely inside it or right on
+                    # top of the rover -- read as a sudden snap turn. Scale
+                    # from ang_min_cmd (just enough to overcome stiction) up
+                    # to max_angular as min_fwd shrinks from hard_stop_dist
+                    # down to reverse_dist (closer than that, footprint
+                    # geometry already means rotating isn't safe anyway --
+                    # see reverse-first branch above -- so full authority is
+                    # warranted there). Recomputed every AVOID tick, so the
+                    # rate also eases back down as the rover turns clear.
+                    urgency = np.clip(
+                        (self.cfg.guard.hard_stop_dist - min_fwd)
+                        / max(self.cfg.guard.hard_stop_dist - self.cfg.guard.reverse_dist, 1e-6),
+                        0.0, 1.0,
+                    )
+                    angular_mag = self.cfg.ang_min_cmd + urgency * (self.cfg.max_angular - self.cfg.ang_min_cmd)
+                    res.angular = escape * angular_mag
                     # latch the escape side + re-arm the cooldown (every
                     # trigger resets it to the full value, so a persistent
                     # obstacle keeps the post-escape bias alive throughout)

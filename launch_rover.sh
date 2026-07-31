@@ -15,7 +15,11 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
-PI_IP=${1:-10.47.234.125}; shift 2>/dev/null || true
+if [[ "${1:-}" == -* ]]; then
+    PI_IP=10.47.234.125
+else
+    PI_IP=${1:-10.47.234.125}; shift 2>/dev/null || true
+fi
 PI_USER=pi
 PI_PASS=${PI_PASS:-hri}
 SSH="sshpass -p $PI_PASS ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no $PI_USER@$PI_IP"
