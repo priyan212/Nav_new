@@ -1,7 +1,7 @@
 ```
 Hello new user of this repo, I'm Priyan an intern at this lab.
 If you need any help contact through GitHub: priyan212
-
+****PLEASE KEEP THE READMES UPDATED****
 ```
 
 # Nav_new — 6WD Rover Navigation: Grounding DINO + NavDP
@@ -96,6 +96,34 @@ enough for per-attempt diagnostics.
   to recognize the signature (θ monotonically running away while x, y barely
   move).
 
+## Goal belief (surviving occlusion)
+
+By default (`PipelineConfig.use_belief_goal = True`) the pipeline doesn't
+just freeze the goal at its last-seen position while the target is out of
+view — `nav_pipeline/goal_belief.py`'s `GoalBelief` propagates it by the
+rover's own dead-reckoned ego-motion instead (same idea as
+`SubgoalBeliefBank` in `MARS/mars-habitatsim/navdp/navdp/extensions/belief_bank.py`,
+which the MARS/EARTH sim GUIs use directly — this is a slimmed-down port for
+the single-goal real-rover/Isaac case). A scalar uncertainty (`sigma`) grows
+each occluded tick — a flat per-tick term plus a rotation-proportional term,
+since turning is where dead reckoning drifts fastest — and once it crosses
+`belief_max_sigma` the pipeline gives up on the propagated estimate and
+drops to `SEARCH`, overriding the older frame-count `lost_patience` cutoff
+while belief is enabled.
+
+The rotation-noise tuning came from real spin-accuracy trials
+(`scripts/odom_accuracy_gui.py`, launched via `./launch_odom_test.sh
+[PI_IP]` — a standalone GUI with no DINO/SAM/NavDP/depth models that just
+compares dead-reckoned odometry against hand-measured ground truth), logged
+to `odometry_log/odom_accuracy_results.csv`: heading error stays within a
+few degrees through ~90-135° of rotation, then grows sharply by 165-270°.
+See `nav_pipeline/goal_belief.py`'s module docstring and
+`belief_eval_20260730/RESULTS.md` for the full comparison against the old
+frozen-goal behavior (belief cuts occlusion-while-moving error ~3-11x, at
+the cost of depending on odometry quality). `scripts/test_belief_vs_frozen.py`
+reruns that comparison (~5 s, CPU only); `scripts/test_belief_integration.py`
+exercises the belief wiring inside a real `DinoNavDPPipeline` end to end.
+
 ## The four worlds it runs in
 
 The same `nav_pipeline` code drives all four — only the transport peer and
@@ -122,12 +150,14 @@ Nav_new/
 ├── configs/               yaml configs (isaac / real rover)
 ├── data/                 saved test frames + pipeline output snapshots
 ├── odometry_log/         dead-reckoned pose CSVs, one per goal (own README)
+├── belief_eval_*/        dated write-ups of the belief-vs-frozen occlusion eval (see Goal belief)
 ├── reference/            prior OmniVLA/InternVLA-N1 nodes, kept for reference
 ├── third_party/InternNav/  vendored InternNav source (checkpoints symlinked in)
 ├── esp32/                rover firmware + Pi-side serial/handshake helpers
 ├── MARS/                 Habitat-Sim Mars sub-project (own README)
 ├── EARTH/                Habitat-Sim real-world photogrammetry sub-project (own README)
-└── launch_*.sh           one-command entry points for each of the 4 worlds
+└── launch_*.sh           one-command entry points for each of the 4 worlds,
+                         plus launch_odom_test.sh (real-rover odometry-accuracy GUI, no perception models)
 ```
 
 ### `nav_pipeline/` — the package
@@ -140,6 +170,7 @@ Nav_new/
 - `navdp_net.py`, `navdp_backbone.py`, `depth_anything/` — standalone/extracted NavDP + Depth Anything V2, vendored from InternNav with imports fixed (InternNav's own package breaks under this repo's transformers version)
 - `depth_estimator.py` — Depth Anything V2 metric monocular depth for the RGB-only real rover
 - `goal_utils.py` — preprocessing + bbox→3D-goal math
+- `goal_belief.py` — ego-motion propagation of the tracked goal point while it's out of view, instead of freezing it (see [Goal belief](#goal-belief-surviving-occlusion))
 - `odometry_logger.py` — dead-reckons `/rover/rpm` (real wheel-encoder RPM) into a pose, one CSV per goal under `odometry_log/`; also backs the GUI's spin-stall watchdog (see [Odometry logging](#odometry-logging))
 - `pipeline.py` — the full perception→policy step, state machine, trajectory selection (the diagram above, as code)
 - `isaac_gui.py` — the control panel: camera + mask/bbox overlay, top-down trajectories + obstacles, live target entry
@@ -164,6 +195,10 @@ where noted:
 - `test_zenoh_loopback.py` — exercises a *running* node over Zenoh with a fake camera
 - `diag_goal_conditioning.py` — does the policy actually steer toward the goal?
 - `test_footprint_guard.py` — unit test for the footprint-swept clearance math
+- `test_belief_vs_frozen.py` — synthetic comparison of belief vs. frozen-goal occlusion handling (see [Goal belief](#goal-belief-surviving-occlusion))
+- `test_belief_integration.py` — exercises the belief wiring inside a real `DinoNavDPPipeline`
+- `odom_accuracy_gui.py` — standalone GUI (no perception/policy models) for measuring real-rover dead-reckoned odometry drift against hand-measured ground truth; launched via `./launch_odom_test.sh`
+- `demo_odom_accuracy_gui.py` — offline/no-hardware demo of the odometry-accuracy GUI's plotting
 - `extract_navdp_weights.py` — pulls the 198 MB NavDP head out of the 16 GB InternVLA-N1 checkpoint
 - `pi_install_services.sh` / `pi_auto_handshake.sh` — run **on the Pi**: install the camera/agent/zenoh systemd services and recover a wedged ESP32 micro-ROS session without a physical reset button
 
@@ -212,6 +247,10 @@ since the scan ships with no lights. Full detail in
 # Headless node only (no GUI), auto-discovers the rover/Isaac peer
 ./launch_dino_navdp.sh --target "trash bin"
 ./launch_dino_navdp.sh --pi-ip <PI_IP> --target "door"
+
+# Real-rover odometry accuracy check (no camera/DINO/SAM/NavDP -- see
+# "Goal belief" below for why this matters)
+./launch_odom_test.sh <PI_IP>
 ```
 
 Change the target at runtime by publishing `std_msgs/String` on

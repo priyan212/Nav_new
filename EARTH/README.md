@@ -117,3 +117,15 @@ metallic — loaded by default via `--sky` (pass `--sky ""` to disable).
 
 Never run `earth_gui.py` alongside another `cmd_vel` publisher
 (`mars_gui.py`, `isaac_gui.py`, `zenoh_node.py`).
+
+**Occlusion handling:** like `MarsPipeline`, `earth_gui.py`'s pipeline feeds
+the DINO/SAM goal point into a persistent `SubgoalBeliefBank`
+(`navdp.extensions.belief_bank`) instead of freezing it at the last-seen
+position — while the target is out of view its estimate is propagated by
+the rover's own ego-motion (`earth/pose`) and its confidence decays, so
+`SEARCH` only kicks in once confidence drops below `belief_confidence_min`.
+See [MARS/README.md](../MARS/README.md#running-the-nav-stack-on-mars) for
+more detail (including the `--belief-only` distractor-gated variant, which
+EARTH doesn't currently have its own copy of) and the top-level
+[README's "Goal belief" section](../README.md#goal-belief-surviving-occlusion)
+for the real-rover/Isaac port of the same idea.

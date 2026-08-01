@@ -39,6 +39,19 @@ previous goal to interpret it.
 `#define`s in `esp32/rover_6wd_complete.ino` (a bench recalibration there
 should be mirrored here).
 
+## `odom_accuracy_results.csv` and `odom_spin_*.csv` — a different kind of file
+
+These aren't per-goal navigation logs from `odometry_logger.py` — they're
+output from `scripts/odom_accuracy_gui.py` (launched via
+`./launch_odom_test.sh`), a standalone GUI that drives the real rover
+through a known motion (e.g. a controlled in-place spin) and compares the
+same dead-reckoned odometry against hand-measured ground truth, to answer
+"how much do we trust this odometry?" `odom_accuracy_results.csv` holds the
+summary (one row per trial); `odom_spin_<angle>deg_<timestamp>.csv` holds
+the raw per-sample trace for each individual spin trial. This is the
+empirical basis for `nav_pipeline/goal_belief.py`'s rotation-noise tuning —
+see the top-level [README's "Goal belief" section](../README.md#goal-belief-surviving-occlusion).
+
 ## Reading the signature of a stuck rover
 
 `theta` running away monotonically while `x, y` barely move is the signature

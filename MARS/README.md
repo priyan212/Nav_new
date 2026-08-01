@@ -89,3 +89,23 @@ Two processes over Zenoh (same contract as the Isaac Sim setup):
 
 Never run mars_gui.py and the other GUIs/zenoh_node at the same time — all
 publish `cmd_vel`.
+
+**Occlusion handling:** `MarsPipeline` (both scripts above) feeds the
+DINO/SAM goal point into a persistent `SubgoalBeliefBank`
+(`navdp.extensions.belief_bank`) instead of freezing it at the last-seen
+position — while the target is out of view, the belief's estimate is
+propagated by the rover's own ego-motion (`mars/pose`) and its confidence
+decays, so `SEARCH` only kicks in once that confidence drops below
+`belief_confidence_min`. This is the same idea later ported down to
+`nav_pipeline/goal_belief.py` for the real rover/Isaac pipeline (see the top
+level [README's "Goal belief" section](../README.md#goal-belief-surviving-occlusion)) —
+MARS keeps the richer, sim-only `SubgoalBeliefBank` rather than the
+slimmed-down real-rover port.
+
+`./MARS/launch_mars.sh --belief-only [--distractor-gate 2.0] [--target "boulder"]`
+runs `scripts/mars_belief_only_gui.py` instead: the goal is *always* the
+belief's mean, and DINO/SAM still run every frame, but a fresh detection
+only updates the belief if it's within `--distractor-gate` metres of where
+the belief currently predicts the target to be. This is a deliberate
+distractor-rejection test — a second, unrelated stone entering frame won't
+yank the goal onto it the way a plain per-frame detection would.
