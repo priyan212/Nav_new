@@ -249,13 +249,18 @@ class EarthPipeline(DinoNavDPPipeline):
         res.timing = timing
         return res
 
-    def _step_inner(self, rgb: np.ndarray, target_text: str, depth: Optional[np.ndarray] = None) -> StepResult:
+    def _step_inner(self, rgb: np.ndarray, target_text: str, depth: Optional[np.ndarray] = None,
+                     pose: Optional[tuple] = None) -> StepResult:
         """Same as DinoNavDPPipeline._step_inner, except the DINO/SAM goal
         point feeds a persistent SubgoalBeliefBank instead of a frozen
         last-seen vector: while the target is out of view its estimated
         position is propagated by the rover's own ego-motion (earth/pose) and
         its confidence decays, so SEARCH only kicks in once that confidence
-        drops below belief_confidence_min (see class docstring)."""
+        drops below belief_confidence_min (see class docstring).
+
+        `pose` is accepted only for signature parity with
+        DinoNavDPPipeline.step()/_step_inner(); this subclass sources pose
+        from self._pose_for_tick, set via set_pose() before each step()."""
         cfg = self.cfg
         res = StepResult()
         H, W = rgb.shape[:2]

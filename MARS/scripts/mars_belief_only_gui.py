@@ -89,7 +89,11 @@ class BeliefOnlyPipeline(MarsPipeline):
         super().__init__(cfg, use_depth_estimator=use_depth_estimator, belief_confidence_min=0.0)
         self.distractor_gate_m = float(distractor_gate_m)
 
-    def _step_inner(self, rgb: np.ndarray, target_text: str, depth: Optional[np.ndarray] = None) -> StepResult:
+    def _step_inner(self, rgb: np.ndarray, target_text: str, depth: Optional[np.ndarray] = None,
+                     pose: Optional[tuple] = None) -> StepResult:
+        # `pose` is accepted only for signature parity with
+        # DinoNavDPPipeline.step()/_step_inner(); this subclass sources pose
+        # from self._pose_for_tick, set via set_pose() before each step().
         cfg = self.cfg
         res = StepResult()
         H, W = rgb.shape[:2]

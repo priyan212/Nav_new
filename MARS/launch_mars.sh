@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-command bringup for the Mars habitat sim + DINO+NavDP GUI.
-#   ./MARS/launch_mars.sh              # rock_envs/run1 rocks load by default
-#   ./MARS/launch_mars.sh --no-rocks   # empty yard, no rocks
+#   ./MARS/launch_mars.sh              # empty yard, no rocks by default
+#   ./MARS/launch_mars.sh --rocks      # rock_envs/run1 rocks loaded
 #   ./MARS/launch_mars.sh --belief-only                     # goal locked to belief (scripts/mars_belief_only_gui.py)
 #   ./MARS/launch_mars.sh --belief-only --distractor-gate 2.0 --target "boulder"
 #   ./MARS/launch_mars.sh --max-climb-deg 25               # rover balking at climbing slopes/hills? raise this
@@ -19,7 +19,7 @@ source /home/i3d/exit/etc/profile.d/conda.sh
 # so this launcher just tolerates unset vars instead.
 set -e
 
-ROCKS_ARG="--rocks $HERE/mars-habitatsim/rock_envs/run1/rock_field.json"
+ROCKS_ARG=""
 GUI_SCRIPT="$HERE/scripts/mars_gui.py"
 
 # consume launcher-level flags (any order); everything left over is passed
@@ -27,11 +27,11 @@ GUI_SCRIPT="$HERE/scripts/mars_gui.py"
 while [[ $# -gt 0 ]]; do
     case "${1:-}" in
         --no-rocks)
-            ROCKS_ARG=""
-            shift
+            shift   # accepted for backwards compatibility; no rocks is now the default
             ;;
         --rocks)
-            shift   # accepted for backwards compatibility; rocks are now the default
+            ROCKS_ARG="--rocks $HERE/mars-habitatsim/rock_envs/run1/rock_field.json"
+            shift
             ;;
         --belief-only)
             # goal locked to the belief; DINO/SAM still run every frame but a
