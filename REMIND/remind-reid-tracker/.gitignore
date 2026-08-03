@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.venv/
+venv/
+env/
+
+.DS_Store
+PERF_OPTIMIZATIONS.md
+d4sm
+
+*.pt
+
+# Self-contained runtime env and caches (see SETUP.md)
+.cache/
+outputs/

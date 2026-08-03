@@ -21,3 +21,9 @@ MARS/data/
 
 # Per-run scene tag logs (see scene_log/README.md)
 scene_log/*.jsonl
+
+# REMIND sample media (large binaries, not tracked)
+REMIND/*.mp4
+REMIND/*.pdf
+REMIND/remind-reid-tracker/testData/videos/**/*.mp4
+2607.09267v1.pdf

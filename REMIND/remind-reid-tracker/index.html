@@ -1,0 +1,971 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>REMIND</title>
+  <style>
+    :root {
+      --text: #111111;
+      --muted: #5f6f82;
+      --line: #d8e0ea;
+      --soft: #f5f7fa;
+      --accent: #0f766e;
+      --accent-dark: #115e59;
+      --link: #1687e8;
+      --max: 980px;
+      --media-max: 860px;
+      --wide-media-max: 1000px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      color: var(--text);
+      font-family: Arial, Helvetica, sans-serif;
+      font-size: 16px;
+      line-height: 1.6;
+      background: #ffffff;
+    }
+
+    a {
+      color: var(--link);
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    header,
+    section,
+    footer {
+      max-width: var(--max);
+      margin: 0 auto;
+      padding: 34px 22px;
+    }
+
+    header {
+      padding-top: 62px;
+      text-align: center;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 46px;
+      line-height: 1.15;
+      font-weight: 700;
+    }
+
+    .title-tail {
+      font-style: italic;
+      font-weight: 400;
+    }
+
+    h2 {
+      margin: 0 0 16px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--line);
+      font-size: 25px;
+      font-weight: 700;
+      text-align: center;
+    }
+
+    .collapsible-section details {
+      width: 100%;
+    }
+
+    .collapsible-section summary {
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--line);
+      cursor: pointer;
+      font-size: 25px;
+      font-weight: 700;
+      line-height: 1.3;
+      text-align: center;
+    }
+
+    .collapsible-section summary::marker {
+      color: var(--muted);
+      font-size: 18px;
+    }
+
+    .collapsible-content {
+      padding-top: 16px;
+    }
+
+    .collapsible-content > p {
+      max-width: 820px;
+      margin-left: auto;
+      margin-right: auto;
+      text-align: justify;
+      text-align-last: left;
+    }
+
+    h3 {
+      margin: 0 0 8px;
+      font-size: 18px;
+      text-align: center;
+    }
+
+    h4 {
+      margin: 22px 0 8px;
+      font-size: 16px;
+      text-align: center;
+    }
+
+    p {
+      margin: 0 0 14px;
+    }
+
+    section > p {
+      max-width: 820px;
+      margin-left: auto;
+      margin-right: auto;
+      text-align: justify;
+      text-align-last: left;
+    }
+
+    .subtitle {
+      margin: 14px auto 8px;
+      max-width: 820px;
+      color: var(--muted);
+      font-size: 22px;
+    }
+
+    .venue,
+    .authors,
+    .affiliation {
+      margin: 8px 0;
+      font-size: 18px;
+      color: var(--muted);
+    }
+
+    .authors {
+      color: var(--link);
+      font-weight: 700;
+    }
+
+    .buttons {
+      display: flex;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 22px;
+    }
+
+    .button {
+      display: inline-flex;
+      justify-content: center;
+      align-items: center;
+      min-width: 96px;
+      min-height: 38px;
+      padding: 8px 15px;
+      border: 1px solid #111111;
+      border-radius: 5px;
+      color: #ffffff;
+      background: #111111;
+      font-weight: 700;
+    }
+
+    .button.secondary {
+      color: #ffffff;
+      background: #111111;
+    }
+
+    .button:hover {
+      background: #333333;
+      color: #ffffff;
+      text-decoration: none;
+    }
+
+    .hero-video,
+    .video-grid,
+    .result-grid,
+    .method-grid {
+      margin-top: 20px;
+    }
+
+    .hero-video {
+      max-width: var(--media-max);
+      margin-left: auto;
+      margin-right: auto;
+      border: 1px solid var(--line);
+      background: var(--soft);
+    }
+
+    video,
+    img {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+
+    .caption {
+      margin: 9px 12px 12px;
+      color: var(--muted);
+      font-size: 14px;
+      text-align: center;
+    }
+
+    .video-note {
+      max-width: 900px;
+      margin: 12px auto 0;
+      color: var(--muted);
+      font-size: 15px;
+      text-align: justify;
+      text-align-last: left;
+    }
+
+    .video-grid,
+    .result-grid,
+    .method-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    #videos {
+      max-width: var(--wide-media-max);
+    }
+
+    #videos .video-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 20px;
+    }
+
+    #videos video {
+      aspect-ratio: 16 / 9;
+      background: #000000;
+      object-fit: contain;
+    }
+
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #ffffff;
+      overflow: hidden;
+    }
+
+    .panel-body {
+      padding: 14px;
+    }
+
+    .placeholder {
+      display: flex;
+      min-height: 190px;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      color: var(--muted);
+      text-align: center;
+      background: var(--soft);
+    }
+
+    .qualitative-feature {
+      grid-column: 1 / -1;
+    }
+
+    #qualitative {
+      max-width: var(--wide-media-max);
+    }
+
+    #qualitative .result-grid {
+      grid-template-columns: 1fr;
+      gap: 20px;
+    }
+
+    .comparison-labels {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      background: #111111;
+      color: #ffffff;
+      font-size: 15px;
+      font-weight: 700;
+      text-align: center;
+    }
+
+    .comparison-labels span {
+      padding: 10px 12px;
+    }
+
+    .comparison-labels span + span {
+      border-left: 1px solid #555555;
+    }
+
+    .comparison-labels.three-way {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .qualitative-video {
+      aspect-ratio: 32 / 9;
+      background: #000000;
+      object-fit: contain;
+    }
+
+    .qualitative-video.three-way {
+      aspect-ratio: 3840 / 848;
+    }
+
+    .method-step {
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--soft);
+      text-align: justify;
+      text-align-last: left;
+    }
+
+    .method-step strong {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--accent-dark);
+      text-align: center;
+    }
+
+    .dataset-examples {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+      margin-top: 20px;
+    }
+
+    .dataset-examples img,
+    .dataset-examples .placeholder {
+      aspect-ratio: 16 / 9;
+      min-height: 190px;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: #ffffff;
+      object-fit: cover;
+    }
+
+    .dataset-examples .placeholder {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    #dataset {
+      max-width: var(--wide-media-max);
+    }
+
+    .dataset-list {
+      display: grid;
+      gap: 20px;
+      margin-top: 20px;
+    }
+
+    .dataset-links {
+      display: flex;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .small-button {
+      display: inline-flex;
+      justify-content: center;
+      min-height: 32px;
+      min-width: 128px;
+      align-items: center;
+      padding: 6px 11px;
+      border: 1px solid #111111;
+      border-radius: 5px;
+      color: #ffffff;
+      background: #111111;
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    .small-button:hover {
+      color: #ffffff;
+      background: #333333;
+      text-decoration: none;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      font-size: 15px;
+    }
+
+    th,
+    td {
+      padding: 10px;
+      border: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: var(--soft);
+    }
+
+    code,
+    pre {
+      font-family: Consolas, Monaco, "Courier New", monospace;
+    }
+
+    pre {
+      overflow-x: auto;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--soft);
+      font-size: 14px;
+    }
+
+    footer {
+      margin-top: 20px;
+      padding-bottom: 48px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    @media (max-width: 720px) {
+      header,
+      section,
+      footer {
+        padding-left: 16px;
+        padding-right: 16px;
+      }
+
+      h1 {
+        font-size: 34px;
+      }
+
+      .subtitle {
+        font-size: 18px;
+      }
+
+      .video-grid,
+      .result-grid,
+      .method-grid {
+        grid-template-columns: 1fr;
+      }
+
+      #videos .video-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .dataset-examples {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <header>
+    <h1>REMIND: <span class="title-tail">RE-Identification with Memory for INDoor Navigation</span></h1>
+    <p class="authors">Pablo Diaz-Pereda, Alejandro Rodriguez-Ramos, David Perez-Saura, and Pascual Campoy</p>
+    <p class="affiliation">
+      Computer Vision and Aerial Robotics Group at Centre for Automation and Robotics C.A.R. (UPM-CSIC),
+      Universidad Politecnica de Madrid (CVAR-UPM), Calle Jose Gutierrez Abascal 2, 28006 Madrid, Spain
+    </p>
+
+    <div class="buttons">
+      <a class="button" href="https://arxiv.org/abs/2607.09267">Paper</a>
+      <a class="button secondary" href="https://github.com/cvar-vision-dl/remind-reid-tracker/blob/main/REMIND_METHOD.md">Method</a>
+      <a class="button secondary" href="https://github.com/cvar-vision-dl/remind-reid-tracker">Code</a>
+    </div>
+
+    <div class="hero-video">
+      <video controls muted playsinline preload="metadata">
+        <source src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/overview.mp4#t=0.1" type="video/mp4" />
+        Your browser does not support the video tag.
+      </video>
+      <p class="caption">
+        REMIND overview video.
+      </p>
+      <p class="video-note">
+        To read the visualization, follow each object's color and class label over time: when they remain stable, REMIND
+        is preserving the same identity for the same physical object. White masks indicate ambiguous or provisional
+        tracks, where the system delays committing to a persistent identity until there is enough evidence.
+      </p>
+    </div>
+  </header>
+
+  <section id="abstract">
+    <h2>Abstract</h2>
+    <p>
+      Mobile robots operating indoors must re-identify previously observed objects after long temporal gaps, significant
+      viewpoint changes, and severe illumination variations. This remains a challenging problem: multi-object tracking
+      methods are optimized for short-term association of pedestrians and vehicles at video rates, person and vehicle
+      re-identification approaches lack persistent memory mechanisms, and state-of-the-art video object segmentation
+      techniques rely on reactive distractor filtering rather than enforcing global identity consistency.
+    </p>
+    <p>
+      To address these limitations, we present REMIND, an online tracker designed for long-term multi-object
+      re-identification of generic indoor objects from monocular RGB imagery, requiring neither camera pose nor depth.
+      Motivated by evidence from visual cognition that humans rely on accumulated appearance familiarity and spatial
+      context rather than explicit self-localization, REMIND combines frozen DINOv3 features with a dual-bank
+      multi-prototype appearance memory, part- and background-level descriptors, a neighbour-context reasoning module
+      exploiting spatial co-occurrence, and joint Hungarian assignment with ambiguity-aware safeguards. On a
+      purpose-built indoor dataset featuring controlled revisits and dense same-class clutter, REMIND reaches 90.35%
+      IDF1, nearly 20 points above a state-of-the-art video object segmentation baseline and more than 36 above a strong
+      tracking-by-detection baseline. On ScanNet++, it attains the highest IDF1 in every setting but one, end-to-end
+      detection over all scenes, where the tracking-by-detection baseline is marginally ahead while REMIND still
+      associates and recovers identities more accurately; it also completes every scene, whereas the video object
+      segmentation baseline exhausts GPU memory on 66.9% under YOLO detections. The complete system, evaluation
+      framework, and dataset are publicly released.
+    </p>
+  </section>
+
+  <section id="dataset" class="collapsible-section">
+    <details>
+      <summary>Datasets</summary>
+      <div class="collapsible-content">
+    <div class="dataset-list">
+      <div class="method-step">
+        <strong>Custom Dataset</strong>
+        Single video recorded in a living room under controlled conditions. The sequence contains medium-low object
+        density and a medium level of repeated object classes, with controlled viewpoint and illumination variation.
+        <div class="dataset-examples">
+          <img src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/custom_gt_frame_000045.png" alt="Custom dataset GT masks for frame 000045" loading="lazy" decoding="async" />
+          <img src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/custom_gt_frame_000105.png" alt="Custom dataset GT masks for frame 000105" loading="lazy" decoding="async" />
+          <img src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/custom_gt_frame_000187.png" alt="Custom dataset GT masks for frame 000187" loading="lazy" decoding="async" />
+          <img src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/custom_gt_frame_000278.png" alt="Custom dataset GT masks for frame 000278" loading="lazy" decoding="async" />
+          <img src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/custom_gt_frame_000816.png" alt="Custom dataset GT masks for frame 000816" loading="lazy" decoding="async" />
+          <img src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/custom_gt_frame_000930.png" alt="Custom dataset GT masks for frame 000930" loading="lazy" decoding="async" />
+        </div>
+      </div>
+      <div class="method-step">
+        <strong>ScanNet++</strong>
+        Indoor scenes with object instances, semantic labels, and segmentation masks. We convert selected scenes to a
+        DAVIS-style tracking format to evaluate identity consistency across complex real-world indoor environments. The
+        GIFs shown below use the official ScanNet++ benchmark annotations from the official dataset release.
+        <div class="dataset-examples">
+          <img src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/scannetpp_gt_scene_f1e01af60a.gif" alt="ScanNet++ scene f1e01af60a with benchmark GT masks and class labels" loading="lazy" decoding="async" />
+          <img src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/scannetpp_gt_scene_3ff873c77e.gif" alt="ScanNet++ scene 3ff873c77e with benchmark GT masks and class labels" loading="lazy" decoding="async" />
+          <img src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/scannetpp_gt_scene_d3b7d054c4.gif" alt="ScanNet++ scene d3b7d054c4 with benchmark GT masks and class labels" loading="lazy" decoding="async" />
+          <img src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/scannetpp_gt_scene_07e6f56969.gif" alt="ScanNet++ scene 07e6f56969 with benchmark GT masks and class labels" loading="lazy" decoding="async" />
+          <img src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/scannetpp_gt_scene_41b00feddb.gif" alt="ScanNet++ scene 41b00feddb with benchmark GT masks and class labels" loading="lazy" decoding="async" />
+          <img src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/scannetpp_gt_scene_45b0dac5e3.gif" alt="ScanNet++ scene 45b0dac5e3 with benchmark GT masks and class labels" loading="lazy" decoding="async" />
+        </div>
+        <div class="dataset-links">
+          <a class="small-button" href="https://scannetpp.mlsg.cit.tum.de/scannetpp/">ScanNet++ page</a>
+          <a class="small-button" href="https://github.com/scannetpp/scannetpp">Code</a>
+        </div>
+      </div>
+    </div>
+      </div>
+    </details>
+  </section>
+
+  <section id="videos" class="collapsible-section">
+    <details>
+      <summary>Tracking Examples</summary>
+      <div class="collapsible-content">
+    <p>
+      These examples show REMIND tracking on selected ScanNet++ indoor scenes converted to DAVIS-style sequences.
+    </p>
+    <div class="video-grid">
+      <div class="panel">
+        <video controls muted playsinline preload="none">
+          <source src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/remind_example_scene_13b4efaf62.mp4#t=0.1" type="video/mp4" />
+        </video>
+      </div>
+
+      <div class="panel">
+        <video controls muted playsinline preload="none">
+          <source src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/remind_example_scene_2748de13fb.mp4#t=0.1" type="video/mp4" />
+        </video>
+      </div>
+
+      <div class="panel">
+        <video controls muted playsinline preload="none">
+          <source src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/remind_example_scene_3b50ff5f35.mp4#t=0.1" type="video/mp4" />
+        </video>
+      </div>
+
+      <div class="panel">
+        <video controls muted playsinline preload="none">
+          <source src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/remind_example_scene_589f5c7c58.mp4#t=0.1" type="video/mp4" />
+        </video>
+      </div>
+
+      <div class="panel">
+        <video controls muted playsinline preload="none">
+          <source src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/remind_example_scene_778769dad8.mp4#t=0.1" type="video/mp4" />
+        </video>
+      </div>
+
+      <div class="panel">
+        <video controls muted playsinline preload="none">
+          <source src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/remind_example_scene_95450f0c4e.mp4#t=0.1" type="video/mp4" />
+        </video>
+      </div>
+
+      <div class="panel">
+        <video controls muted playsinline preload="none">
+          <source src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/remind_example_scene_9d7e20fbec.mp4#t=0.1" type="video/mp4" />
+        </video>
+      </div>
+
+      <div class="panel">
+        <video controls muted playsinline preload="none">
+          <source src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/remind_example_scene_c026d108e0.mp4#t=0.1" type="video/mp4" />
+        </video>
+      </div>
+
+      <div class="panel">
+        <video controls muted playsinline preload="none">
+          <source src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/remind_example_scene_e6372539da.mp4#t=0.1" type="video/mp4" />
+        </video>
+      </div>
+
+      <div class="panel">
+        <video controls muted playsinline preload="none">
+          <source src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/remind_example_scene_eeeb9836b8.mp4#t=0.1" type="video/mp4" />
+        </video>
+      </div>
+    </div>
+      </div>
+    </details>
+  </section>
+
+  <section id="results">
+    <h2>Main Results</h2>
+    <p>
+      REMIND explicitly models ambiguous and uncertain cases. For quantitative evaluation, ambiguous/provisional
+      labels are collapsed into a final identity decision so standard tracking metrics can be computed. This collapsed
+      output is used only for reporting: internally, the method does not always force an immediate identity label.
+    </p>
+    <p class="video-note">
+      MASA is evaluated with an adapted MASA-GDINO setup: class-aware association, full-scene memory, disabled spatial
+      distance filtering, and 0.3 embedding momentum. ScanNet++ rows report the DAM4SAM-comparable subset; the YOLO
+      subset uses the V2 forced split.
+    </p>
+    <h3>Evaluation with ground-truth masks</h3>
+    <h4>Custom Dataset</h4>
+    <table>
+      <thead>
+        <tr>
+          <th>Method</th>
+          <th>Detector</th>
+          <th>IDF1</th>
+          <th>Recovery</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>DAM4SAM</td>
+          <td>GT masks init</td>
+          <td>70.53%</td>
+          <td>69.15%</td>
+        </tr>
+        <tr>
+          <td>MASA</td>
+          <td>GT masks</td>
+          <td>53.84%</td>
+          <td>45.74%</td>
+        </tr>
+        <tr>
+          <td>REMIND</td>
+          <td>GT masks</td>
+          <td><strong>90.35%</strong></td>
+          <td><strong>85.46%</strong></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h4>ScanNet++</h4>
+    <table>
+      <thead>
+        <tr>
+          <th>Method</th>
+          <th>Detector</th>
+          <th>IDF1</th>
+          <th>Recovery</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>DAM4SAM</td>
+          <td>GT masks init</td>
+          <td>60.71%</td>
+          <td>41.65%</td>
+        </tr>
+        <tr>
+          <td>MASA</td>
+          <td>GT masks</td>
+          <td>57.01%</td>
+          <td>42.65%</td>
+        </tr>
+        <tr>
+          <td>REMIND</td>
+          <td>GT masks</td>
+          <td><strong>66.67%</strong></td>
+          <td><strong>58.36%</strong></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Evaluation with YOLO detections</h3>
+    <h4>Custom Dataset</h4>
+    <table>
+      <thead>
+        <tr>
+          <th>Method</th>
+          <th>Detector</th>
+          <th>IDF1</th>
+          <th>Recovery</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>DAM4SAM</td>
+          <td>YOLO init</td>
+          <td>64.54%</td>
+          <td>65.96%</td>
+        </tr>
+        <tr>
+          <td>MASA</td>
+          <td>YOLO</td>
+          <td>45.76%</td>
+          <td>38.65%</td>
+        </tr>
+        <tr>
+          <td>REMIND</td>
+          <td>YOLO</td>
+          <td><strong>75.45%</strong></td>
+          <td><strong>79.08%</strong></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h4>ScanNet++</h4>
+    <table>
+      <thead>
+        <tr>
+          <th>Method</th>
+          <th>Detector</th>
+          <th>IDF1</th>
+          <th>Recovery</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>DAM4SAM</td>
+          <td>YOLO init</td>
+          <td>57.97%</td>
+          <td><strong>53.59%</strong></td>
+        </tr>
+        <tr>
+          <td>MASA</td>
+          <td>YOLO</td>
+          <td>60.38%</td>
+          <td>46.89%</td>
+        </tr>
+        <tr>
+          <td>REMIND</td>
+          <td>YOLO</td>
+          <td><strong>61.30%</strong></td>
+          <td>46.23%</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="qualitative" class="collapsible-section">
+    <details>
+      <summary>Qualitative Results</summary>
+      <div class="collapsible-content">
+    <p>
+      Qualitative comparisons focus on the effect of the detection source in the custom video and on the comparison
+      among REMIND, DAM4SAM, and MASA in selected ScanNet++ benchmark scenes.
+    </p>
+    <p class="video-note">
+      In these videos, stable colors and class labels are the main cue for correct re-identification: they show that the
+      tracker keeps assigning the same identity to the same object across frames. White masks mark ambiguous or temporary
+      assignments, reflecting cases where REMIND is intentionally cautious before updating its memory.
+    </p>
+    <div class="result-grid">
+      <div class="panel qualitative-feature">
+        <div class="panel-body">
+          <h3>Custom video: GT masks vs YOLO detections</h3>
+          <p>
+            Side-by-side REMIND comparison on the custom video, contrasting tracking from ground-truth masks with
+            tracking from YOLO detections.
+          </p>
+          <p>
+            YOLO is expected to perform worse than ground-truth masks because detections can fail, mask boundaries are
+            less precise, and a single object may be split into multiple regions. These fragments create false duplicate
+            objects and can pollute the contextual memory used to describe nearby objects.
+          </p>
+        </div>
+        <div class="comparison-labels">
+          <span>Detector: GT masks</span>
+          <span>Detector: YOLO</span>
+        </div>
+        <video class="qualitative-video" controls muted playsinline preload="none">
+          <source src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/remind_custom_gt_vs_yolo.mp4#t=0.1" type="video/mp4" />
+        </video>
+      </div>
+
+      <div>
+        <h3>REMIND vs DAM4SAM vs MASA on ScanNet++</h3>
+        <p>
+          Three-way qualitative comparisons on five official ScanNet++ benchmark scenes converted to DAVIS-style
+          tracking sequences.
+        </p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-body">
+          <p>
+            In the first ScanNet++ example, REMIND keeps the bed region and the curtain more consistently tracked, while
+            DAM4SAM intermittently loses them. MASA struggles especially in the bed area, where it confuses the blankets
+            and pillows, while the other methods preserve these identities more reliably.
+          </p>
+        </div>
+        <div class="comparison-labels three-way">
+          <span>REMIND</span>
+          <span>DAM4SAM</span>
+          <span>MASA</span>
+        </div>
+        <video class="qualitative-video three-way" controls muted playsinline preload="none" aria-label="REMIND vs DAM4SAM vs MASA comparison on ScanNet++ scene 02f25e5fee">
+          <source src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/COMPARE_REMIND_GT_VS_D4SM_GT_INIT_VS_MASA_GT_02f25e5fee.mp4#t=0.1" type="video/mp4" />
+        </video>
+      </div>
+
+      <div class="panel">
+        <div class="panel-body">
+          <p>
+            In the second example, DAM4SAM loses the wardrobe, the blanket, and one of the curtains, while REMIND keeps
+            these objects more consistently tracked. MASA also struggles with the pillows, wardrobe, and curtain; although
+            DAM4SAM exhibits related failures in this area, REMIND handles these objects more reliably than both baselines.
+          </p>
+        </div>
+        <div class="comparison-labels three-way">
+          <span>REMIND</span>
+          <span>DAM4SAM</span>
+          <span>MASA</span>
+        </div>
+        <video class="qualitative-video three-way" controls muted playsinline preload="none" aria-label="REMIND vs DAM4SAM vs MASA comparison on ScanNet++ scene 268513240f">
+          <source src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/COMPARE_REMIND_GT_VS_D4SM_GT_INIT_VS_MASA_GT_268513240f.mp4#t=0.1" type="video/mp4" />
+        </video>
+      </div>
+
+      <div class="panel">
+        <div class="panel-body">
+          <p>
+            In the third example, DAM4SAM loses the table and several objects placed on top of it at some point in the
+            sequence, while REMIND preserves more stable identities. MASA behaves similarly to DAM4SAM: after the temporal
+            jump, it recovers several objects with incorrect identities.
+          </p>
+        </div>
+        <div class="comparison-labels three-way">
+          <span>REMIND</span>
+          <span>DAM4SAM</span>
+          <span>MASA</span>
+        </div>
+        <video class="qualitative-video three-way" controls muted playsinline preload="none" aria-label="REMIND vs DAM4SAM vs MASA comparison on ScanNet++ scene 2f5996ff01">
+          <source src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/COMPARE_REMIND_GT_VS_D4SM_GT_INIT_VS_MASA_GT_2f5996ff01.mp4#t=0.1" type="video/mp4" />
+        </video>
+      </div>
+
+      <div class="panel">
+        <div class="panel-body">
+          <p>
+            In the fourth example, DAM4SAM temporarily loses the table, chair, and TV, although it later recovers them,
+            whereas REMIND keeps these objects more consistently connected across the sequence. MASA shows behavior similar
+            to DAM4SAM, with comparable instability in maintaining these identities.
+          </p>
+        </div>
+        <div class="comparison-labels three-way">
+          <span>REMIND</span>
+          <span>DAM4SAM</span>
+          <span>MASA</span>
+        </div>
+        <video class="qualitative-video three-way" controls muted playsinline preload="none" aria-label="REMIND vs DAM4SAM vs MASA comparison on ScanNet++ scene 37c9538a2b">
+          <source src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/COMPARE_REMIND_GT_VS_D4SM_GT_INIT_VS_MASA_GT_37c9538a2b.mp4#t=0.1" type="video/mp4" />
+        </video>
+      </div>
+
+      <div class="panel">
+        <div class="panel-body">
+          <p>
+            In the fifth example, REMIND maintains stable tracks for the chairs, table, and surrounding furniture, while
+            DAM4SAM loses the chairs and table and also struggles with the door and cabinet during parts of the sequence.
+            MASA likewise becomes confused in some frames, particularly around the chairs and shelving unit.
+          </p>
+        </div>
+        <div class="comparison-labels three-way">
+          <span>REMIND</span>
+          <span>DAM4SAM</span>
+          <span>MASA</span>
+        </div>
+        <video class="qualitative-video three-way" controls muted playsinline preload="none" aria-label="REMIND vs DAM4SAM vs MASA comparison on ScanNet++ scene a30b666f83">
+          <source src="https://github.com/cvar-vision-dl/remind-reid-tracker/releases/download/project-page-assets/COMPARE_REMIND_GT_VS_D4SM_GT_INIT_VS_MASA_GT_a30b666f83.mp4#t=0.1" type="video/mp4" />
+        </video>
+      </div>
+    </div>
+      </div>
+    </details>
+  </section>
+
+  <section id="acknowledgements">
+    <h2>Acknowledgements</h2>
+    <p>
+      This work has been supported by the project SHEREC "Safe Healthy and Environmental Ship Recycling", Reference:
+      101136056, funded by the European Union under the Horizon Europe Program HORIZON-CL4-2023-HUMAN-01 CNECT.
+    </p>
+  </section>
+
+  <section id="citation">
+    <h2>Citation</h2>
+    <p>Please cite REMIND, MASA, and the ScanNet++ dataset when using this project page, code, or data-derived results.</p>
+    <h3>REMIND</h3>
+    <pre><code>@misc{remind2026,
+  title  = {REMIND: RE-Identification with Memory for INDoor Navigation},
+  author = {Diaz-Pereda, Pablo and Rodriguez-Ramos, Alejandro and Perez-Saura, David and Campoy, Pascual},
+  year   = {2026}
+}</code></pre>
+    <h3>MASA</h3>
+    <pre><code>@inproceedings{li2024masa,
+  title     = {Matching Anything by Segmenting Anything},
+  author    = {Li, Siyuan and Ke, Lei and Danelljan, Martin and Piccinelli, Luigi and Segu, Mattia and Van Gool, Luc and Yu, Fisher},
+  booktitle = {IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year      = {2024}
+}</code></pre>
+    <h3>ScanNet++</h3>
+    <pre><code>@inproceedings{yeshwanthliu2023scannetpp,
+  title={ScanNet++: A High-Fidelity Dataset of 3D Indoor Scenes},
+  author={Yeshwanth, Chandan and Liu, Yueh-Cheng and Nie{\ss}ner, Matthias and Dai, Angela},
+  booktitle = {Proceedings of the International Conference on Computer Vision ({ICCV})},
+  year={2023}
+}</code></pre>
+  </section>
+
+  <footer>
+    <p>
+      REMIND project page. Code:
+      <a href="https://github.com/cvar-vision-dl/remind-reid-tracker">github.com/cvar-vision-dl/remind-reid-tracker</a>
+    </p>
+  </footer>
+
+  <script>
+    document.querySelectorAll(".collapsible-section details").forEach((details) => {
+      details.addEventListener("toggle", () => {
+        if (!details.open || details.dataset.mediaReady) {
+          return;
+        }
+
+        details.querySelectorAll("video").forEach((video) => {
+          video.preload = "metadata";
+          video.load();
+        });
+        details.dataset.mediaReady = "true";
+      });
+    });
+  </script>
+</body>
+</html>
