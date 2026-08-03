@@ -622,13 +622,21 @@ class DinoNavDPPipeline:
 
     # ------------------------------------------------------------------ #
     def step(self, rgb: np.ndarray, target_text: str, depth: Optional[np.ndarray] = None,
-             pose: Optional[tuple] = None) -> StepResult:
+             pose: Optional[tuple] = None, external_dets: Optional[list] = None) -> StepResult:
         """pose, if given: (x, y, theta) odometry at capture time -- stamped onto
         this tick's scene_log entry (see PipelineConfig.use_scene_tagger). Note
         OdometryLogger resets to (0,0,0) at the start of every goal, so poses
         from different goals are in different local frames, not one global map.
+
+        external_dets, if given (even an empty list): the caller has already
+        resolved which single detection (or none) is this tick's target --
+        e.g. nav_pipeline/remind_gui.py, which asks REMIND for the object
+        carrying a specific persistent ID instead of a bare category phrase.
+        Bypasses DINO + the relation/positional/appearance re-lock machinery
+        below entirely (see _step_inner); None (the default) is the exact
+        prior behavior for every other caller.
         """
-        res = self._step_inner(rgb, target_text, depth, pose)
+        res = self._step_inner(rgb, target_text, depth, pose, external_dets)
         # stiction floor is now baked into bearing_to_angular's smooth ramp
         # for TRACK; AVOID commands max_angular directly and SEARCH's
         # search_angular is already comfortably above ang_min_cmd, so
@@ -656,7 +664,7 @@ class DinoNavDPPipeline:
         return res
 
     def _step_inner(self, rgb: np.ndarray, target_text: str, depth: Optional[np.ndarray] = None,
-                     pose: Optional[tuple] = None) -> StepResult:
+                     pose: Optional[tuple] = None, external_dets: Optional[list] = None) -> StepResult:
         res = StepResult()
         H, W = rgb.shape[:2]
         timing = {}
@@ -668,23 +676,34 @@ class DinoNavDPPipeline:
         timing["cmc"] = time.time() - t0
 
         t0 = time.time()
-        relation = parse_relational_target(target_text)
-        positional = None if relation is not None else parse_positional_target(target_text)
-        if relation is not None:
-            target_class, anchor_class = relation
-            raw_dets = self.detector.detect(rgb, f"{target_class}. {anchor_class}.")
-            target_dets = [d for d in raw_dets if clean_label(d.label) == target_class]
-            anchor_dets = [d for d in raw_dets if clean_label(d.label) == anchor_class]
-            initial_pick = select_by_relation(target_dets, anchor_dets) if self._last_box is None else None
-            det = self._select_detection(target_dets, motion=motion, rgb=rgb, initial_pick=initial_pick)
-        elif positional is not None:
-            target_class, position = positional
-            raw_dets = self.detector.detect(rgb, f"{target_class}.")
-            target_dets = [d for d in raw_dets if clean_label(d.label) == target_class]
-            initial_pick = select_by_position(target_dets, position) if self._last_box is None else None
-            det = self._select_detection(target_dets, motion=motion, rgb=rgb, initial_pick=initial_pick)
+        if external_dets is not None:
+            # Caller already resolved exactly which physical object this
+            # tick's target is (e.g. REMIND's persistent per-object ID --
+            # see nav_pipeline/remind_gui.py) -- skip DINO entirely and the
+            # box-IoU/appearance re-lock machinery below, which exists only
+            # to disambiguate BETWEEN raw same-class DINO candidates frame
+            # to frame. An empty list means "not currently visible this
+            # tick", same as a normal miss below.
+            det = external_dets[0] if external_dets else None
+            self._last_candidate_count = 0
         else:
-            det = self._select_detection(self.detector.detect(rgb, target_text), motion=motion, rgb=rgb)
+            relation = parse_relational_target(target_text)
+            positional = None if relation is not None else parse_positional_target(target_text)
+            if relation is not None:
+                target_class, anchor_class = relation
+                raw_dets = self.detector.detect(rgb, f"{target_class}. {anchor_class}.")
+                target_dets = [d for d in raw_dets if clean_label(d.label) == target_class]
+                anchor_dets = [d for d in raw_dets if clean_label(d.label) == anchor_class]
+                initial_pick = select_by_relation(target_dets, anchor_dets) if self._last_box is None else None
+                det = self._select_detection(target_dets, motion=motion, rgb=rgb, initial_pick=initial_pick)
+            elif positional is not None:
+                target_class, position = positional
+                raw_dets = self.detector.detect(rgb, f"{target_class}.")
+                target_dets = [d for d in raw_dets if clean_label(d.label) == target_class]
+                initial_pick = select_by_position(target_dets, position) if self._last_box is None else None
+                det = self._select_detection(target_dets, motion=motion, rgb=rgb, initial_pick=initial_pick)
+            else:
+                det = self._select_detection(self.detector.detect(rgb, target_text), motion=motion, rgb=rgb)
         timing["dino"] = time.time() - t0
 
         res.candidate_count = self._last_candidate_count
@@ -755,10 +774,22 @@ class DinoNavDPPipeline:
         if det is not None:
             res.detection = det
             clip_rejected = False
-            if self.segmenter is not None:
+            mask = None
+            if external_dets is not None:
+                # The external resolver (e.g. REMIND, which segments every
+                # detection with its own YOLO-seg backend as a normal part
+                # of its own pipeline) already produced this object's mask
+                # -- reuse it directly instead of a second SAM2 pass, and
+                # skip CLIP entirely: target_text here is just the class
+                # name that resolver already assigned, so CLIP would only
+                # be re-checking that same classification with a weaker
+                # model, not verifying an independent phrase. None (no mask
+                # supplied) falls through to the plain bbox-depth goal
+                # below, same as "no mask available" always has.
+                mask = getattr(det, "mask", None)
+            elif self.segmenter is not None:
                 now = time.time()
                 due = (now - self._last_sam_t) >= self.cfg.sam_period_s
-                mask = None
                 if due:
                     t0 = time.time()
                     mask = self.segmenter.segment_box(rgb, det.box)
@@ -783,16 +814,16 @@ class DinoNavDPPipeline:
                     # long as the current DINO box still overlaps the one it was
                     # segmented from
                     mask = self._last_mask
-                if mask is not None:
-                    from .sam_segmenter import mask_centroid, mask_median_depth
+            if mask is not None:
+                from .sam_segmenter import mask_centroid, mask_median_depth
 
-                    res.mask = mask
-                    d = mask_median_depth(depth, mask)
-                    if d is not None:
-                        u, v = mask_centroid(mask)
-                        from .goal_utils import pixel_depth_to_point
+                res.mask = mask
+                d = mask_median_depth(depth, mask)
+                if d is not None:
+                    u, v = mask_centroid(mask)
+                    from .goal_utils import pixel_depth_to_point
 
-                        goal = pixel_depth_to_point(u, v, d, fx, fy, cx, cy)
+                    goal = pixel_depth_to_point(u, v, d, fx, fy, cx, cy)
             if not clip_rejected and goal is None:  # SAM disabled, empty mask, or no valid mask depth
                 goal = goal_point_from_detection(det.box, depth, fx, fy, cx, cy)
             if goal is not None:
