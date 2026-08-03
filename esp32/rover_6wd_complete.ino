@@ -14,10 +14,32 @@
  *          ENFORCED by feedback, not guessed open-loop. Fixes battery-sag
  *          slowdown, terrain load, and asymmetric left/right turn response.
  *
- * ROS2 interface (UNCHANGED — rpm_to_odom.py depends on this contract):
+ * ROS2 interface (positions 0,1 UNCHANGED — rpm_to_odom.py depends on this
+ * contract; positions 2,3 are NEW additive fields, see IMU note below):
  *   Subscribes : /cmd_vel   (geometry_msgs/Twist)
- *   Publishes  : /rover/rpm  (std_msgs/Float32MultiArray  [left_rpm, right_rpm],
- *                             signed: +ve = wheel drives robot FORWARD)
+ *   Publishes  : /rover/rpm  (std_msgs/Float32MultiArray
+ *                             [left_rpm, right_rpm, imu_heading_deg, imu_calib],
+ *                             signed RPM: +ve = wheel drives robot FORWARD;
+ *                             imu_heading_deg: BNO055 fused absolute heading
+ *                             in degrees [0,360), or NaN if the IMU didn't
+ *                             ack at startup; imu_calib: human-readable
+ *                             SYS*1000 + GYR*100 + ACC*10 + MAG, each digit
+ *                             0(uncalibrated)-3(fully calibrated), e.g. 3320
+ *                             = SYS 3, GYR 3, ACC 2, MAG 0 -- existing
+ *                             consumers that only read data[0]/data[1]
+ *                             (len(data) >= 2 checks) are unaffected by the
+ *                             array growing to 4.
+ *
+ * IMU (NEW): BNO055 on I2C (GPIO21 SDA / GPIO22 SCL, ESP32 defaults -- free
+ * on this board, no conflict with the motor/encoder pins above). Wheel-
+ * differential heading (theta) drifts sharply past ~135-165deg of rotation
+ * on this skid-steer chassis (measured, see odometry_log/
+ * odom_accuracy_results.csv) because turning scrubs the wheels against the
+ * ground -- the encoders can't see that slip. BNO055 does its own onboard
+ * sensor fusion (accel+gyro+mag) and reports an absolute heading that
+ * doesn't depend on wheel odometry at all, so it's immune to that specific
+ * failure mode. Raw I2C register access (no Adafruit_BNO055/Adafruit_Sensor
+ * library dependency) -- see bno055_init()/bno055_read_heading_deg() below.
  *
  * SIGN CONVENTION
  *   The firmware owns the encoder sign so that a forward command yields
@@ -35,6 +57,7 @@
 #include <rmw_microros/rmw_microros.h>
 #include <geometry_msgs/msg/twist.h>
 #include <std_msgs/msg/float32_multi_array.h>
+#include <Wire.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MOTOR PINS (6-wheel rover: 3 motors per side)
@@ -161,7 +184,7 @@ rclc_executor_t     executor;
 
 geometry_msgs__msg__Twist         cmd_vel_msg;
 std_msgs__msg__Float32MultiArray  rpm_msg;
-float rpm_data[2] = {0.0f, 0.0f};  // static buffer, no malloc needed
+float rpm_data[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // [left_rpm, right_rpm, imu_heading_deg, imu_calib]
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PER-SIDE CONTROL STATE
@@ -182,6 +205,90 @@ static const float METERS_PER_COUNT = (2.0f * PI * WHEEL_RADIUS_M) / ENCODER_CPR
 // snapshot for the 10 Hz RPM publisher
 long   pub_last_left  = 0;
 long   pub_last_right = 0;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BNO055 IMU (I2C, absolute-heading fusion) — see the file header note above.
+// Raw register access, no external library: keeps this sketch's dependency
+// footprint at just Wire.h (already part of the ESP32 core), so it can't
+// introduce a NEW library-version mismatch on top of the existing
+// micro_ros_arduino/esp32-core pinning (see esp32-flashing-procedure memo).
+// ─────────────────────────────────────────────────────────────────────────────
+#define BNO055_I2C_ADDR             0x28   // default (ADR pin low/unconnected)
+#define BNO055_SDA_PIN              21
+#define BNO055_SCL_PIN              22
+
+#define BNO055_REG_CHIP_ID          0x00
+#define BNO055_CHIP_ID_VALUE        0xA0
+#define BNO055_REG_PAGE_ID          0x07
+#define BNO055_REG_EUL_HEADING_LSB  0x1A
+#define BNO055_REG_CALIB_STAT       0x35
+#define BNO055_REG_OPR_MODE         0x3D
+#define BNO055_REG_PWR_MODE         0x3E
+
+#define BNO055_MODE_CONFIG          0x00
+#define BNO055_MODE_NDOF            0x0C
+#define BNO055_PWR_NORMAL           0x00
+
+bool imu_present = false;
+
+bool bno055_write8(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(BNO055_I2C_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  return Wire.endTransmission() == 0;
+}
+
+bool bno055_read(uint8_t reg, uint8_t *buf, uint8_t len) {
+  Wire.beginTransmission(BNO055_I2C_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;  // repeated START, keep bus held
+  if (Wire.requestFrom((int)BNO055_I2C_ADDR, (int)len) != (int)len) return false;
+  for (uint8_t i = 0; i < len; i++) buf[i] = Wire.read();
+  return true;
+}
+
+// Returns false if the BNO055 never acks/identifies correctly -- this IS the
+// wiring check: CHIP_ID only reads back 0xA0 if VIN/GND/SDA/SCL are all
+// actually connected and the sensor is powered.
+bool bno055_init() {
+  Wire.begin(BNO055_SDA_PIN, BNO055_SCL_PIN);
+  Wire.setClock(100000);  // 100kHz standard-mode I2C -- safe default, no need
+                           // to risk 400kHz fast-mode on an unverified bus
+
+  uint8_t chip_id = 0;
+  if (!bno055_read(BNO055_REG_CHIP_ID, &chip_id, 1) || chip_id != BNO055_CHIP_ID_VALUE) {
+    return false;
+  }
+
+  bno055_write8(BNO055_REG_PAGE_ID, 0x00);
+  bno055_write8(BNO055_REG_OPR_MODE, BNO055_MODE_CONFIG);
+  delay(25);                                    // mode-switch settle (datasheet: 19ms to CONFIG)
+  bno055_write8(BNO055_REG_PWR_MODE, BNO055_PWR_NORMAL);
+  bno055_write8(BNO055_REG_PAGE_ID, 0x00);
+  bno055_write8(BNO055_REG_OPR_MODE, BNO055_MODE_NDOF);  // full 9-DOF fusion, absolute heading
+  delay(25);                                    // mode-switch settle (datasheet: 7ms, +margin)
+  return true;
+}
+
+// Fused absolute heading, degrees [0,360). NaN if the IMU never initialized
+// or a read fails (transient I2C glitch) -- callers must NaN-check, never
+// assume this is always valid.
+float bno055_read_heading_deg() {
+  if (!imu_present) return NAN;
+  uint8_t buf[2];
+  if (!bno055_read(BNO055_REG_EUL_HEADING_LSB, buf, 2)) return NAN;
+  int16_t raw = (int16_t)((uint16_t)buf[1] << 8 | buf[0]);
+  return raw / 16.0f;  // 1 LSB = 1/16 degree (BNO055 datasheet Table 3-22)
+}
+
+// SYS/GYRO/ACCEL/MAG calibration, each 0 (uncalibrated) - 3 (fully
+// calibrated). Not currently published -- available for future use (e.g.
+// gating theta-snap corrections on the Pi side until SYS reaches 3).
+uint8_t bno055_read_calib_status() {
+  uint8_t v = 0;
+  if (!imu_present || !bno055_read(BNO055_REG_CALIB_STAT, &v, 1)) return 0;
+  return v;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ENCODER ISRs  (1x quadrature: count on channel-A rising, phase from B)
@@ -317,8 +424,8 @@ bool create_entities() {
         "/rover/rpm") != RCL_RET_OK) return false;
 
   rpm_msg.data.data     = rpm_data;
-  rpm_msg.data.size     = 2;
-  rpm_msg.data.capacity = 2;
+  rpm_msg.data.size     = 4;
+  rpm_msg.data.capacity = 4;
 
   if (rclc_executor_init(&executor, &support.context, 1, &allocator) != RCL_RET_OK) return false;
   if (rclc_executor_add_subscription(
@@ -381,6 +488,13 @@ void setup() {
   pinMode(ENC_R_A, INPUT); pinMode(ENC_R_B, INPUT);
   attachInterrupt(digitalPinToInterrupt(ENC_L_A), enc_left_isr,  RISING);
   attachInterrupt(digitalPinToInterrupt(ENC_R_A), enc_right_isr, RISING);
+
+  // BNO055 IMU (I2C, separate bus from Serial -- safe to init before or
+  // after set_microros_transports() below; done here so imu_present is
+  // known before the first RPM publish). No effect on wheel control if the
+  // sensor isn't wired/found: imu_present just stays false and
+  // bno055_read_heading_deg() reports NaN forever, same as no IMU at all.
+  imu_present = bno055_init();
 
   // After this, Serial belongs to the micro-ROS transport. No Serial.print().
   set_microros_transports();
@@ -449,6 +563,13 @@ void loop() {
         // signed RPM at the wheel (+ve = drives robot forward)
         rpm_data[0] = ENC_L_SIGN * (dl / ENCODER_CPR) / dt_min;
         rpm_data[1] = ENC_R_SIGN * (dr / ENCODER_CPR) / dt_min;
+        rpm_data[2] = bno055_read_heading_deg();  // NaN if IMU absent/unread
+        {
+          uint8_t c = bno055_read_calib_status();
+          float sys_c = (c >> 6) & 0x03, gyr_c = (c >> 4) & 0x03,
+                acc_c = (c >> 2) & 0x03, mag_c = c & 0x03;
+          rpm_data[3] = sys_c * 1000.0f + gyr_c * 100.0f + acc_c * 10.0f + mag_c;
+        }
         rcl_publish(&rpm_pub, &rpm_msg, NULL);
 
         // NOTE: Serial is the XRCE-DDS transport — do NOT Serial.print() here.
@@ -486,4 +607,9 @@ void loop() {
  *      the integrated count ≈ ENCODER_CPR. Adjust if there is a gearbox.
  *   3. Command a slow forward and confirm both wheels hold speed (closed loop).
  *      Set CLOSED_LOOP 0 to fall back to open-loop feedforward if needed.
+ *   4. ros2 topic echo /rover/rpm — a 3rd array element should now appear.
+ *      A real number (not NaN) confirms the BNO055 wiring (VIN/GND/SDA/SCL)
+ *      is correct and the sensor acked its CHIP_ID at boot; NaN means
+ *      bno055_init() never saw the sensor -- check wiring before trusting
+ *      any heading-based feature built on this field.
  */
