@@ -76,7 +76,9 @@ def zenoh_setup(session: zenoh.Session, st: SharedState, odom: OdometryLogger):
         try:
             data = parse_float32_multiarray(bytes(sample.payload))
             if len(data) >= 2:
-                odom.update(data[0], data[1])
+                imu_heading = data[2] if len(data) >= 3 else None
+                imu_calib = data[3] if len(data) >= 4 else None
+                odom.update(data[0], data[1], imu_heading_deg=imu_heading, imu_calib=imu_calib)
         except Exception as e:
             print(f"[WARN] rpm parse failed: {e}")
 
