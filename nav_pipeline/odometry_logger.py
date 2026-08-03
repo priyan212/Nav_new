@@ -29,7 +29,7 @@ class OdometryLogger:
     # window_s a caller will query
     HISTORY_WINDOW_S = 30.0
 
-    def __init__(self, log_dir: str = "odometry_log"):
+    def __init__(self, log_dir: str = "odometry_log", imu_min_mag_calib: int = 1):
         self.log_dir = log_dir
         os.makedirs(log_dir, exist_ok=True)
         self.path: Optional[str] = None
@@ -38,6 +38,13 @@ class OdometryLogger:
         self.x = self.y = self.theta = 0.0
         self._last_t: Optional[float] = None
         self._history: deque = deque()  # (t, x, y, theta, |dtheta| this tick), newest last
+        # Optional IMU heading fusion (see update()'s imu_heading_deg/imu_calib
+        # args) -- off unless a caller actually passes those, so every
+        # existing 2-arg update(left_rpm, right_rpm) call site (zenoh_node.py,
+        # isaac_gui.py, remind_gui.py) is byte-for-byte unaffected.
+        self.imu_min_mag_calib = imu_min_mag_calib
+        self._imu_heading0_deg: Optional[float] = None
+        self.theta_source = "enc"
 
     @staticmethod
     def _slug(text: str) -> str:
@@ -52,16 +59,53 @@ class OdometryLogger:
         self.path = os.path.join(self.log_dir, fname)
         self._file = open(self.path, "w", newline="")
         self._writer = csv.writer(self._file)
-        self._writer.writerow(["t", "dt", "left_rpm", "right_rpm", "v", "w", "x", "y", "theta"])
+        self._writer.writerow(["t", "dt", "left_rpm", "right_rpm", "v", "w", "x", "y", "theta",
+                               "imu_heading_deg", "theta_src"])
         self.x = self.y = self.theta = 0.0
         self._last_t = None
         self._history.clear()
+        self._imu_heading0_deg = None
+        self.theta_source = "enc"
         print(f"[odometry] goal '{target}' -> logging to {self.path}")
 
-    def update(self, left_rpm: float, right_rpm: float, t: Optional[float] = None):
+    def _imu_theta(self, imu_heading_deg: Optional[float], imu_calib: Optional[float]) -> Optional[float]:
+        """Convert a raw BNO055 Euler heading (deg, compass CW+, see
+        esp32/rover_6wd_complete.ino) into this run's theta convention (rad,
+        CCW+, zeroed at start_new_goal()) -- or None if it isn't trustworthy
+        yet, in which case the caller falls back to wheel-diff dead reckoning.
+
+        Gated on the MAG sub-score of the packed imu_calib byte (sys*1000 +
+        gyr*100 + acc*10 + mag): magnetometer calibration is what anchors the
+        heading to an absolute reference and stops it drifting, so an
+        uncalibrated mag reading is worse than no IMU at all. GYR/ACC/SYS
+        aren't gated on -- verified live (see memory) that heading tracked a
+        real 90deg turn to within ~1.6deg with SYS still stuck at 0.
+        """
+        if imu_heading_deg is None or not math.isfinite(imu_heading_deg):
+            return None
+        if imu_calib is not None:
+            mag_calib = int(round(imu_calib)) % 10
+            if mag_calib < self.imu_min_mag_calib:
+                return None
+        if self._imu_heading0_deg is None:
+            self._imu_heading0_deg = imu_heading_deg  # zero the reference at the first good sample
+        delta_deg = self._imu_heading0_deg - imu_heading_deg  # compass CW+ -> theta CCW+
+        delta_deg = (delta_deg + 180.0) % 360.0 - 180.0
+        return math.radians(delta_deg)
+
+    def update(self, left_rpm: float, right_rpm: float, t: Optional[float] = None,
+               imu_heading_deg: Optional[float] = None, imu_calib: Optional[float] = None):
         """Feed one /rover/rpm sample; integrates and appends a CSV row.
 
         No-op (returns None) until start_new_goal() has opened a file.
+        imu_heading_deg/imu_calib are optional (see esp32/rover_6wd_complete.ino's
+        rpm_data[2]/[3]): when given and the magnetometer is calibrated, theta
+        is set directly from the IMU instead of integrated from the wheel
+        differential -- the IMU has no accumulating drift and doesn't get
+        thrown off by wheel slip during in-place turns, both of which corrupt
+        the wheel-only heading over a long run. x/y are still advanced from
+        encoder-derived speed either way (translation distance is what
+        encoders measure well).
         """
         if self._writer is None:
             return None
@@ -77,12 +121,20 @@ class OdometryLogger:
         dtheta = 0.0
         if dt > 0.0:
             dtheta = w * dt
-            self.theta += dtheta
+            imu_theta = self._imu_theta(imu_heading_deg, imu_calib)
+            if imu_theta is not None:
+                self.theta = imu_theta
+                self.theta_source = "imu"
+            else:
+                self.theta += dtheta
+                self.theta_source = "enc"
             self.x += v * math.cos(self.theta) * dt
             self.y += v * math.sin(self.theta) * dt
 
+        imu_field = f"{imu_heading_deg:.4f}" if imu_heading_deg is not None and math.isfinite(imu_heading_deg) else ""
         self._writer.writerow([f"{t:.6f}", f"{dt:.4f}", left_rpm, right_rpm,
-                               f"{v:.4f}", f"{w:.4f}", f"{self.x:.4f}", f"{self.y:.4f}", f"{self.theta:.4f}"])
+                               f"{v:.4f}", f"{w:.4f}", f"{self.x:.4f}", f"{self.y:.4f}", f"{self.theta:.4f}",
+                               imu_field, self.theta_source])
         self._file.flush()
 
         self._history.append((t, self.x, self.y, self.theta, abs(dtheta)))
