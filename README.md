@@ -9,11 +9,13 @@ If you need any help contact through GitHub: priyan212
 Point a 6-wheeled rover at anything you can name — "trash bin", "red chair",
 "boulder" — and it drives there on its own, swerving around whatever's in the
 way. No LiDAR, a single RGB camera for perception — the only other sensing
-is the ESP32's signed wheel-encoder RPM feed (`/rover/rpm`), which the GPU
-side dead-reckons into a logged pose for diagnostics/safety (see
-[Odometry logging](#odometry-logging)), not for navigation itself. The whole
-stack (detection, depth, driving policy) runs in **≈1.3 GB of GPU memory**,
-about 1/13th of the full InternVLA-N1 dual-system it was distilled from.
+is the ESP32's signed wheel-encoder RPM feed plus a BNO055 IMU's fused
+heading (`/rover/rpm`), which the GPU side dead-reckons into a logged pose
+for diagnostics/safety (see [Odometry logging](#odometry-logging)) and for
+the standalone [manual control + Go Home](#manual-control--go-home) GUI, not
+for the DINO+NavDP navigation stack itself. The whole stack (detection,
+depth, driving policy) runs in **≈1.3 GB of GPU memory**, about 1/13th of the
+full InternVLA-N1 dual-system it was distilled from.
 
 It runs unmodified against four different bodies — the real rover, an Isaac
 Sim digital twin, a Habitat-Sim Mars yard, and a Habitat-Sim real-world
@@ -72,10 +74,22 @@ stop + escape turn) → `STOP` (goal close enough, or its mask fills the view).
 The real rover has no LiDAR and no dedicated odometry node, but the ESP32
 firmware (`esp32/rover_6wd_complete.ino`) does have real quadrature encoders
 on the mid wheel of each side, publishing signed L/R RPM on `/rover/rpm` (10
-Hz, +ve = drives forward). `nav_pipeline/odometry_logger.py` dead-reckons
-that into a differential-drive pose (x, y, θ) and appends a CSV row per
-sample — no GPS/SLAM involved, so it drifts over long runs, but it's good
-enough for per-attempt diagnostics.
+Hz, +ve = drives forward), plus a BNO055 IMU (I2C, raw register access, no
+Adafruit library) fused into the same message as `imu_heading_deg` (absolute
+compass heading, NaN if the sensor never acked at boot) and `imu_calib`
+(packed `SYS*1000+GYR*100+ACC*10+MAG` calibration digits, 0-3 each).
+`nav_pipeline/odometry_logger.py` dead-reckons that into a differential-drive
+pose (x, y, θ) and appends a CSV row per sample — x/y always come from
+encoder speed, but θ is taken directly from the IMU heading once the
+magnetometer digit reaches `imu_min_mag_calib` (default 1), instead of being
+integrated from the wheel differential. That switch matters because
+skid-steer wheel-diff heading drifts sharply past ~135-165° of rotation
+(measured, `odometry_log/odom_accuracy_results.csv`) — wheel slip during
+in-place turns is exactly what the encoders can't see, while the BNO055's
+onboard sensor fusion has no such accumulating drift once its magnetometer
+is calibrated. No GPS/SLAM involved either way, so it still drifts over long
+runs without a calibrated IMU, but it's good enough for per-attempt
+diagnostics.
 
 - **One file per goal, not per run.** Every time the target text changes
   (GUI Send/preset button, or a new `omnivla/goal_text` message), the logger
@@ -124,6 +138,31 @@ the cost of depending on odometry quality). `scripts/test_belief_vs_frozen.py`
 reruns that comparison (~5 s, CPU only); `scripts/test_belief_integration.py`
 exercises the belief wiring inside a real `DinoNavDPPipeline` end to end.
 
+## Manual control + Go Home
+
+`nav_pipeline/home_gui.py` (launched via `./launch_rover_home.sh [PI_IP]`) is
+a separate, lightweight control panel for the real rover: arrow-key/hold-button
+manual driving, plus a **GO HOME** button that drives back to wherever the
+rover was when the GUI launched (or wherever **Set Home Here** was last
+pressed). It's deliberately independent of `pipeline.py` / `isaac_gui.py` /
+`zenoh_node.py` — none of DINO/NavDP/SAM/CLIP/depth are imported, so it
+starts in under a second with no GPU, using only the fused encoder+IMU pose
+described above (`OdometryLogger`, small CDR bits duplicated from
+`zenoh_node.py` to avoid the heavy import chain).
+
+Go Home is closed-loop, not an open-loop "turn 180°, drive N meters" — it
+recomputes bearing/distance from the live fused pose every tick, so drift or
+a bump mid-return gets corrected on the fly:
+
+- **ROTATE** (heading error > ~20°) → turn in place only.
+- **DRIVE** (heading error < ~8°) → drive forward with steering correction
+  folded in (hysteresis between the two thresholds stops phase-chattering).
+- **FACE** (within `--home-dist-tol`, default 10 cm) → stop translating and
+  rotate in place to match the heading recorded at "Set Home Here" (or
+  θ=0, the launch heading, if home was never re-set). Only then does it
+  report **ARRIVED** — the rover ends up facing the same way it started, not
+  just standing in the same spot.
+
 ## The four worlds it runs in
 
 The same `nav_pipeline` code drives all four — only the transport peer and
@@ -158,6 +197,7 @@ Nav_new/
 ├── EARTH/                Habitat-Sim real-world photogrammetry sub-project (own README)
 └── launch_*.sh           one-command entry points for each of the 4 worlds,
                          plus launch_odom_test.sh (real-rover odometry-accuracy GUI, no perception models)
+                         and launch_rover_home.sh (manual control + Go Home, no perception models)
 ```
 
 ### `nav_pipeline/` — the package
@@ -171,9 +211,10 @@ Nav_new/
 - `depth_estimator.py` — Depth Anything V2 metric monocular depth for the RGB-only real rover
 - `goal_utils.py` — preprocessing + bbox→3D-goal math
 - `goal_belief.py` — ego-motion propagation of the tracked goal point while it's out of view, instead of freezing it (see [Goal belief](#goal-belief-surviving-occlusion))
-- `odometry_logger.py` — dead-reckons `/rover/rpm` (real wheel-encoder RPM) into a pose, one CSV per goal under `odometry_log/`; also backs the GUI's spin-stall watchdog (see [Odometry logging](#odometry-logging))
+- `odometry_logger.py` — dead-reckons `/rover/rpm` (real wheel-encoder RPM + BNO055 IMU heading) into a pose, one CSV per goal under `odometry_log/`; also backs the GUI's spin-stall watchdog (see [Odometry logging](#odometry-logging))
 - `pipeline.py` — the full perception→policy step, state machine, trajectory selection (the diagram above, as code)
 - `isaac_gui.py` — the control panel: camera + mask/bbox overlay, top-down trajectories + obstacles, live target entry
+- `home_gui.py` — vision-free manual control + Go Home panel (fused encoder+IMU pose only, no DINO/NavDP/SAM/CLIP/depth), launched via `./launch_rover_home.sh` (see [Manual control + Go Home](#manual-control--go-home))
 - `zenoh_node.py` — headless transport node, same Zenoh/CDR contract as the old OmniVLA node
 
 ### `checkpoints/`
@@ -207,10 +248,14 @@ where noted:
 Micro-ROS firmware for the 6-wheel differential drive base
 (`rover_6wd_complete.ino`, subscribes `/cmd_vel`, publishes `/rover/rpm` —
 signed L/R wheel RPM from the real quadrature encoders on each side's mid
-wheel, 10 Hz, consumed by `nav_pipeline/odometry_logger.py`; `WHEEL_RADIUS_M`
-/ `TRACK_WIDTH_M` must stay in sync between the two), plus Pi-side helpers
-(`rover_handshake_manager.py`, `serial_bridge.py`) for talking to the ESP32
-over `/dev/ttyUSB0`.
+wheel, plus BNO055 IMU fused heading (`imu_heading_deg`) and calibration
+status (`imu_calib`), 10 Hz, consumed by `nav_pipeline/odometry_logger.py`;
+`WHEEL_RADIUS_M` / `TRACK_WIDTH_M` must stay in sync between the two), plus
+Pi-side helpers (`rover_handshake_manager.py`, `serial_bridge.py`) for
+talking to the ESP32 over `/dev/ttyUSB0`. The BNO055 talks raw I2C register
+access (GPIO21 SDA / GPIO22 SCL, no Adafruit library dependency) — `NaN` in
+`imu_heading_deg` means the sensor never acked its chip ID at boot (check
+wiring), not a runtime fault.
 
 ### `MARS/`
 
@@ -251,21 +296,28 @@ since the scan ships with no lights. Full detail in
 # Real-rover odometry accuracy check (no camera/DINO/SAM/NavDP -- see
 # "Goal belief" below for why this matters)
 ./launch_odom_test.sh <PI_IP>
+
+# Real-rover manual control + Go Home (no camera/DINO/SAM/NavDP -- see
+# "Manual control + Go Home" below)
+./launch_rover_home.sh <PI_IP>
 ```
 
 Change the target at runtime by publishing `std_msgs/String` on
 `omnivla/goal_text` — no restart needed.
 
 Only ever run **one** controller against a given peer at a time
-(`isaac_gui.py`, `mars_gui.py`, `zenoh_node.py` all publish `cmd_vel` and will
-fight each other for it).
+(`isaac_gui.py`, `mars_gui.py`, `zenoh_node.py`, `home_gui.py` all publish
+`cmd_vel` and will fight each other for it).
 
 ### Zenoh transport contract (mostly unchanged from the OmniVLA project this was distilled from)
 
 - **in:** `image_raw` / `rt/image_raw` / `rover_camera` (+ `/compressed`),
   optional `depth_raw` (32FC1 metres or 16UC1 millimetres), `omnivla/goal_text`,
   `rover/rpm` / `rt/rover/rpm` (`std_msgs/Float32MultiArray [left_rpm,
-  right_rpm]`, real rover only — logged, not used for control)
+  right_rpm, imu_heading_deg, imu_calib]`, real rover only — logged and
+  fused into heading, not otherwise used for control; the last two fields
+  are additive, so any consumer still checking `len(data) >= 2` is
+  unaffected)
 - **out:** `cmd_vel` (Twist), `omnivla/explanation`, `omnivla/waypoints` (`nav_msgs/Path`)
 
 All CDR-encoded ROS 2 messages, so any of the three worlds — or a brand new
