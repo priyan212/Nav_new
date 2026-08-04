@@ -39,7 +39,12 @@ the fused pose every tick), not an open-loop "turn 180, drive N meters":
     turn-rate steering correction folded in to hold the line (hysteresis
     band between the two thresholds stops phase-chattering right at the
     boundary).
-  - Stops once within --home-dist-tol of home (default 10 cm).
+  - Once within --home-dist-tol of home (default 10 cm): FACE phase --
+    stop translating and rotate in place to match the heading recorded at
+    "Set Home Here" (or theta=0, the launch heading, if home was never
+    re-set), within --home-heading-tol (default 5 deg). Only then does it
+    report ARRIVED -- the rover ends up facing the same way it started,
+    not just at the same spot.
 Since it re-reads the fused pose every tick, drift or a bump mid-return gets
 corrected on the fly rather than compounding, which is what makes this more
 reliable than a single fixed rotate-then-drive plan.
@@ -257,7 +262,7 @@ def home_control_loop(st: SharedState, running, args):
         with st.lock:
             mode = st.mode
             x, y, theta = st.x, st.y, st.theta
-            hx, hy, _ = st.home
+            hx, hy, home_theta = st.home
 
         if mode != "homing":
             phase = "rotate"
@@ -274,16 +279,7 @@ def home_control_loop(st: SharedState, running, args):
         dist = math.hypot(dx, dy)
         bearing = math.atan2(dy, dx)
         err = normalize_angle(bearing - theta)
-
-        if dist <= args.home_dist_tol:
-            with st.lock:
-                st.last_cmd = (0.0, 0.0)
-                st.mode = "idle"
-                st.home_phase = "ARRIVED"
-                st.home_dist = dist
-                st.home_heading_err = err
-            time.sleep(period)
-            continue
+        home_heading_err = normalize_angle(home_theta - theta)
 
         if time.time() - start_t > HOMING_TIMEOUT_S:
             print(f"[WARN] go-home timeout after {HOMING_TIMEOUT_S:.0f}s "
@@ -295,12 +291,46 @@ def home_control_loop(st: SharedState, running, args):
             time.sleep(period)
             continue
 
+        if dist <= args.home_dist_tol:
+            # Position reached. Final phase: rotate in place to match the
+            # heading recorded at "Set Home Here" (or the launch heading,
+            # theta=0, if home was never re-set) -- so the rover ends up
+            # facing the same way it started rather than whatever direction
+            # the last approach leg happened to leave it pointing.
+            phase = "face"
+            if abs(home_heading_err) < math.radians(args.home_heading_tol):
+                with st.lock:
+                    st.last_cmd = (0.0, 0.0)
+                    st.mode = "idle"
+                    st.home_phase = "ARRIVED"
+                    st.home_dist = dist
+                    st.home_heading_err = home_heading_err
+                time.sleep(period)
+                continue
+
+            ang = bearing_to_angular(home_heading_err, args.home_max_angular, args.home_ang_min_cmd,
+                                      args.home_deadband, math.radians(args.home_ramp_deg))
+            if args.home_angular_slew_max > 0:
+                max_delta = args.home_angular_slew_max * period
+                ang = max(prev_ang - max_delta, min(prev_ang + max_delta, ang))
+            prev_ang = ang
+
+            with st.lock:
+                st.last_cmd = (0.0, ang)
+                st.home_phase = "FACING HOME DIR"
+                st.home_dist = dist
+                st.home_heading_err = home_heading_err
+            dt = period - (time.time() - t0)
+            if dt > 0:
+                time.sleep(dt)
+            continue
+
         # hysteresis: cheap turn-in-place until roughly facing home, then
         # drive with a gentler steering correction -- avoids chattering
-        # right at a single fixed threshold
-        if phase == "rotate":
-            if abs(err) < DRIVE_ENTER_RAD:
-                phase = "drive"
+        # right at a single fixed threshold (also applies coming out of the
+        # "face" phase if the rover drifted back outside home_dist_tol)
+        if phase in ("rotate", "face"):
+            phase = "rotate" if abs(err) >= DRIVE_ENTER_RAD else "drive"
         elif abs(err) > ROTATE_ENTER_RAD:
             phase = "rotate"
 
@@ -539,6 +569,8 @@ def main():
     ap.add_argument("--home-angular-slew-max", type=float, default=0.6,
                     help="rad/s^2 max angular acceleration while homing (0 disables)")
     ap.add_argument("--home-dist-tol", type=float, default=0.10, help="meters -- stop within this of home")
+    ap.add_argument("--home-heading-tol", type=float, default=5.0,
+                    help="deg -- final in-place rotation to match the home heading stops within this")
     ap.add_argument("--imu-min-mag-calib", type=int, default=1,
                     help="0-3; magnetometer calib required before trusting IMU heading over wheel-diff")
     ap.add_argument("--odometry-log-dir", type=str, default="odometry_log")
