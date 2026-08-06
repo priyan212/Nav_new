@@ -100,7 +100,7 @@ info "Starting REMIND live server (port $REMIND_PORT, log: $REMIND_LOG)..."
     export HF_HOME="$REMIND_DIR/.cache/huggingface"
     export YOLO_CONFIG_DIR="$REMIND_DIR/.cache/ultralytics"
     cd "$REMIND_DIR"
-    exec python scripts/live_server.py --yolo-model yolo11l-seg.pt --port "$REMIND_PORT" --device cuda:0
+    exec python scripts/live_server.py --port "$REMIND_PORT" --device cuda:0
 ) > "$REMIND_LOG" 2>&1 &
 REMIND_PID=$!
 

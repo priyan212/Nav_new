@@ -25,6 +25,7 @@ class RuntimeContext:
         yolo,
         dino: DinoExtractor,
         output_dir: Path,
+        captioner=None,
     ):
         self.config = config
         self.device = device
@@ -33,6 +34,10 @@ class RuntimeContext:
         self.yolo = yolo
         self.dino = dino
         self.output_dir = output_dir
+        # BLIP captioner, only built when config['blip']['enabled'] -- see
+        # initialize_system(). None for the yolo/davis backends, which
+        # already carry real class names and don't need it.
+        self.captioner = captioner
 
 
 def set_seeds(seed: int | None) -> None:
@@ -99,7 +104,47 @@ def build_segmenter(config: dict, device: str):
         seg.load_model()
         return seg
 
+    if backend == "sam":
+        from detection.sam_segmenter import SamSegmenter
+
+        seg = SamSegmenter(config=config, device=device)
+        seg.load_model()
+        return seg
+
     raise ValueError(f"Backend de detector no soportado: {backend}")
+
+
+def build_captioner(config: dict, device: str):
+    """Builds whichever labeling backend is enabled for class-agnostic
+    detections (SAM has no real class name of its own -- see
+    detection/sam_segmenter.py). internvl takes priority if both are
+    somehow enabled at once (mutually exclusive in practice -- see
+    default_config.yaml's comments) since it's the better-constrained
+    classifier (see features/internvl_classifier.py's docstring for why
+    BLIP's free-form captioning was replaced)."""
+    internvl_cfg = config.get("internvl", {}) or {}
+    blip_cfg = config.get("blip", {}) or {}
+    internvl_on = bool(internvl_cfg.get("enabled", False))
+    blip_on = bool(blip_cfg.get("enabled", False))
+
+    if internvl_on and blip_on:
+        print("[WARN] both internvl.enabled and blip.enabled are true -- using internvl")
+
+    if internvl_on:
+        from features.internvl_classifier import InternVLClassifier
+
+        captioner = InternVLClassifier(config=internvl_cfg, device=device)
+        captioner.load_model()
+        return captioner
+
+    if blip_on:
+        from features.blip_captioner import BlipCaptioner
+
+        captioner = BlipCaptioner(config=blip_cfg, device=device)
+        captioner.load_model()
+        return captioner
+
+    return None
 
 
 def initialize_system(config: dict) -> RuntimeContext:
@@ -125,6 +170,9 @@ def initialize_system(config: dict) -> RuntimeContext:
     dino = DinoExtractor(config=dino_cfg, device=device)
     dino.load_model()
 
+    # BLIP (optional -- only for backends without real class names, e.g. sam)
+    captioner = build_captioner(config=config, device=device)
+
     return RuntimeContext(
         config=config,
         device=device,
@@ -132,4 +180,5 @@ def initialize_system(config: dict) -> RuntimeContext:
         yolo=yolo,
         dino=dino,
         output_dir=output_dir,
+        captioner=captioner,
     )

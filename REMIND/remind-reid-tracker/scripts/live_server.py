@@ -11,6 +11,17 @@ REMIND's own .venv and answers over local HTTP -- see
 nav_pipeline/remind_client.py for the caller side and
 launch_rover_remind.sh for how the two processes are brought up together.
 
+Detection backend: SAM 2.1 automatic mask generation (class-agnostic --
+detection/sam_segmenter.py), not YOLO. There's no classifier, so every
+newly-tracked object's class_name comes from a one-shot InternVL
+classification call (features/internvl_classifier.py, run once per object
+at creation, not per frame; prompted as a classifier -- "what object is
+this, one/two words" -- not a free-form captioner, which is what actually
+fixed BLIP's instability on flat floor/wall/ceiling patches, e.g. captioning
+them as "black tiles"). Pass --no-internvl to fall back to the generic
+"object" label and skip that model entirely, or --use-blip to go back to
+the old BLIP captioner (features/blip_captioner.py) instead.
+
 Endpoints
 ---------
   GET  /health   -> {"status": "ok", "frame_count": int}
@@ -18,23 +29,26 @@ Endpoints
                     -> {"frame_id": int, "objects": [
                          {"det_id", "object_id" (persistent, null if not
                           yet confirmed), "kind" (match|new|ambiguous|
-                          provisional|detection), "class_name",
+                          provisional|detection), "class_name" (an InternVL
+                          classification once the object has been confirmed/
+                          created, e.g. "chair"; null for detections
+                          that haven't been assigned an object_id yet),
                           "confidence", "bbox": [x0,y0,x1,y1],
                           "mask_bbox": [x0,y0,x1,y1] (int, rounded -- the
                           crop region "mask_png_b64" was encoded from) or
                           null, "mask_png_b64": base64 PNG of the mask
                           CROPPED to mask_bbox (not full-frame -- REMIND's
-                          own YOLO-seg backend already produced this mask
-                          as part of its own per-object descriptors, see
+                          own SAM backend already produced this mask as
+                          part of its own per-object descriptors, see
                           detection/detection.py's Detection.mask; sending
                           only the bbox-sized crop keeps the payload small)
                           or null if this detection had no mask}, ...]}
   POST /reset      clears the object memory catalogue and restarts frame
-                    numbering from 0, WITHOUT reloading YOLO/DINOv3 (fast)
-                    -> {"status": "reset"}
+                    numbering from 0, WITHOUT reloading SAM/DINOv3/BLIP
+                    (fast) -> {"status": "reset"}
 
 Run (inside this repo's .venv -- see run_live_server.sh):
-    python scripts/live_server.py --yolo-model yolo11l-seg.pt --port 8765
+    python scripts/live_server.py --port 8765
 """
 from __future__ import annotations
 
@@ -64,17 +78,27 @@ from pipeline.reid_pipeline import ReIDPipeline  # noqa: E402
 def _build_config(args: argparse.Namespace) -> dict:
     cfg = Config(args.config).to_dict()
     cfg.setdefault("paths", {})["output_dir"] = str(args.output_dir)
-    cfg.setdefault("detector", {})["backend"] = "yolo"
+    det_cfg = cfg.setdefault("detector", {})
+    det_cfg["backend"] = "sam"
+    # Name-based ignored_classes (default_config.yaml's list, meant for
+    # YOLO/DAVIS's real class names) doesn't apply to a class-agnostic
+    # backend -- SAM's own area-fraction filtering (sam.min/max_mask_area_frac)
+    # does that job instead. Leaving the default list in place caused every
+    # detection to be silently dropped (see detection/sam_segmenter.py).
+    det_cfg["ignored_classes"] = []
 
-    yolo_cfg = cfg.setdefault("yolo", {})
-    yolo_cfg["model_label"] = "CUSTOM"
-    yolo_cfg["models"] = {"CUSTOM": str(args.yolo_model)}
-    yolo_cfg["conf_th"] = float(args.yolo_conf)
-    yolo_cfg["iou_th"] = float(args.yolo_iou)
-    yolo_cfg["max_det"] = int(args.max_det)
+    sam_cfg = cfg.setdefault("sam", {})
+    sam_cfg["points_per_side"] = int(args.sam_points_per_side)
 
-    cfg.setdefault("system", {})["input_width_size"] = int(args.yolo_imgsz)
+    cfg.setdefault("system", {})["input_width_size"] = int(args.input_width)
     cfg.setdefault("runtime", {})["device"] = str(args.device)
+
+    blip_cfg = cfg.setdefault("blip", {})
+    blip_cfg["enabled"] = bool(args.use_blip)
+
+    internvl_cfg = cfg.setdefault("internvl", {})
+    internvl_cfg["enabled"] = bool(not args.no_internvl and not args.use_blip)
+
     # This runs unattended as a background service -- silence REMIND's
     # per-frame console timing table and association/update debug dumps
     # (both gated by these top-level flags; see association/engine/
@@ -145,7 +169,7 @@ def _encode_mask_crop(mask: np.ndarray, bbox, frame_hw: Tuple[int, int]) -> Tupl
     return base64.b64encode(buf.tobytes()).decode("ascii"), [x0, y0, x1, y1]
 
 
-def _pack_detections(p_out, u_out, frame_hw: Tuple[int, int]) -> list:
+def _pack_detections(p_out, u_out, frame_hw: Tuple[int, int], memory=None) -> list:
     transforms = getattr(p_out, "transforms", {}) or {}
     entries: dict = {}
     for item in getattr(u_out, "matches", []) or []:
@@ -171,11 +195,25 @@ def _pack_detections(p_out, u_out, frame_hw: Tuple[int, int]) -> list:
         if raw_mask is not None:
             full_mask = _mask_to_original_space(np.asarray(raw_mask), transforms, frame_hw)
             mask_png_b64, mask_bbox = _encode_mask_crop(full_mask, bbox, frame_hw)
+
+        # SAM's own Detection.class_name is always None (class-agnostic --
+        # see detection/sam_segmenter.py); the real label is the BLIP
+        # caption cached on the tracked object once it's created/confirmed
+        # (update/memory_manager.py's resolve_creation_class_name). Detections
+        # not yet assigned an object_id (kind="detection") have no caption
+        # yet and stay unlabeled.
+        class_name = getattr(det, "class_name", None)
+        object_id = entry["object_id"]
+        if object_id is not None and memory is not None:
+            tracked = memory.get(int(object_id))
+            if tracked is not None and getattr(tracked, "class_name", None):
+                class_name = str(tracked.class_name)
+
         objects.append({
             "det_id": det_id,
-            "object_id": entry["object_id"],
+            "object_id": object_id,
             "kind": entry["kind"],
-            "class_name": getattr(det, "class_name", None),
+            "class_name": class_name,
             "confidence": float(getattr(det, "confidence", 0.0) or 0.0),
             "bbox": bbox,
             "mask_bbox": mask_bbox,
@@ -196,7 +234,9 @@ class Tracker:
         self.lock = threading.Lock()
         self.frame_id = 0
         self.config = _build_config(args)
-        print("[remind-live] loading YOLO + DINOv3 ...")
+        label_backend = (" + InternVL" if self.config.get("internvl", {}).get("enabled")
+                         else " + BLIP" if self.config.get("blip", {}).get("enabled") else "")
+        print(f"[remind-live] loading SAM + DINOv3{label_backend} ...")
         self.ctx = initialize_system(self.config)
         self.pipeline = ReIDPipeline(self.ctx)
 
@@ -217,7 +257,7 @@ class Tracker:
                 frame=frame_bgr, frame_id=fid, timestamp=time.time(),
             )
             frame_hw = (int(frame_bgr.shape[0]), int(frame_bgr.shape[1]))
-            return {"frame_id": fid, "objects": _pack_detections(p_out, u_out, frame_hw)}
+            return {"frame_id": fid, "objects": _pack_detections(p_out, u_out, frame_hw, memory=self.ctx.memory)}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -271,24 +311,24 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--config", default=str(REPO_ROOT / "config" / "default_config.yaml"))
     ap.add_argument("--output-dir", default=str(REPO_ROOT / "outputs" / "live"))
-    ap.add_argument("--yolo-model", required=True, help="file name under yolo/ (e.g. yolo11l-seg.pt)")
-    ap.add_argument("--yolo-conf", type=float, default=0.5)
-    ap.add_argument("--yolo-iou", type=float, default=0.5)
-    ap.add_argument("--yolo-imgsz", type=int, default=1280)
-    ap.add_argument("--max-det", type=int, default=100)
+    ap.add_argument("--sam-points-per-side", type=int, default=8,
+                     help="SAM automatic-mask-generation grid density -- the main latency knob; "
+                          "see config/default_config.yaml's sam: block for measured timings")
+    ap.add_argument("--input-width", type=int, default=1280)
+    ap.add_argument("--no-internvl", action="store_true",
+                     help="skip loading InternVL; newly tracked objects are labeled 'object' instead "
+                          "of getting a real class name (unless --use-blip is also given)")
+    ap.add_argument("--use-blip", action="store_true",
+                     help="use the old BLIP free-form captioner instead of InternVL's constrained "
+                          "classification -- BLIP tends to caption flat floor/wall/ceiling patches "
+                          "with unstable text (e.g. 'black tiles'); prefer InternVL (the default) "
+                          "unless specifically debugging/comparing the two")
     ap.add_argument("--device", default="cuda:0")
     return ap
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    if "/" in args.yolo_model or "\\" in args.yolo_model:
-        raise SystemExit("--yolo-model must be a bare file name under yolo/, not a path")
-    yolo_path = REPO_ROOT / "yolo" / args.yolo_model
-    if not yolo_path.is_file():
-        raise SystemExit(f"YOLO model not found: {yolo_path}")
-    args.yolo_model = str(yolo_path)
-
     tracker = Tracker(args)
     Handler.tracker = tracker
     server = ThreadingHTTPServer((args.host, args.port), Handler)

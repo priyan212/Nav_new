@@ -34,12 +34,15 @@ class RemindObject:
 
     @property
     def label(self) -> str:
-        """Matches the "<CLASS> ID <n>" format the GUI's text entry expects
-        (see remind_target.parse_object_target) -- what's drawn on screen is
-        exactly what the operator can type back."""
+        """ID-only display label (see remind_gui.py's module docstring --
+        REMIND's BLIP caption, class_name here, is kept for internal
+        bookkeeping/debugging only and is never shown to the operator).
+        Matches the "ID <n>" format remind_target.parse_object_target
+        expects, so what's drawn on screen is exactly what can be typed
+        back."""
         if self.object_id is not None:
-            return f"{(self.class_name or '?').upper()} ID {self.object_id}"
-        return f"{(self.class_name or '?').upper()} ({self.kind})"
+            return f"ID {self.object_id}"
+        return f"({self.kind})"
 
 
 class RemindClient:

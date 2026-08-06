@@ -294,7 +294,7 @@ def bearing_to_angular(bearing: float, max_angular: float, ang_min_cmd: float,
 class StepResult:
     linear: float = 0.0
     angular: float = 0.0
-    state: str = "SEARCH"            # SEARCH | TRACK | AVOID | STOP
+    state: str = "SEARCH"            # SEARCH | TRACK | GOTO | AVOID | STOP
     detection: Optional[object] = None
     ambiguous: bool = False           # >=2 comparably-scored same-class candidates in view
     candidate_count: int = 0          # how many (see PipelineConfig.ambiguity_score_margin)
@@ -622,11 +622,14 @@ class DinoNavDPPipeline:
 
     # ------------------------------------------------------------------ #
     def step(self, rgb: np.ndarray, target_text: str, depth: Optional[np.ndarray] = None,
-             pose: Optional[tuple] = None, external_dets: Optional[list] = None) -> StepResult:
+             pose: Optional[tuple] = None, external_dets: Optional[list] = None,
+             external_goal: Optional[np.ndarray] = None) -> StepResult:
         """pose, if given: (x, y, theta) odometry at capture time -- stamped onto
-        this tick's scene_log entry (see PipelineConfig.use_scene_tagger). Note
-        OdometryLogger resets to (0,0,0) at the start of every goal, so poses
-        from different goals are in different local frames, not one global map.
+        this tick's scene_log entry (see PipelineConfig.use_scene_tagger), and
+        required for external_goal below. As of the object-map feature,
+        OdometryLogger keeps pose CONTINUOUS across goals (see its module
+        docstring) rather than resetting per goal, so this is one shared
+        world frame, not a series of disjoint local ones.
 
         external_dets, if given (even an empty list): the caller has already
         resolved which single detection (or none) is this tick's target --
@@ -635,8 +638,21 @@ class DinoNavDPPipeline:
         Bypasses DINO + the relation/positional/appearance re-lock machinery
         below entirely (see _step_inner); None (the default) is the exact
         prior behavior for every other caller.
+
+        external_goal, only consulted when external_dets is None or empty
+        (i.e. the target isn't currently visible): a [x fwd, y left] (or
+        [x,y,z]) point in the CURRENT local frame to drive toward blindly --
+        e.g. remind_gui.py's object_map.py giving the last remembered world
+        location of an object that isn't in view right now. Enters state
+        "GOTO" and reuses the exact same obstacle-guard/NavDP/trajectory
+        machinery as a live TRACK (so depth-based collision avoidance stays
+        active for the whole blind leg), but never self-declares STOP from
+        proximity alone -- dead-reckoning drift over a long walk between
+        rooms makes a purely odometric "arrived" unsafe to trust. The caller
+        decides when to stop coasting on GOTO (e.g. switch to a search spin
+        once close with no visual reacquisition) and give up.
         """
-        res = self._step_inner(rgb, target_text, depth, pose, external_dets)
+        res = self._step_inner(rgb, target_text, depth, pose, external_dets, external_goal)
         # stiction floor is now baked into bearing_to_angular's smooth ramp
         # for TRACK; AVOID commands max_angular directly and SEARCH's
         # search_angular is already comfortably above ang_min_cmd, so
@@ -664,7 +680,8 @@ class DinoNavDPPipeline:
         return res
 
     def _step_inner(self, rgb: np.ndarray, target_text: str, depth: Optional[np.ndarray] = None,
-                     pose: Optional[tuple] = None, external_dets: Optional[list] = None) -> StepResult:
+                     pose: Optional[tuple] = None, external_dets: Optional[list] = None,
+                     external_goal: Optional[np.ndarray] = None) -> StepResult:
         res = StepResult()
         H, W = rgb.shape[:2]
         timing = {}
@@ -685,6 +702,11 @@ class DinoNavDPPipeline:
             # to frame. An empty list means "not currently visible this
             # tick", same as a normal miss below.
             det = external_dets[0] if external_dets else None
+            self._last_candidate_count = 0
+        elif external_goal is not None:
+            # Blind navigate-back leg (GOTO, see step()'s docstring) -- no
+            # live detection to resolve at all this tick.
+            det = None
             self._last_candidate_count = 0
         else:
             relation = parse_relational_target(target_text)
@@ -835,6 +857,21 @@ class DinoNavDPPipeline:
                     res.goal_point = goal
                     res.timing = timing
                     return res
+        if goal is None and external_goal is not None:
+            # Blind navigate-back: no live detection this tick, but the
+            # caller supplied a remembered local-frame point (see step()'s
+            # docstring). Skip belief/SEARCH entirely -- drive toward it
+            # using the exact same obstacle-guard/NavDP path as a live TRACK
+            # below. Deliberately no self-declared STOP here: unlike a live
+            # mask-depth goal, this point can be stale from odometry drift
+            # accumulated crossing rooms, so proximity alone isn't trusted
+            # as "arrived" -- that call is left to the caller (e.g.
+            # remind_gui.py switching to a search spin once close).
+            goal = np.asarray(external_goal, dtype=np.float32)
+            if goal.shape[0] < 3:
+                goal = np.array([float(goal[0]), float(goal[1]), 0.0], dtype=np.float32)
+            res.state = "GOTO"
+
         if goal is None:
             self._lost_count += 1
             if self.cfg.use_belief_goal:
@@ -882,7 +919,8 @@ class DinoNavDPPipeline:
                 return res
 
         res.goal_point = goal
-        res.state = "TRACK"
+        if res.state != "GOTO":  # set above when this tick is a blind navigate-back leg
+            res.state = "TRACK"
 
         # --- obstacle guard --------------------------------------------- #
         obstacle_pts = None

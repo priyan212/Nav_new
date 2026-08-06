@@ -125,6 +125,7 @@ class ReIDPipeline:
             config=runtime_ctx.config,
             memory_store=runtime_ctx.memory,
             class_id_to_name=class_id_to_name,
+            captioner=getattr(runtime_ctx, "captioner", None),
         )
 
     def process_frame(self, frame, frame_id: int, timestamp: float):
@@ -147,6 +148,14 @@ class ReIDPipeline:
             timestamp=timestamp,
         )
 
+        # RGB frame for BLIP captioning on new-object creation (see
+        # update/memory_manager.py) -- same aligned pixel space as
+        # p_out.detections' bbox/mask, so crops line up. Only actually used
+        # when a captioner is configured (sam backend); free otherwise since
+        # this is a cheap channel-swap view, not a model call.
+        frame_aligned_bgr = (p_out.debug or {}).get("frame_aligned_bgr")
+        frame_rgb_for_caption = frame_aligned_bgr[:, :, ::-1] if frame_aligned_bgr is not None else None
+
         u_out = timer.run(
             "update",
             self.update_stage.process_frame,
@@ -155,6 +164,7 @@ class ReIDPipeline:
             association_output=a_out,
             frame_id=frame_id,
             timestamp=timestamp,
+            frame_rgb=frame_rgb_for_caption,
         )
 
         self.last_stage_times_seconds = timer.snapshot_seconds()

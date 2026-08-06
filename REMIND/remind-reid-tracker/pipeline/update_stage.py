@@ -10,7 +10,7 @@ class UpdateStage:
     Memory update stage (lifecycle + models).
     """
 
-    def __init__(self, config: dict, memory_store, class_id_to_name=None):
+    def __init__(self, config: dict, memory_store, class_id_to_name=None, captioner=None):
         self.config = config
         self.memory_store = memory_store
         self.class_id_to_name = class_id_to_name if isinstance(class_id_to_name, dict) else None
@@ -19,6 +19,7 @@ class UpdateStage:
             config=config,
             memory_store=memory_store,
             class_id_to_name=self.class_id_to_name,
+            captioner=captioner,
         )
 
     def process_frame(
@@ -28,6 +29,7 @@ class UpdateStage:
         association_output,
         frame_id: int,
         timestamp: float,
+        frame_rgb=None,
     ):
         return self.manager.apply_frame(
             detections=detections,
@@ -35,4 +37,5 @@ class UpdateStage:
             association_output=association_output,
             timestamp=timestamp,
             frame_id=frame_id,
+            frame_rgb=frame_rgb,
         )

@@ -45,3 +45,6 @@ cd /mnt/bigdisk/Priyan/Nav_new
 # newlaunch file: launch_rover_vitb.sh — thin wrapper around launch_rover.sh (same Pi bringup/health checks) that just adds --depth-encoder vitb:
 ./launch_rover_vitb.sh                          # default Pi IP
 ./launch_rover_vitb.sh 10.47.234.125 --target "trash bin"
+
+# Indoor-relevant (the ones you'll actually encounter navigating a room):
+chair, couch, dining table, bed, potted plant, tv, laptop, mouse, keyboard, remote, cell phone, book, clock, vase, scissors, teddy bear, backpack, handbag, suitcase, umbrella, bottle, wine glass, cup, bowl, microwave, oven, toaster, sink, refrigerator, toilet, bench, person.

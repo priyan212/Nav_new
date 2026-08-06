@@ -7,8 +7,17 @@ wheel drives the robot forward, 10 Hz). This integrates that into a
 differential-drive pose (x, y, theta) and appends one CSV row per sample.
 
 One file per GOAL, not per run: start_new_goal() closes whatever file is
-open and starts a fresh one (fresh x/y/theta origin too), named after the
-target text, so each goal's odometry is self-contained in odometry_log/.
+open and starts a fresh one, named after the target text.
+
+Pose (x, y, theta) is CONTINUOUS across goals by default -- it does NOT
+reset when start_new_goal() rotates the log file. This is required for
+object-location memory (nav_pipeline/object_map.py) and blind navigate-back
+(pipeline.py's GOTO state) to work at all: a world location remembered from
+one goal is meaningless if the very next goal restarts the origin at
+wherever the rover happens to be standing. Call reset_pose() explicitly
+(e.g. an operator "reset map" action) if you actually want a fresh origin --
+start_new_goal(..., reset_pose=True) does both at once for callers that want
+the old per-goal-origin behavior back.
 """
 
 import csv
@@ -45,14 +54,26 @@ class OdometryLogger:
         self.imu_min_mag_calib = imu_min_mag_calib
         self._imu_heading0_deg: Optional[float] = None
         self.theta_source = "enc"
+        # last raw values seen in update() -- kept regardless of whether they
+        # were good enough to gate theta onto the IMU (see is_imu_calibrated),
+        # so a caller (e.g. remind_gui.py's status display) can show live
+        # calibration state without needing its own separate rpm subscriber.
+        self.last_imu_heading_deg: Optional[float] = None
+        self.last_imu_calib: Optional[float] = None
 
     @staticmethod
     def _slug(text: str) -> str:
         s = re.sub(r"[^a-z0-9]+", "_", text.strip().lower()).strip("_")
         return s[:40] or "target"
 
-    def start_new_goal(self, target: str):
-        """Close the current file (if any) and start a fresh one + fresh pose for this goal."""
+    def start_new_goal(self, target: str, reset_pose: bool = False):
+        """Close the current file (if any) and start a fresh one for this goal.
+
+        Pose is preserved by default (see module docstring) -- a new goal is
+        just a new CSV file in the same continuous world frame. Pass
+        reset_pose=True to also zero (x, y, theta), e.g. an explicit operator
+        "reset map" action, not an ordinary target switch.
+        """
         if self._file is not None:
             self._file.close()
         fname = f"odom_{self._slug(target)}_{time.strftime('%Y%m%d_%H%M%S')}.csv"
@@ -61,12 +82,44 @@ class OdometryLogger:
         self._writer = csv.writer(self._file)
         self._writer.writerow(["t", "dt", "left_rpm", "right_rpm", "v", "w", "x", "y", "theta",
                                "imu_heading_deg", "theta_src"])
-        self.x = self.y = self.theta = 0.0
         self._last_t = None
+        if reset_pose:
+            self.reset_pose()
+        print(f"[odometry] goal '{target}' -> logging to {self.path} "
+              f"(pose {'reset' if reset_pose else f'continued at ({self.x:.2f}, {self.y:.2f}, {self.theta:+.2f})'})")
+
+    def reset_pose(self):
+        """Zero (x, y, theta) and clear the spin_delta() history -- a genuine
+        fresh origin, distinct from start_new_goal()'s normal file rotation
+        (see module docstring)."""
+        self.x = self.y = self.theta = 0.0
         self._history.clear()
         self._imu_heading0_deg = None
         self.theta_source = "enc"
-        print(f"[odometry] goal '{target}' -> logging to {self.path}")
+
+    @staticmethod
+    def decode_calib(imu_calib: Optional[float]) -> str:
+        """Unpack the BNO055 calib byte (sys*1000 + gyr*100 + acc*10 + mag,
+        see esp32/rover_6wd_complete.ino) into a readable "SYS.. GYR.. ACC..
+        MAG.." string, each sub-score 0-3."""
+        if imu_calib is None:
+            return "no IMU data"
+        v = int(round(imu_calib))
+        sys_c, gyr_c, acc_c, mag_c = (v // 1000) % 10, (v // 100) % 10, (v // 10) % 10, v % 10
+        return f"SYS{sys_c} GYR{gyr_c} ACC{acc_c} MAG{mag_c}"
+
+    def is_imu_calibrated(self) -> bool:
+        """Whether the last-seen IMU sample is trustworthy enough to be
+        driving theta (see _imu_theta's gating below) -- i.e. the same
+        MAG-only check, but queryable at any time (e.g. remind_gui.py's
+        status display) rather than only implicitly via theta_source."""
+        return self._mag_calib_ok(self.last_imu_calib)
+
+    def _mag_calib_ok(self, imu_calib: Optional[float]) -> bool:
+        if imu_calib is None:
+            return False
+        mag_calib = int(round(imu_calib)) % 10
+        return mag_calib >= self.imu_min_mag_calib
 
     def _imu_theta(self, imu_heading_deg: Optional[float], imu_calib: Optional[float]) -> Optional[float]:
         """Convert a raw BNO055 Euler heading (deg, compass CW+, see
@@ -83,10 +136,8 @@ class OdometryLogger:
         """
         if imu_heading_deg is None or not math.isfinite(imu_heading_deg):
             return None
-        if imu_calib is not None:
-            mag_calib = int(round(imu_calib)) % 10
-            if mag_calib < self.imu_min_mag_calib:
-                return None
+        if imu_calib is not None and not self._mag_calib_ok(imu_calib):
+            return None
         if self._imu_heading0_deg is None:
             self._imu_heading0_deg = imu_heading_deg  # zero the reference at the first good sample
         delta_deg = self._imu_heading0_deg - imu_heading_deg  # compass CW+ -> theta CCW+
@@ -107,6 +158,15 @@ class OdometryLogger:
         encoder-derived speed either way (translation distance is what
         encoders measure well).
         """
+        # Captured unconditionally, even before start_new_goal() has opened a
+        # file (self._writer is None below) -- an operator checking IMU
+        # calibration status shouldn't have to send a target first just to
+        # get a live reading (see is_imu_calibrated).
+        if imu_heading_deg is not None and math.isfinite(imu_heading_deg):
+            self.last_imu_heading_deg = imu_heading_deg
+        if imu_calib is not None:
+            self.last_imu_calib = imu_calib
+
         if self._writer is None:
             return None
         t = time.time() if t is None else t

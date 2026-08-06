@@ -43,9 +43,14 @@ class MemoryManager:
       - reports_by_det_id for update rules (neighbor episodes and robust updates)
     """
 
-    def __init__(self, config: dict, memory_store, class_id_to_name=None):
+    def __init__(self, config: dict, memory_store, class_id_to_name=None, captioner=None):
         self.config = config
         self.memory_store = memory_store
+        # BLIP captioner (see features/blip_captioner.py) -- None for
+        # backends with real class names (yolo/davis); when set, it takes
+        # priority over resolve_class_name() for newly created objects
+        # (SAM's class-agnostic detections have no class name to resolve).
+        self.captioner = captioner
 
         self.policies = UpdatePolicies(
             config=config,
@@ -67,6 +72,7 @@ class MemoryManager:
         association_output,
         timestamp: float,
         frame_id: int | None = None,
+        frame_rgb=None,
     ) -> FrameUpdateOutput:
         out = FrameUpdateOutput(timestamp=timestamp)
         timer = ExecutionTimer()
@@ -101,6 +107,8 @@ class MemoryManager:
             timestamp=float(timestamp),
             visible_object_ids=visible_object_ids,
             assigned_by_det_id=assigned_by_det_id,
+            det_by_id=det_by_id,
+            frame_rgb=frame_rgb,
         )
 
         protected_ambiguous_object_ids = timer.run(
@@ -111,6 +119,7 @@ class MemoryManager:
             timestamp=float(timestamp),
             det_features_by_id=det_features_by_id,
             det_by_id=det_by_id,
+            frame_rgb=frame_rgb,
         )
         protected_provisional_object_ids = timer.run(
             "provisional_tracks",
@@ -242,6 +251,35 @@ class MemoryManager:
                 }
             )
 
+    def resolve_creation_class_name(
+        self,
+        *,
+        class_id: int,
+        det_id: int,
+        det_by_id: dict[int, object] | None,
+        frame_rgb,
+    ) -> str | None:
+        """Label for a brand-new tracked object: BLIP caption when a
+        captioner is configured (SAM's class-agnostic detections have no
+        class name of their own -- see features/blip_captioner.py), else
+        the usual class_id_to_name lookup (yolo/davis backends)."""
+        if self.captioner is not None and frame_rgb is not None and det_by_id is not None:
+            det = det_by_id.get(int(det_id), None)
+            if det is not None:
+                try:
+                    caption = self.captioner.caption(
+                        frame_rgb,
+                        mask=getattr(det, "mask", None),
+                        bbox=getattr(det, "bbox", None),
+                    )
+                except Exception as e:  # a bad crop/OOM shouldn't kill tracking
+                    print(f"[WARN] BLIP captioning failed for det {det_id}: {e}")
+                    caption = None
+                if caption:
+                    return caption
+            return "object"
+        return self.policies.resolve_class_name(int(class_id))
+
     def create_new_objects(
         self,
         *,
@@ -252,6 +290,8 @@ class MemoryManager:
         timestamp: float,
         visible_object_ids: list[int],
         assigned_by_det_id: dict[int, int],
+        det_by_id: dict[int, object] | None = None,
+        frame_rgb=None,
     ) -> None:
         prov_cfg = ((self.config.get("update", {}) or {}).get("provisional_new", {}) or {})
         prov_min_overlap = float(prov_cfg.get("min_support_overlap", 0.5))
@@ -270,7 +310,9 @@ class MemoryManager:
                 assigned_by_det_id=assigned_by_det_id,
             )
 
-            class_name = self.policies.resolve_class_name(int(class_id))
+            class_name = self.resolve_creation_class_name(
+                class_id=int(class_id), det_id=int(det_id), det_by_id=det_by_id, frame_rgb=frame_rgb,
+            )
             new_obj = self.memory_store.create_tracked_object(
                 class_id=int(class_id),
                 timestamp=float(timestamp),
@@ -496,6 +538,7 @@ class MemoryManager:
         timestamp: float,
         det_features_by_id: dict,
         det_by_id: dict[int, object],
+        frame_rgb=None,
     ) -> set[int]:
         amb_cfg = ((self.config.get("update", {}) or {}).get("ambiguous_tracks", {}) or {})
         amb_enabled = bool(amb_cfg.get("enabled", True))
@@ -556,6 +599,8 @@ class MemoryManager:
             timestamp=float(timestamp),
             det_features_by_id=det_features_by_id,
             protected_object_ids=protected_object_ids,
+            det_by_id=det_by_id,
+            frame_rgb=frame_rgb,
         )
 
         matched_track_by_det_id: dict[int, object] = {}
@@ -646,6 +691,8 @@ class MemoryManager:
         timestamp: float,
         det_features_by_id: dict,
         protected_object_ids: set[int],
+        det_by_id: dict[int, object] | None = None,
+        frame_rgb=None,
     ) -> None:
         specs_by_object_id: dict[int, dict] = {}
         for item in items or []:
@@ -685,7 +732,12 @@ class MemoryManager:
                 object_id=int(object_id),
                 class_id=int(spec["class_id"]),
                 timestamp=float(timestamp),
-                class_name=self.policies.resolve_class_name(int(spec["class_id"])),
+                class_name=self.resolve_creation_class_name(
+                    class_id=int(spec["class_id"]),
+                    det_id=int(spec["seed_det_id"]),
+                    det_by_id=det_by_id,
+                    frame_rgb=frame_rgb,
+                ),
             )
             self.policies.bootstrap_object_from_observation(
                 tracked_object=new_obj,

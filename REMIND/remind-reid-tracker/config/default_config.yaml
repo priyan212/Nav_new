@@ -28,6 +28,9 @@ input:
 # MODELS
 # =============================================================================
 detector:
+  # "davis" (ground-truth masks, eval) | "yolo" (class-based detect+seg) |
+  # "sam" (class-agnostic automatic mask generation, see sam: below --
+  # used by scripts/live_server.py for live rover operation)
   backend: "davis"
   ignored_classes: ["wall", "floor", "ceiling","object"]
 
@@ -61,6 +64,63 @@ davis:
   mask_erosion_iters: 1
   prefetch_annotations: true
   prefetch_distance: 1
+
+# Class-agnostic automatic mask generation (detector.backend: "sam"). Every
+# mask gets the same constant class_id (0) -- see detection/sam_segmenter.py.
+# points_per_side is the main latency knob: measured on an RTX 3090 Ti,
+# points_per_side=8 (64 grid points) ~210ms/frame, =16 (256 points) ~680ms/
+# frame on a near-empty synthetic scene -- busier real scenes (more masks
+# surviving the confidence filters -> more NMS pairs) will run slower than
+# that. Tune down for live frame-rate budgets.
+sam:
+  model_id: "facebook/sam2.1-hiera-small"
+  points_per_side: 8
+  points_batch_size: 64
+  pred_iou_thresh: 0.86
+  stability_score_offset: 1.0
+  stability_score_thresh: 0.90
+  min_mask_area_frac: 0.001
+  max_mask_area_frac: 0.85
+  mask_nms_iou_thresh: 0.7
+  border_margin_px: 4
+
+  # Flat-surface rejection (floor/wall/ceiling/tile false positives -- SAM
+  # segments these as if they were objects, and no captioner downstream can
+  # fix that after the fact since there's genuinely no object there). 0
+  # disables a given filter. See detection/sam_segmenter.py's module
+  # docstring for why there's no depth-plane-fit option here.
+  min_mask_std: 10.0
+  edge_touch_reject: true
+  edge_touch_frac: 0.5
+  edge_touch_min_area_frac: 0.05
+  edge_touch_margin_px: 3
+
+# BLIP captioning fills the human-readable label SAM's class-agnostic masks
+# don't carry -- runs ONCE per newly created tracked object, not per frame
+# (see update/memory_manager.py). Disabled by default so existing YOLO/DAVIS
+# backends (which already have real class names) are unaffected; live_server.py
+# turns this on for the SAM backend.
+blip:
+  enabled: false
+  model_id: "Salesforce/blip-image-captioning-base"
+  max_new_tokens: 12
+  min_crop_px: 8
+  mask_background_fill: true
+
+# InternVL classification -- alternative to blip above, prompted as a
+# classifier ("what object is this? one/two words") instead of a free-form
+# captioner, which is what actually fixed BLIP's floor/wall/ceiling patches
+# getting captioned as things like "black tiles" (see
+# features/internvl_classifier.py's docstring). Mutually exclusive with blip
+# in practice -- only enable one (internvl wins if both are, see
+# pipeline/initialization.py's build_captioner).
+internvl:
+  enabled: false
+  model_id: "OpenGVLab/InternVL3_5-1B-HF"
+  prompt: "What object is this? Answer with one or two words only, no punctuation."
+  max_new_tokens: 8
+  min_crop_px: 8
+  mask_background_fill: true
 
 dino:
   model_label: S
