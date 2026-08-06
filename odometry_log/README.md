@@ -8,11 +8,16 @@ BNO055 IMU's fused absolute heading (`imu_heading_deg`) and calibration
 status (`imu_calib`) in the same message. This directory holds the
 integration of that feed into a differential-drive pose — useful for
 diagnostics (did the rover actually move, or just spin?), not a substitute
-for real localization: `x`/`y` still drift with no external correction, and
-the whole pose resets to `(0, 0, 0)` at the start of every goal.
+for real localization: `x`/`y` still drift with no external correction.
+Pose is **continuous across goals by default** (it does not reset to
+`(0, 0, 0)` when a new goal starts) — required for
+[object-location memory](../nav_pipeline/object_map.py) and blind
+navigate-back (see the top-level [README's REMIND section](../README.md#object-persistent-targeting-remind))
+to mean anything across goals/rooms. Call `OdometryLogger.reset_pose()` (or
+`start_new_goal(..., reset_pose=True)`) for a genuine fresh origin.
 
 `theta` is taken directly from the IMU heading once the magnetometer
-calibration digit reaches `imu_min_mag_calib` (default 1) — the BNO055's
+calibration digit reaches `imu_min_mag_calib` (default 3) — the BNO055's
 onboard sensor fusion has no accumulating drift, unlike wheel-differential
 heading, which drifts sharply past ~135-165° of rotation on this skid-steer
 chassis (wheel slip during in-place turns, invisible to the encoders; see
@@ -30,12 +35,14 @@ button, or a new `omnivla/goal_text` message — named:
 odom_<slugified-target>_<YYYYMMDD_HHMMSS>.csv
 ```
 
-e.g. `odom_trash_bin_20260728_130406.csv`. Each file's `x, y, theta` start
-at the origin, so it's a self-contained record of "how did the rover move
-while pursuing this one goal" — no need to know the pose at the end of the
-previous goal to interpret it. `nav_pipeline/home_gui.py`'s manual
-control + Go Home GUI (see the top-level [README's "Manual control + Go
-Home" section](../README.md#manual-control--go-home)) opens one file for its
+e.g. `odom_trash_bin_20260728_130406.csv`. Each file is a fresh CSV, but
+**`x, y, theta` carry over from wherever the previous goal ended** — see
+above — so consecutive files in this directory are segments of one
+continuous trajectory, not independent per-goal records; you do need the
+end-of-previous-file pose (or just read the next file's first row) to place
+a given file in the world. `nav_pipeline/home_gui.py`'s manual control + Go
+Home GUI (see the top-level [README's "Manual control + Go Home"
+section](../README.md#manual-control--go-home)) opens one file for its
 whole session, named `odom_home_session_<YYYYMMDD_HHMMSS>.csv`, since it
 isn't goal-text-driven.
 

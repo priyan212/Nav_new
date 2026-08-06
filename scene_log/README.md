@@ -41,16 +41,20 @@ One JSON object per line:
 | `objects` | `{label: count}` for every vocabulary label Grounding DINO found in that frame |
 | `pose` | rover's dead-reckoned `(x, y, theta)` at capture time, from `nav_pipeline/odometry_logger.py` -- **only present when the caller passes `pose=` into `pipeline.step()`** (both `isaac_gui.py` and `zenoh_node.py` do; offline/sim scripts that call `step()` without a `pose` argument won't have this field) |
 
-### The pose is per-goal-local, not a global map
+### The pose is a continuous world frame, not per-goal-local
 
-`OdometryLogger` resets `(x, y, theta)` to `(0, 0, 0)` at the start of every
-new goal (new target text). So two entries with `pose.x=1.0` from *different*
-goals are **not** the same physical spot — each goal's poses live in their
-own local frame, drifting from wherever the rover happened to be when that
-goal started. Fine for "where did I see this, relative to where I started
-chasing the current target"; not fine for stitching a single map across
-multiple goals without extra work (e.g. carrying over the ending pose of one
-goal as the origin offset for the next, or real localization).
+`OdometryLogger` keeps `(x, y, theta)` continuous across goals by default —
+it does **not** reset when the target text changes (see the top-level
+[README's Odometry logging section](../README.md#odometry-logging)), so two
+entries with `pose.x=1.0` from *different* goals genuinely are the same
+physical spot (modulo ordinary dead-reckoning drift, which is unbounded over
+a long enough session either way — no GPS/SLAM correction happens here).
+That's what makes this log usable as a single accumulating inventory across
+a whole session instead of needing per-goal origin-stitching. It's still
+just dead reckoning, though: a `reset_pose()` call (an explicit operator
+"reset map" action, or `start_new_goal(..., reset_pose=True)`) starts a new
+local frame, and entries logged before vs. after that call are **not**
+comparable without knowing where that reset happened.
 
 ```bash
 python3 -c "

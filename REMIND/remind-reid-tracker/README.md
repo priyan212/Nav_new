@@ -77,6 +77,74 @@ Models are loaded automatically at runtime:
 
 ---
 
+## Live Tracking Server (for robot integration)
+
+`scripts/live_server.py` runs REMIND as a standalone HTTP service instead of
+processing a video/frame folder offline — built for a downstream robot
+pipeline (e.g. [Nav_new](../../README.md#object-persistent-targeting-remind))
+that needs REMIND's persistent per-object identities on every camera frame
+but can't import this repo in-process (its own torch/transformers pins are
+typically newer than a robotics stack's — see `SETUP.md`). Run it inside
+this repo's own env/`.venv` and have the other process talk to it over
+`localhost`:
+
+```bash
+python scripts/live_server.py --port 8765
+```
+
+**Detection backend is SAM, not YOLO, for the live path.** `detector.backend`
+in `config/default_config.yaml` now has three options — `"davis"`
+(ground-truth masks, eval only), `"yolo"` (class-based detect+seg, still the
+default for `main.py`/offline eval), and `"sam"` (class-agnostic automatic
+mask generation, `detection/sam_segmenter.py`, SAM 2.1 hiera-small). The live
+server hardcodes `"sam"` regardless of the config file: it lays a grid of
+prompt points over the frame (`sam.points_per_side`, default 8 — the main
+latency/recall knob, ~210ms/frame at 8 vs. ~680ms/frame at 16 on an RTX 3090
+Ti), segments every point in one batched forward pass, and keeps/deduplicates
+masks by predicted IoU, stability score, and area fraction. Being
+class-agnostic, it has no fixed vocabulary to filter by (`ignored_classes` is
+force-cleared for this backend) — instead two RGB-only heuristics reject
+flat floor/wall/ceiling false positives: `min_mask_std` (low grayscale
+variance inside the mask) and `edge_touch_reject` (a large mask hugging a
+full image border).
+
+**Class names come from InternVL, not YOLO's fixed list.** SAM has no
+classifier, so every newly-created tracked object gets a one-shot
+classification call (once per object at creation, not per frame) instead —
+`features/internvl_classifier.py` (`OpenGVLab/InternVL3_5-1B-HF`, prompted as
+a constrained classifier: *"what object is this, one or two words"*), the
+live server's default. `features/blip_captioner.py` (free-form BLIP
+captioning) is the older alternative, kept for `--use-blip` — InternVL
+replaced it as the default because BLIP was unstable on flat, low-texture
+surfaces (e.g. captioning a wall patch as "black tiles"), which the
+constrained-classifier prompt doesn't do. `--no-internvl` skips both and
+falls back to the generic label `"object"`. Both live under `blip:` /
+`internvl:` in the config (`enabled`, `model_id`, `prompt`/`max_new_tokens`,
+etc.) but the live server's CLI flags take precedence over those config
+defaults; enabling both in config is invalid — InternVL wins if it happens
+regardless.
+
+Useful `live_server.py` flags: `--sam-points-per-side` (default 8),
+`--input-width` (default 1280, frames are downscaled to this before SAM),
+`--no-internvl`, `--use-blip`, `--device` (default `cuda:0`), `--output-dir`.
+The old `--yolo-model`/`--yolo-conf`/`--yolo-iou`/`--yolo-imgsz`/`--max-det`
+flags are gone — they only ever applied to the YOLO backend this server no
+longer uses.
+
+Endpoints:
+
+| | |
+|---|---|
+| `GET /health` | `{"status": "ok", "frame_count": int}` |
+| `POST /infer` | body: one JPEG frame (BGR/cv2) → `{"frame_id", "objects": [{"det_id", "object_id" (persistent, null until confirmed), "kind" (match\|new\|ambiguous\|provisional\|detection), "class_name" (InternVL/BLIP classification once confirmed, else null), "confidence", "bbox", "mask_bbox", "mask_png_b64"}, ...]}` |
+| `POST /reset` | clears the object catalogue + frame counter, without reloading SAM/InternVL/DINOv3 (fast) |
+
+`mask_png_b64` is the mask **cropped to `mask_bbox`**, not full-frame — kept
+small since REMIND's own SAM backend already produced the mask as part of
+its per-object descriptors, so the caller isn't paying to re-segment.
+
+---
+
 ## Running On Your Own Data
 
 This mode is for trying REMIND on your own videos or frame folders. It does not require ground-truth annotations. You only need input images/video and a YOLO segmentation model.
