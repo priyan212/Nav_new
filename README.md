@@ -81,7 +81,7 @@ compass heading, NaN if the sensor never acked at boot) and `imu_calib`
 `nav_pipeline/odometry_logger.py` dead-reckons that into a differential-drive
 pose (x, y, θ) and appends a CSV row per sample — x/y always come from
 encoder speed, but θ is taken directly from the IMU heading once the
-magnetometer digit reaches `imu_min_mag_calib` (default 1), instead of being
+magnetometer digit reaches `imu_min_mag_calib` (default 3), instead of being
 integrated from the wheel differential. That switch matters because
 skid-steer wheel-diff heading drifts sharply past ~135-165° of rotation
 (measured, `odometry_log/odom_accuracy_results.csv`) — wheel slip during
@@ -91,12 +91,37 @@ is calibrated. No GPS/SLAM involved either way, so it still drifts over long
 runs without a calibrated IMU, but it's good enough for per-attempt
 diagnostics.
 
+**"Calibrated" is not the same as accurate at low thresholds.** The
+BNO055's magnetometer sub-score only needs to reach 1 (out of 0-3) to be
+trusted by the BNO055's own internal fusion state machine, which is a low
+bar — with real magnetic interference nearby (motors, wiring, metal
+furniture), the reported heading can still swing 100+ degrees while sitting
+completely still at that level (reproduced 2026-08-06: a stationary rover's
+heading jumped ~176° at `mag=2`). `imu_min_mag_calib` therefore now
+**defaults to 3**, Bosch's own bar for a trustworthy absolute heading,
+rather than requiring the flag to be passed manually; if it never reaches 3
+in a given room, that's a real environment/mounting issue; the odometry
+falls back to wheel-diff dead reckoning (with its own, better-understood
+drift) until it does, rather than trusting a low-confidence heading. The
+firmware also now persists the calibration offset profile to flash the
+first time it reaches full calibration each boot (see the IMU note in
+`rover_6wd_complete.ino`'s header, confirmed surviving a real reset
+2026-08-06), so the manual wave-around calibration dance is only needed
+once per physical environment, not every power-cycle.
+
 - **One file per goal, not per run.** Every time the target text changes
   (GUI Send/preset button, or a new `omnivla/goal_text` message), the logger
   closes the current file and starts a fresh one — `odometry_log/odom_
-  <slugified-target>_<timestamp>.csv` — resetting x/y/θ back to the origin,
-  so each file is a self-contained record of "how did the rover move while
-  pursuing this specific goal."
+  <slugified-target>_<timestamp>.csv` — so each file is a self-contained
+  record of "how did the rover move while pursuing this specific goal."
+  **Pose itself (x, y, θ) is continuous across goals by default** — a new
+  goal is just a new CSV file in the same running world frame, it does
+  *not* re-zero the origin. This is what makes
+  [object-location memory](#object-persistent-targeting-remind) meaningful
+  across goals/rooms instead of resetting every time the target changes;
+  call `reset_pose()` (or `start_new_goal(..., reset_pose=True)`) for the
+  old per-goal-origin behavior back, e.g. an explicit operator "reset map"
+  action.
 - **Spin-stall watchdog** (`isaac_gui.py`): a generic, multi-instance target
   (e.g. "chair" in a room full of chairs) can make Grounding DINO's
   re-acquire-on-loss hop between different physical objects each time the
@@ -138,17 +163,82 @@ the cost of depending on odometry quality). `scripts/test_belief_vs_frozen.py`
 reruns that comparison (~5 s, CPU only); `scripts/test_belief_integration.py`
 exercises the belief wiring inside a real `DinoNavDPPipeline` end to end.
 
+## Object-persistent targeting (REMIND)
+
+`nav_pipeline/remind_gui.py` (launched via `./launch_rover_remind.sh
+[PI_IP]`, which brings up the real rover exactly like `launch_rover.sh`
+*and* starts REMIND's own live-tracking server as a background process in
+its own conda env — see [REMIND/remind-reid-tracker/README.md](REMIND/remind-reid-tracker/README.md))
+replaces DINO's per-frame open-vocabulary detection with REMIND's
+persistent per-object identity: every camera frame is sent to that server
+(SAM automatic mask generation, class-agnostic — no fixed vocabulary), which
+hands back every currently-tracked object as a stable `object_id`, overlaid
+on the video feed as `ID <n>`. Targeting is **ID-only** — type or click a
+number back (`nav_pipeline/remind_target.py`) — because REMIND's own
+BLIP/InternVL caption per object is unstable frame to frame and stays
+internal bookkeeping only (`object_map.py`), never shown or matched against
+directly. Same control panel otherwise (camera feed, top-down NavDP
+trajectory plot, state/velocity readout, manual drive, STOP) as
+`isaac_gui.py`, same belief/AVOID/STOP state machine and 1.5 m default
+`stop_distance`, and RGB-only Depth Anything V2 **ViT-B** by default (more
+accurate than the ViT-S used elsewhere, since depth error feeds directly
+into the stop decision).
+
+- **Free-text targeting** ("go to the black chair", "chair near the
+  window") layers on top via `nav_pipeline/object_query.py`: a CLIP image
+  embedding is cached once per object — the first time it's seen, never
+  overwritten — and matched against a CLIP text embedding of the query,
+  reusing `relational_target.py`'s "X near Y" / "leftmost X" parsers but
+  ranking by remembered *world* position instead of pixel position.
+  Resolves to one `object_id` in a background thread, then behaves exactly
+  as if that ID had been typed directly — so it stays locked onto the one
+  instance the query picked even with several same-class objects in frame.
+- **Object-location memory** (`nav_pipeline/object_map.py`, persisted to
+  `object_map/object_map.json`): every tick, every REMIND object currently
+  in view — not just the driving target — gets its world-frame location
+  folded into a running per-ID estimate, using the rover's own continuous
+  odometry pose (see [Odometry logging](#odometry-logging)). That's why
+  pose no longer resets per goal: an object seen while chasing one target
+  needs to still mean something once the target changes. Survives GUI
+  restarts within a room/building, but is **not** safe to trust across a
+  power cycle or a physical pick-up-and-move of the rover — there's no way
+  to detect the odometry origin went stale, so clear it with the GUI's
+  **Forget locations** button (or delete the JSON) if that happened.
+- **Navigate-back (`GOTO`)**: if the selected object isn't currently
+  visible but a remembered world location exists for it, `pipeline.py`
+  gains a new `GOTO` state — drives toward that remembered point blind
+  (odometry-only waypoint) through the *same* obstacle-guard/NavDP
+  trajectory-selection machinery as a live `TRACK` (so depth-based
+  collision avoidance stays active the whole leg), but never self-declares
+  `STOP` from proximity alone, since dead-reckoning drift over a
+  cross-room walk makes trusting that unsafe. The instant REMIND matches
+  the object again it drops straight back to normal camera-based
+  `TRACK`/`STOP`; if it reaches the remembered spot without reacquiring it
+  visually, it falls back to an ordinary `SEARCH` spin there instead of
+  declaring arrival. Escalation to `GOTO` only happens once `pipeline.py`'s
+  own short-horizon [goal belief](#goal-belief-surviving-occlusion) has
+  genuinely given up (`sigma` past `belief_max_sigma`) — a bare drop in
+  REMIND's per-tick match (SAM's grid-point automatic masking has no
+  cross-frame memory, so a real object can miss a tick or two from pure
+  grid-sampling noise) is first coasted through via a
+  `--match-grace-period` window, so belief gets first crack at it instead
+  of the rover flickering into `GOTO`/`SEARCH` on every brief drop-out.
+
+```bash
+./launch_rover_remind.sh [PI_IP]
+```
+
 ## Manual control + Go Home
 
 `nav_pipeline/home_gui.py` (launched via `./launch_rover_home.sh [PI_IP]`) is
 a separate, lightweight control panel for the real rover: arrow-key/hold-button
 manual driving, plus a **GO HOME** button that drives back to wherever the
 rover was when the GUI launched (or wherever **Set Home Here** was last
-pressed). It's deliberately independent of `pipeline.py` / `isaac_gui.py` /
-`zenoh_node.py` — none of DINO/NavDP/SAM/CLIP/depth are imported, so it
-starts in under a second with no GPU, using only the fused encoder+IMU pose
-described above (`OdometryLogger`, small CDR bits duplicated from
-`zenoh_node.py` to avoid the heavy import chain).
+pressed). By default it's still deliberately independent of `pipeline.py` /
+`isaac_gui.py` / `zenoh_node.py` — none of DINO/NavDP/SAM/CLIP/depth are
+imported, so it starts in under a second with no GPU, using only the fused
+encoder+IMU pose described above (`OdometryLogger`, small CDR bits
+duplicated from `zenoh_node.py` to avoid the heavy import chain).
 
 Go Home is closed-loop, not an open-loop "turn 180°, drive N meters" — it
 recomputes bearing/distance from the live fused pose every tick, so drift or
@@ -162,6 +252,25 @@ a bump mid-return gets corrected on the fly:
   θ=0, the launch heading, if home was never re-set). Only then does it
   report **ARRIVED** — the rover ends up facing the same way it started, not
   just standing in the same spot.
+
+**Optional obstacle avoidance while homing** (`--enable-obstacle-avoidance`,
+off by default): starts the Pi camera and loads the full
+`DinoNavDPPipeline` (DINO + NavDP + Depth Anything V2 — a real model-load
+pause comparable to `launch_rover.sh`'s, plus continuous camera Wi-Fi/CPU
+traffic the plain camera-free Go Home never had), and drives the long
+cross-room leg through `pipeline.py`'s `GOTO` state (the same mechanism
+[REMIND navigate-back](#object-persistent-targeting-remind) uses, just
+pointed at the fixed home point via `object_map.world_to_local` instead of
+a remembered object) instead of the plain bearing-servo above. NavDP scores
+candidate trajectories by both goal progress and a footprint-aware
+obstacle-clearance veto, so it naturally keeps making progress toward home
+after steering around something rather than resuming a fixed heading and
+re-hitting whatever it just avoided. `GOTO` never self-declares arrival (see
+above), so `navdp_home_loop` owns that check itself: once within
+`--home-arrival-radius` (default 1 m) of home, it hands off to the same
+vision-free ROTATE/DRIVE/FACE/ARRIVED servo above for the precise final
+approach and heading match. Manual drive is never gated by any of this,
+flag on or off.
 
 ## The four worlds it runs in
 
@@ -189,15 +298,21 @@ Nav_new/
 ├── configs/               yaml configs (isaac / real rover)
 ├── data/                 saved test frames + pipeline output snapshots
 ├── odometry_log/         dead-reckoned pose CSVs, one per goal (own README)
+├── object_map/           persistent id -> world-location JSON (object_map.py, see REMIND targeting)
 ├── belief_eval_*/        dated write-ups of the belief-vs-frozen occlusion eval (see Goal belief)
 ├── reference/            prior OmniVLA/InternVLA-N1 nodes, kept for reference
 ├── third_party/InternNav/  vendored InternNav source (checkpoints symlinked in)
-├── esp32/                rover firmware + Pi-side serial/handshake helpers
+├── esp32/                rover firmware + Pi-side serial/handshake helpers (see esp32/FLASHING.md
+│                        for how to compile + flash it — the ESP32 is wired to the Pi, not the
+│                        GPU machine, so this is a compile-locally/scp/flash-via-SSH workflow)
 ├── MARS/                 Habitat-Sim Mars sub-project (own README)
 ├── EARTH/                Habitat-Sim real-world photogrammetry sub-project (own README)
+├── REMIND/remind-reid-tracker/  persistent per-object re-ID tracker, live-served for
+│                        object-persistent targeting (own README, separate conda env)
 └── launch_*.sh           one-command entry points for each of the 4 worlds,
-                         plus launch_odom_test.sh (real-rover odometry-accuracy GUI, no perception models)
-                         and launch_rover_home.sh (manual control + Go Home, no perception models)
+                         plus launch_odom_test.sh (real-rover odometry-accuracy GUI, no perception models),
+                         launch_rover_home.sh (manual control + Go Home, no perception models by default),
+                         and launch_rover_remind.sh (REMIND object-persistent targeting, real rover only)
 ```
 
 ### `nav_pipeline/` — the package
@@ -211,10 +326,14 @@ Nav_new/
 - `depth_estimator.py` — Depth Anything V2 metric monocular depth for the RGB-only real rover
 - `goal_utils.py` — preprocessing + bbox→3D-goal math
 - `goal_belief.py` — ego-motion propagation of the tracked goal point while it's out of view, instead of freezing it (see [Goal belief](#goal-belief-surviving-occlusion))
-- `odometry_logger.py` — dead-reckons `/rover/rpm` (real wheel-encoder RPM + BNO055 IMU heading) into a pose, one CSV per goal under `odometry_log/`; also backs the GUI's spin-stall watchdog (see [Odometry logging](#odometry-logging))
-- `pipeline.py` — the full perception→policy step, state machine, trajectory selection (the diagram above, as code)
+- `odometry_logger.py` — dead-reckons `/rover/rpm` (real wheel-encoder RPM + BNO055 IMU heading) into a pose, continuous across goals (one CSV per goal under `odometry_log/`, but the pose itself doesn't re-zero); also backs the GUI's spin-stall watchdog (see [Odometry logging](#odometry-logging))
+- `object_map.py` — persistent per-object-ID world-location memory (`local_to_world`/`world_to_local` against the continuous odometry pose), backing REMIND [navigate-back](#object-persistent-targeting-remind); persisted to `object_map/object_map.json`
+- `object_query.py` — resolves free-text ("go to the chair near the window") to a specific `object_id` via cached CLIP image embeddings + `relational_target.py`'s parsers, ranked by remembered world position (see [Object-persistent targeting](#object-persistent-targeting-remind))
+- `pipeline.py` — the full perception→policy step, state machine, trajectory selection (the diagram above, as code); also owns the `GOTO` blind-navigate-back state (`external_goal` argument to `step()`)
 - `isaac_gui.py` — the control panel: camera + mask/bbox overlay, top-down trajectories + obstacles, live target entry
-- `home_gui.py` — vision-free manual control + Go Home panel (fused encoder+IMU pose only, no DINO/NavDP/SAM/CLIP/depth), launched via `./launch_rover_home.sh` (see [Manual control + Go Home](#manual-control--go-home))
+- `remind_gui.py` — REMIND-backed variant of `isaac_gui.py`: ID-only persistent-object targeting instead of a bare DINO phrase, launched via `./launch_rover_remind.sh` (see [Object-persistent targeting](#object-persistent-targeting-remind))
+- `remind_client.py` / `remind_target.py` — HTTP client for the REMIND live server (`REMIND/remind-reid-tracker/scripts/live_server.py`) and its "ID <n>" target-text parser
+- `home_gui.py` — manual control + Go Home panel; camera-free/no-GPU by default (fused encoder+IMU pose only), or opt into NavDP obstacle avoidance for the homing leg via `--enable-obstacle-avoidance`, launched via `./launch_rover_home.sh` (see [Manual control + Go Home](#manual-control--go-home))
 - `zenoh_node.py` — headless transport node, same Zenoh/CDR contract as the old OmniVLA node
 
 ### `checkpoints/`
@@ -274,6 +393,21 @@ opposite gotcha from MARS's hand-built Z-up mesh) and a generated sky dome,
 since the scan ships with no lights. Full detail in
 [EARTH/README.md](EARTH/README.md).
 
+### `REMIND/`
+
+A self-contained multi-object re-identification tracker (own conda env —
+its torch/transformers pins are incompatible with this project's `internnav`
+env) that gives every detected object a persistent identity across a live
+camera stream, instead of DINO's stateless per-frame open-vocab detection.
+`remind-reid-tracker/scripts/live_server.py` serves it over HTTP for
+`nav_pipeline/remind_client.py` to poll. Two READMEs cover it:
+[REMIND/README.md](REMIND/README.md) for how it plugs into Nav_new's
+navigation (object-location memory, navigate-back, free-text targeting —
+also summarized in [Object-persistent targeting](#object-persistent-targeting-remind)
+above), and [REMIND/remind-reid-tracker/README.md](REMIND/remind-reid-tracker/README.md)
+for the tracker itself (SAM detection backend, BLIP/InternVL captioning,
+the live server's API).
+
 ## Running it
 
 ```bash
@@ -297,17 +431,21 @@ since the scan ships with no lights. Full detail in
 # "Goal belief" below for why this matters)
 ./launch_odom_test.sh <PI_IP>
 
-# Real-rover manual control + Go Home (no camera/DINO/SAM/NavDP -- see
-# "Manual control + Go Home" below)
+# Real-rover manual control + Go Home (no camera/DINO/SAM/NavDP by default -- see
+# "Manual control + Go Home" below; add --enable-obstacle-avoidance to opt in)
 ./launch_rover_home.sh <PI_IP>
+
+# Real-rover object-persistent targeting via REMIND (brings up its own live
+# server too -- see "Object-persistent targeting (REMIND)" below)
+./launch_rover_remind.sh <PI_IP>
 ```
 
 Change the target at runtime by publishing `std_msgs/String` on
 `omnivla/goal_text` — no restart needed.
 
 Only ever run **one** controller against a given peer at a time
-(`isaac_gui.py`, `mars_gui.py`, `zenoh_node.py`, `home_gui.py` all publish
-`cmd_vel` and will fight each other for it).
+(`isaac_gui.py`, `mars_gui.py`, `zenoh_node.py`, `home_gui.py`, `remind_gui.py`
+all publish `cmd_vel` and will fight each other for it).
 
 ### Zenoh transport contract (mostly unchanged from the OmniVLA project this was distilled from)
 

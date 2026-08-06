@@ -28,7 +28,7 @@
 #    ./launch_rover_remind.sh 10.47.234.125 --target "chair id 1"
 # ============================================================
 set -uo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 REPO_DIR="$(pwd)"
 REMIND_DIR="$REPO_DIR/REMIND/remind-reid-tracker"
 

@@ -11,7 +11,7 @@
 # subscribing to cmd_vel.
 
 set -eo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 source /home/i3d/exit/etc/profile.d/conda.sh
 conda activate internnav

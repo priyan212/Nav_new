@@ -34,6 +34,16 @@ from transformers import AutoProcessor, InternVLForConditionalGeneration
 
 class InternVLClassifier:
     DEFAULT_PROMPT = "What object is this? Answer with one or two words only, no punctuation."
+    # Nav_new's VLM arrival-confirmation gate (nav_pipeline/remind_gui_vlm.py)
+    # -- see confirm_arrival() below. Full-scene question, not the crop-only
+    # classifier prompt above: arrival is a judgment about the robot's
+    # relationship to the whole frame, not what the target object looks like.
+    ARRIVAL_PROMPT_TEMPLATE = (
+        "You are looking through a mobile robot's front camera. The robot is "
+        "trying to reach: '{target}'. Has the robot arrived at / gotten close "
+        "enough to this target that it should stop moving? Answer with exactly "
+        "one word: yes or no."
+    )
 
     def __init__(self, config: dict, device: str):
         self.config = config or {}
@@ -95,6 +105,43 @@ class InternVLClassifier:
         text = self.processor.decode(gen_only[0], skip_special_tokens=True).strip()
         text = text.rstrip(".").strip()
         return text or None
+
+    @torch.no_grad()
+    def confirm_arrival(self, rgb: np.ndarray, target_desc: str) -> Optional[bool]:
+        """VQA arrival check on the FULL frame -- unlike caption() above,
+        which classifies a cropped detection, arrival is a judgment about
+        the robot's relationship to the whole scene (how close it looks,
+        whether the object fills the frame), not just what the target crop
+        looks like. Called by live_server.py's /confirm_arrival endpoint,
+        itself only hit once Nav_new's metric depth-threshold stop has
+        already fired (see nav_pipeline/remind_gui_vlm.py's
+        VLMArrivalGate) -- this is a slower semantic confirmation layered
+        ON TOP of that, never a replacement for it.
+
+        Returns True/False, or None if the generated answer didn't parse
+        as a clear yes/no (caller treats None as "not yet")."""
+        if self.model is None:
+            raise RuntimeError("InternVL is not loaded. Call load_model() before confirm_arrival().")
+
+        prompt = self.ARRIVAL_PROMPT_TEMPLATE.format(target=target_desc)
+        messages = [
+            {"role": "user", "content": [
+                {"type": "image"},
+                {"type": "text", "text": prompt},
+            ]},
+        ]
+        chat_prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True)
+        inputs = self.processor(images=rgb, text=chat_prompt, return_tensors="pt").to(
+            self.device, torch.bfloat16
+        )
+        out_ids = self.model.generate(**inputs, max_new_tokens=4, do_sample=False)
+        gen_only = out_ids[:, inputs["input_ids"].shape[1]:]
+        text = self.processor.decode(gen_only[0], skip_special_tokens=True).strip().lower()
+        if text.startswith("yes"):
+            return True
+        if text.startswith("no"):
+            return False
+        return None
 
     def _crop(
         self,

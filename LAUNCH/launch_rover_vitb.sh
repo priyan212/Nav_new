@@ -13,5 +13,5 @@
 #   ./launch_rover_vitb.sh                          # default Pi IP (10.47.234.125)
 #   ./launch_rover_vitb.sh 10.47.234.125 --target "trash bin"
 set -uo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 exec ./launch_rover.sh "$@" --depth-encoder vitb

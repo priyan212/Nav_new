@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import List, Optional
@@ -98,6 +99,42 @@ class RemindClient:
                 mask=self._decode_mask(o.get("mask_png_b64"), o.get("mask_bbox"), (h, w)),
             ))
         return objects
+
+    def confirm_arrival(self, rgb: np.ndarray, target_desc: str) -> Optional[bool]:
+        """Ask the REMIND server's already-loaded InternVL model whether the
+        rover has arrived at `target_desc`, given the CURRENT full frame
+        (see live_server.py's /confirm_arrival and InternVLClassifier.
+        confirm_arrival). Distinct from infer() above: this is a per-
+        arrival-attempt VQA call meant to be throttled by the caller (see
+        nav_pipeline/remind_gui_vlm.py's VLMArrivalGate), not run every tick.
+
+        Returns True/False, or None if InternVL's answer didn't parse as a
+        clear yes/no. Raises NotImplementedError if this server has no
+        /confirm_arrival endpoint (older server) or InternVL wasn't loaded
+        (started with --no-internvl/--use-blip) -- callers should treat
+        that as "VLM confirmation unavailable" and fall back to pure
+        metric behavior, not retry."""
+        h, w = rgb.shape[:2]
+        bgr = rgb[:, :, ::-1]
+        ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+        if not ok:
+            raise RuntimeError("JPEG encode failed")
+        query = urllib.parse.urlencode({"target": target_desc})
+        req = urllib.request.Request(
+            f"{self.server_url}/confirm_arrival?{query}", data=buf.tobytes(), method="POST",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=max(self.timeout, 8.0)) as r:
+                payload = json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code in (404, 501):
+                raise NotImplementedError(
+                    f"REMIND server has no usable /confirm_arrival endpoint (HTTP {e.code})"
+                ) from e
+            raise
+        arrived = payload.get("arrived")
+        return bool(arrived) if arrived is not None else None
 
     @staticmethod
     def _decode_mask(mask_png_b64: Optional[str], mask_bbox, frame_hw) -> Optional[np.ndarray]:

@@ -19,7 +19,7 @@
 # OmniVLA isaac_gui.py) — they all publish cmd_vel and will fight each other.
 
 set -eo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 source /home/i3d/exit/etc/profile.d/conda.sh
 conda activate internnav

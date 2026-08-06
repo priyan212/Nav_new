@@ -36,7 +36,7 @@
 #    ./launch_rover_home.sh 10.47.234.125 --enable-obstacle-avoidance
 # ============================================================
 set -uo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 if [[ "${1:-}" == -* ]]; then
     PI_IP=10.47.234.125

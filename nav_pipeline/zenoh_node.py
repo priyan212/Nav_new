@@ -46,6 +46,7 @@ except ImportError:
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from nav_pipeline.obstacle_guard import GuardConfig  # noqa: E402
 from nav_pipeline.odometry_logger import OdometryLogger  # noqa: E402
 from nav_pipeline.pipeline import DinoNavDPPipeline, PipelineConfig  # noqa: E402
 
@@ -331,7 +332,9 @@ class DinoNavDPZenohNode:
             if len(data) >= 2:
                 imu_heading = data[2] if len(data) >= 3 else None
                 imu_calib = data[3] if len(data) >= 4 else None
-                self.odom.update(data[0], data[1], imu_heading_deg=imu_heading, imu_calib=imu_calib)
+                lateral_m_s = data[4] if len(data) >= 5 else None  # holonomic chassis only, see landerpi/bridge.py
+                self.odom.update(data[0], data[1], imu_heading_deg=imu_heading, imu_calib=imu_calib,
+                                  lateral_m_s=lateral_m_s)
         except Exception as e:
             print(f"[WARN] rpm parse failed: {e}")
 
@@ -471,6 +474,12 @@ def main():
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--odometry-log-dir", type=str, default="odometry_log",
                    help="dead-reckoned pose CSV log dir (from /rover/rpm)")
+    p.add_argument("--footprint-length", type=float, default=GuardConfig().footprint_length,
+                   help="robot length (m) for obstacle_guard's swept-footprint clearance -- "
+                        "defaults to the ESP32 rover's real size, override for a different robot "
+                        "(e.g. the LanderPi, see landerpi/README.md) before trusting obstacle avoidance")
+    p.add_argument("--footprint-width", type=float, default=GuardConfig().footprint_width,
+                   help="robot width (m), see --footprint-length")
     args = p.parse_args()
 
     cfg = PipelineConfig(
@@ -482,6 +491,7 @@ def main():
         angular_slew_max=args.angular_slew_max,
         invert_angular=args.invert_angular,
         use_belief_goal=not args.no_belief_goal,
+        guard=GuardConfig(footprint_length=args.footprint_length, footprint_width=args.footprint_width),
     )
     pipeline = DinoNavDPPipeline(cfg)
 

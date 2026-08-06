@@ -38,7 +38,7 @@ class OdometryLogger:
     # window_s a caller will query
     HISTORY_WINDOW_S = 30.0
 
-    def __init__(self, log_dir: str = "odometry_log", imu_min_mag_calib: int = 1):
+    def __init__(self, log_dir: str = "odometry_log", imu_min_mag_calib: int = 3):
         self.log_dir = log_dir
         os.makedirs(log_dir, exist_ok=True)
         self.path: Optional[str] = None
@@ -81,7 +81,7 @@ class OdometryLogger:
         self._file = open(self.path, "w", newline="")
         self._writer = csv.writer(self._file)
         self._writer.writerow(["t", "dt", "left_rpm", "right_rpm", "v", "w", "x", "y", "theta",
-                               "imu_heading_deg", "theta_src"])
+                               "imu_heading_deg", "theta_src", "lateral_m_s"])
         self._last_t = None
         if reset_pose:
             self.reset_pose()
@@ -145,7 +145,8 @@ class OdometryLogger:
         return math.radians(delta_deg)
 
     def update(self, left_rpm: float, right_rpm: float, t: Optional[float] = None,
-               imu_heading_deg: Optional[float] = None, imu_calib: Optional[float] = None):
+               imu_heading_deg: Optional[float] = None, imu_calib: Optional[float] = None,
+               lateral_m_s: Optional[float] = None):
         """Feed one /rover/rpm sample; integrates and appends a CSV row.
 
         No-op (returns None) until start_new_goal() has opened a file.
@@ -157,6 +158,13 @@ class OdometryLogger:
         the wheel-only heading over a long run. x/y are still advanced from
         encoder-derived speed either way (translation distance is what
         encoders measure well).
+
+        lateral_m_s is optional (default None -> every existing 2-arg/4-arg
+        call site, e.g. the ESP32 skid-steer rover, is byte-for-byte
+        unaffected): a body-frame sideways velocity (+left, m/s), for
+        holonomic chassis (e.g. the LanderPi's Mecanum wheels, see
+        landerpi/bridge.py) where real lateral motion/slip is possible and
+        otherwise invisible to this rover-inherited unicycle model.
         """
         # Captured unconditionally, even before start_new_goal() has opened a
         # file (self._writer is None below) -- an operator checking IMU
@@ -178,6 +186,8 @@ class OdometryLogger:
         v = 0.5 * (v_left + v_right)
         w = (v_right - v_left) / TRACK_WIDTH_M
 
+        lateral = 0.0 if lateral_m_s is None else lateral_m_s
+
         dtheta = 0.0
         if dt > 0.0:
             dtheta = w * dt
@@ -188,13 +198,17 @@ class OdometryLogger:
             else:
                 self.theta += dtheta
                 self.theta_source = "enc"
-            self.x += v * math.cos(self.theta) * dt
-            self.y += v * math.sin(self.theta) * dt
+            # Body-frame (v forward, lateral left) rotated into world frame.
+            # lateral is 0.0 for every non-holonomic caller, reducing this to
+            # the original x += v*cos(theta)*dt / y += v*sin(theta)*dt exactly.
+            self.x += (v * math.cos(self.theta) - lateral * math.sin(self.theta)) * dt
+            self.y += (v * math.sin(self.theta) + lateral * math.cos(self.theta)) * dt
 
         imu_field = f"{imu_heading_deg:.4f}" if imu_heading_deg is not None and math.isfinite(imu_heading_deg) else ""
+        lateral_field = f"{lateral_m_s:.4f}" if lateral_m_s is not None else ""
         self._writer.writerow([f"{t:.6f}", f"{dt:.4f}", left_rpm, right_rpm,
                                f"{v:.4f}", f"{w:.4f}", f"{self.x:.4f}", f"{self.y:.4f}", f"{self.theta:.4f}",
-                               imu_field, self.theta_source])
+                               imu_field, self.theta_source, lateral_field])
         self._file.flush()
 
         self._history.append((t, self.x, self.y, self.theta, abs(dtheta)))

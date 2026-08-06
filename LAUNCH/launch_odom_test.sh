@@ -16,7 +16,7 @@
 #    ./launch_odom_test.sh 10.47.234.125 --max-angular 1.0
 # ============================================================
 set -uo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 PI_IP=${1:-10.47.234.125}; shift 2>/dev/null || true
 PI_USER=pi

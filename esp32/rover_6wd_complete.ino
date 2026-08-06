@@ -40,6 +40,19 @@
  * doesn't depend on wheel odometry at all, so it's immune to that specific
  * failure mode. Raw I2C register access (no Adafruit_BNO055/Adafruit_Sensor
  * library dependency) -- see bno055_init()/bno055_read_heading_deg() below.
+ * Calibration offsets persist across power cycles (NVS via Preferences,
+ * still no new external library): the first time this boot's calibration
+ * reaches SYS/GYR/ACC/MAG all == 3, bno055_save_calibration() stores the
+ * offset block to flash; every future boot's bno055_init() restores it via
+ * bno055_load_calibration(), skipping the physical wave-around calibration
+ * dance. Getting CALIBRATED (Pi-side theta_src == "imu") does NOT mean the
+ * heading is actually ACCURATE, though: --imu-min-mag-calib on the Pi side
+ * (home_gui.py et al) gates on the MAG sub-score alone, and level 1 there
+ * (the default) is a low bar -- real magnetic disturbance near the sensor
+ * (motor current, nearby metal/wiring) can still swing the reported heading
+ * tens of degrees at MAG==1. Level 3 is Bosch's own bar for a trustworthy
+ * absolute heading; if MAG can't reach 3 in a given room, that's a real
+ * environment/mounting issue this persistence feature doesn't paper over.
  *
  * SIGN CONVENTION
  *   The firmware owns the encoder sign so that a forward command yields
@@ -58,6 +71,9 @@
 #include <geometry_msgs/msg/twist.h>
 #include <std_msgs/msg/float32_multi_array.h>
 #include <Wire.h>
+#include <Preferences.h>  // ESP32 core NVS wrapper (bundled with the core, same tier as
+                          // Wire.h -- not a new external library, see BNO055 calibration
+                          // persistence note below)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MOTOR PINS (6-wheel rover: 3 motors per side)
@@ -225,11 +241,57 @@ long   pub_last_right = 0;
 #define BNO055_REG_OPR_MODE         0x3D
 #define BNO055_REG_PWR_MODE         0x3E
 
+// Sensor offset/radius block (accel offset x/y/z, mag offset x/y/z, gyro
+// offset x/y/z, accel radius, mag radius -- BNO055 datasheet table 3-42),
+// 22 contiguous bytes. Only readable/writable in CONFIG mode. This is the
+// standard save/restore-calibration mechanism (Bosch datasheet section
+// 3.6.4): read it out once fully calibrated, persist it, and write it back
+// on every future boot instead of re-doing the physical wave-around
+// calibration dance each time -- see bno055_save_calibration()/
+// bno055_load_calibration() below.
+#define BNO055_REG_CALIB_START      0x55
+#define BNO055_CALIB_LEN            22
+
+// Bosch's NDOF fusion algorithm reports the MAG sub-score conservatively:
+// even with a known-good offset profile just restored from flash, it won't
+// report mag calibrated (score 3) until it has seen live, consistent
+// magnetometer readings post-boot -- unlike accel/gyro, whose calibration
+// is sensor-intrinsic (bias/temperature) and validates almost instantly,
+// mag calibration compensates for LOCAL magnetic interference, which the
+// chip has no way to know hasn't changed since the offsets were saved. Set
+// this to 1 to bridge JUST that initial post-boot gap: report mag as
+// trusted (score 3) immediately after a saved profile loads, but ONLY
+// until the live status genuinely reaches 3 on its own for the first time
+// this boot (bno_mag_live_confirmed) -- from that point on the override is
+// inert and the live reading is fully authoritative again, so a real
+// disturbance encountered later during actual use (motor EMI while
+// driving, reproduced 2026-08-06: heading drifted 24 deg in ~300ms while
+// stationary right after a drive burst) still correctly falls back to
+// wheel-diff instead of being permanently masked. Safe ONLY if the rover
+// stays in the same magnetic environment (same room, same nearby
+// metal/motors/wiring) it was calibrated in -- if it's moved somewhere
+// very different, the bridged window right after boot could mask a bad
+// heading, same risk as before, just narrowed to that one window instead
+// of the whole session (see nav_pipeline/odometry_logger.py's
+// imu_min_mag_calib gate, Pi-side).
+#define TRUST_LOADED_MAG_CALIB      1
+
 #define BNO055_MODE_CONFIG          0x00
 #define BNO055_MODE_NDOF            0x0C
 #define BNO055_PWR_NORMAL           0x00
 
 bool imu_present = false;
+Preferences bno_prefs;
+bool bno_calib_saved_this_boot = false;  // avoid hammering flash every publish tick
+                                          // once full calibration is reached -- see loop()
+bool bno_calib_loaded_this_boot = false; // a saved offset block was found + applied at boot
+                                          // -- see bno055_load_calibration()/TRUST_LOADED_MAG_CALIB
+bool bno_mag_live_confirmed = false;     // raw MAG sub-score has genuinely reached 3 at least
+                                          // once THIS boot -- once true, TRUST_LOADED_MAG_CALIB
+                                          // stops bridging and the live status is fully
+                                          // authoritative again, so a real disturbance after that
+                                          // point (e.g. motor EMI while driving) still correctly
+                                          // falls back to wheel-diff instead of being masked.
 
 bool bno055_write8(uint8_t reg, uint8_t val) {
   Wire.beginTransmission(BNO055_I2C_ADDR);
@@ -245,6 +307,52 @@ bool bno055_read(uint8_t reg, uint8_t *buf, uint8_t len) {
   if (Wire.requestFrom((int)BNO055_I2C_ADDR, (int)len) != (int)len) return false;
   for (uint8_t i = 0; i < len; i++) buf[i] = Wire.read();
   return true;
+}
+
+// Restore a previously-saved calibration offset block (see
+// bno055_save_calibration() below) -- MUST be called while already in
+// CONFIG mode (offset registers aren't accessible in NDOF). No-op if
+// nothing was ever saved: a fresh board, or one that's never yet completed
+// a full physical calibration, just keeps the sensor's power-on defaults
+// and calibrates from scratch as before. Sets bno_calib_loaded_this_boot
+// on success -- see TRUST_LOADED_MAG_CALIB below for what that unlocks.
+void bno055_load_calibration() {
+  bno_prefs.begin("bno055", true);  // read-only
+  if (bno_prefs.getBytesLength("offsets") == BNO055_CALIB_LEN) {
+    uint8_t buf[BNO055_CALIB_LEN];
+    bno_prefs.getBytes("offsets", buf, BNO055_CALIB_LEN);
+    for (uint8_t i = 0; i < BNO055_CALIB_LEN; i++) {
+      bno055_write8(BNO055_REG_CALIB_START + i, buf[i]);
+    }
+    bno_calib_loaded_this_boot = true;
+  }
+  bno_prefs.end();
+}
+
+// Persist the current calibration offset block to flash (NVS via
+// Preferences) so a future boot can skip the physical wave-around
+// calibration dance entirely -- see bno055_load_calibration() and loop()'s
+// RPM-publish block, which calls this once per boot the first time
+// bno055_read_calib_status() reports full calibration (0xFF). Briefly
+// switches to CONFIG mode to read the offset registers (only accessible
+// there, datasheet section 3.6.4) -- a one-time ~50ms fusion-output pause
+// the very first time full calibration is reached each boot, never again
+// after that (guarded by bno_calib_saved_this_boot), so it doesn't
+// meaningfully compete with the control loop's cadence.
+void bno055_save_calibration() {
+  bno055_write8(BNO055_REG_PAGE_ID, 0x00);
+  bno055_write8(BNO055_REG_OPR_MODE, BNO055_MODE_CONFIG);
+  delay(25);
+
+  uint8_t buf[BNO055_CALIB_LEN];
+  if (bno055_read(BNO055_REG_CALIB_START, buf, BNO055_CALIB_LEN)) {
+    bno_prefs.begin("bno055", false);  // read/write
+    bno_prefs.putBytes("offsets", buf, BNO055_CALIB_LEN);
+    bno_prefs.end();
+  }
+
+  bno055_write8(BNO055_REG_OPR_MODE, BNO055_MODE_NDOF);
+  delay(25);
 }
 
 // Returns false if the BNO055 never acks/identifies correctly -- this IS the
@@ -265,6 +373,7 @@ bool bno055_init() {
   delay(25);                                    // mode-switch settle (datasheet: 19ms to CONFIG)
   bno055_write8(BNO055_REG_PWR_MODE, BNO055_PWR_NORMAL);
   bno055_write8(BNO055_REG_PAGE_ID, 0x00);
+  bno055_load_calibration();  // restore a saved offset block, if any (must run in CONFIG mode)
   bno055_write8(BNO055_REG_OPR_MODE, BNO055_MODE_NDOF);  // full 9-DOF fusion, absolute heading
   delay(25);                                    // mode-switch settle (datasheet: 7ms, +margin)
   return true;
@@ -568,7 +677,26 @@ void loop() {
           uint8_t c = bno055_read_calib_status();
           float sys_c = (c >> 6) & 0x03, gyr_c = (c >> 4) & 0x03,
                 acc_c = (c >> 2) & 0x03, mag_c = c & 0x03;
+#if TRUST_LOADED_MAG_CALIB
+          // See TRUST_LOADED_MAG_CALIB's comment above: bridge only up to
+          // the first genuine live confirmation this boot, then get out of
+          // the way permanently so a later real disturbance isn't masked.
+          if (mag_c >= 3.0f) bno_mag_live_confirmed = true;
+          if (bno_calib_loaded_this_boot && !bno_mag_live_confirmed && mag_c < 3.0f) {
+            mag_c = 3.0f;
+          }
+#endif
           rpm_data[3] = sys_c * 1000.0f + gyr_c * 100.0f + acc_c * 10.0f + mag_c;
+          // Auto-persist the calibration offsets the FIRST time full
+          // calibration (all four sub-scores == 3, i.e. c == 0xFF) is seen
+          // this boot -- see bno055_save_calibration()'s docstring. After
+          // this, a power cycle restores it via bno055_load_calibration()
+          // in bno055_init() instead of needing the manual wave-around
+          // dance again.
+          if (!bno_calib_saved_this_boot && c == 0xFF) {
+            bno055_save_calibration();
+            bno_calib_saved_this_boot = true;
+          }
         }
         rcl_publish(&rpm_pub, &rpm_msg, NULL);
 

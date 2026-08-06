@@ -148,11 +148,11 @@ class PipelineConfig:
     use_belief_goal: bool = True
     belief_sigma_init: float = 1000.0
     belief_sigma_visible: float = 0.05
-    belief_odom_noise: float = 0.01
+    belief_odom_noise: float = 0.0015 # <--------------------------------------------------------------------------------------
     # see goal_belief.py's module docstring for where this starting point
     # comes from (real spin-accuracy trials, not a physical constant)
     belief_rot_noise_gain: float = 0.35
-    belief_max_sigma: float = 1.0    # above this, distrust belief and go to SEARCH
+    belief_max_sigma: float = 0.15    # above this, distrust belief and go to SEARCH # <----------------------------------------
     belief_decay_factor: float = 0.95
     # Target-ambiguity detection: a bare category prompt ("chair") is
     # genuinely underspecified when several same-class objects score
@@ -995,7 +995,7 @@ class DinoNavDPPipeline:
 
         clearances = None
         if obstacle_pts is not None:
-            clearances = swept_clearance(trajs, obstacle_pts)
+            clearances = swept_clearance(trajs, obstacle_pts, self.cfg.guard)
         idx = self._select_trajectory(trajs, critic, goal, clearances)
         chosen = trajs[idx]
         res.trajectory = chosen

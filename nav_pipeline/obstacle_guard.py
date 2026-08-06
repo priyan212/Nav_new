@@ -67,9 +67,23 @@ class GuardConfig:
     margin: float = 0.10            # required gap beyond the swept hull (m)
     hard_stop_dist: float = 0.60    # forward obstacle closer than this -> stop (m)
     reverse_dist: float = 0.35      # too close to rotate -> back up first (m)
-    slow_dist: float = 1.5          # start slowing below this forward distance (m)
+    slow_dist: float = 2.5          # start slowing + curving below this forward distance (m) --
+                                     # this is also the switch-over point between pure open-space
+                                     # goal-bearing servo (ignores obstacles) and NavDP's
+                                     # clearance-vetoed trajectory selection (see pipeline.py's
+                                     # step()), so it's the main knob for how far out avoidance
+                                     # visibly starts. Kept comfortably under max_range (4.0m) since
+                                     # depth reliability degrades near the far edge of range.
     corridor_half_width: float = 0.35  # forward corridor half-width ≥ half-width+margin (m)
     stride: int = 4                 # depth subsampling stride (speed)
+    # Robot footprint for swept_clearance()'s two-circle cover -- defaults to
+    # the ESP32 rover's real dimensions so every existing caller that doesn't
+    # pass this GuardConfig into swept_clearance() is unaffected. A different
+    # robot (different physical size) should pass its own GuardConfig with
+    # these overridden -- see landerpi/README.md.
+    footprint_length: float = ROVER_LENGTH
+    footprint_width: float = ROVER_WIDTH
+    footprint_circle_dx: float = _CIRCLE_DX
 
 
 def depth_to_obstacle_points(
@@ -130,30 +144,42 @@ def depth_to_obstacle_points(
     return pts
 
 
-def swept_clearance(trajs: np.ndarray, points: np.ndarray) -> np.ndarray:
+def swept_clearance(
+    trajs: np.ndarray, points: np.ndarray, cfg: Optional[GuardConfig] = None
+) -> np.ndarray:
     """Footprint-swept clearance of each trajectory (N, T, 3) vs points (M, 2).
 
-    Sweeps the two-circle cover of the rover rectangle along the waypoints
+    Sweeps the two-circle cover of the robot rectangle along the waypoints
     using each waypoint's yaw (3rd channel). Returns (N,) gap beyond the
     hull in meters — 0 means the hull touches an obstacle point; inf when
     there are no points. The start pose (0, 0, 0) is prepended so rotating
     in place is covered too.
+
+    cfg: optional GuardConfig to override the footprint (cfg.footprint_length
+    / footprint_width / footprint_circle_dx). Omit to use the ESP32 rover's
+    dimensions (module-level ROVER_LENGTH/ROVER_WIDTH) -- every existing
+    caller that doesn't pass a cfg keeps that exact behavior.
     """
     if points.shape[0] == 0:
         return np.full(trajs.shape[0], np.inf, dtype=np.float32)
+    if cfg is not None:
+        dx = cfg.footprint_circle_dx
+        r = float(np.hypot(cfg.footprint_length / 2 - dx, cfg.footprint_width / 2)) + 0.01
+    else:
+        dx, r = _CIRCLE_DX, _CIRCLE_R
     N, T, _ = trajs.shape
     start = np.zeros((N, 1, 3), dtype=trajs.dtype)
     tr = np.concatenate([start, trajs], axis=1)            # (N, T+1, 3)
     x, y, yaw = tr[:, :, 0], tr[:, :, 1], tr[:, :, 2]
     cos_y, sin_y = np.cos(yaw), np.sin(yaw)
-    # circle centers at ±_CIRCLE_DX along the body axis   -> (N, 2*(T+1), 2)
-    cx = np.concatenate([x + cos_y * _CIRCLE_DX, x - cos_y * _CIRCLE_DX], axis=1)
-    cy = np.concatenate([y + sin_y * _CIRCLE_DX, y - sin_y * _CIRCLE_DX], axis=1)
+    # circle centers at ±dx along the body axis   -> (N, 2*(T+1), 2)
+    cx = np.concatenate([x + cos_y * dx, x - cos_y * dx], axis=1)
+    cy = np.concatenate([y + sin_y * dx, y - sin_y * dx], axis=1)
     d2 = (
         (cx[:, :, None] - points[None, None, :, 0]) ** 2
         + (cy[:, :, None] - points[None, None, :, 1]) ** 2
     )
-    gap = np.sqrt(d2.min(axis=(1, 2))) - _CIRCLE_R
+    gap = np.sqrt(d2.min(axis=(1, 2))) - r
     return gap.astype(np.float32)  # negative = hull would overlap the obstacle
 
 

@@ -374,7 +374,9 @@ def zenoh_setup(session: zenoh.Session, st: SharedState, odom: OdometryLogger, c
                 return
             imu_heading = data[2] if len(data) >= 3 else None
             imu_calib = data[3] if len(data) >= 4 else None
-            odom.update(data[0], data[1], imu_heading_deg=imu_heading, imu_calib=imu_calib)
+            lateral_m_s = data[4] if len(data) >= 5 else None  # holonomic chassis only, see landerpi/bridge.py
+            odom.update(data[0], data[1], imu_heading_deg=imu_heading, imu_calib=imu_calib,
+                        lateral_m_s=lateral_m_s)
             with st.lock:
                 st.x, st.y, st.theta = odom.x, odom.y, odom.theta
                 st.theta_source = odom.theta_source
@@ -687,10 +689,12 @@ class App:
     PLOT_SIZE = 520
     MIN_SPAN_M = 1.0  # floor on the autoscale range so a stationary rover isn't shown zoomed to a point
 
-    def __init__(self, root: tk.Tk, st: SharedState, obstacle_avoidance_enabled: bool = False):
+    def __init__(self, root: tk.Tk, st: SharedState, obstacle_avoidance_enabled: bool = False,
+                 imu_min_mag_calib: int = 3):
         self.root = root
         self.st = st
         self.obstacle_avoidance_enabled = obstacle_avoidance_enabled
+        self.imu_min_mag_calib = imu_min_mag_calib
         root.title("Nav_new — Manual Control + Go Home")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.closed = False
@@ -871,7 +875,7 @@ class App:
         elif theta_src != "imu":
             self.warn.configure(
                 text="⚠ heading source: wheel encoders only (IMU not calibrated yet — "
-                     "tilt/rotate the rover until magnetometer calib >=1)")
+                     f"tilt/rotate the rover until magnetometer calib >={self.imu_min_mag_calib})")
         else:
             self.warn.configure(text=f"rpm samples: {rpm_count}   camera frames: {frame_count}")
 
@@ -912,8 +916,10 @@ def main():
     ap.add_argument("--home-dist-tol", type=float, default=0.10, help="meters -- stop within this of home")
     ap.add_argument("--home-heading-tol", type=float, default=5.0,
                     help="deg -- final in-place rotation to match the home heading stops within this")
-    ap.add_argument("--imu-min-mag-calib", type=int, default=1,
-                    help="0-3; magnetometer calib required before trusting IMU heading over wheel-diff")
+    ap.add_argument("--imu-min-mag-calib", type=int, default=3,
+                    help="0-3; magnetometer calib required before trusting IMU heading over wheel-diff "
+                         "(default 3, Bosch's own bar for a trustworthy absolute heading -- lower values "
+                         "have been observed to produce 100+ deg heading swings while stationary)")
     ap.add_argument("--odometry-log-dir", type=str, default="odometry_log")
     # ── NavDP obstacle avoidance while homing (see navdp_home_loop) --
     #    OPT-IN: default Go Home is exactly the original camera-free, no-GPU
@@ -938,7 +944,10 @@ def main():
     ap.add_argument("--hard-stop-dist", type=float, default=0.60, help="meters, forward obstacle -> AVOID")
     ap.add_argument("--reverse-dist", type=float, default=0.35,
                     help="meters -- closer than this, back up before turning (too close to rotate safely)")
-    ap.add_argument("--slow-dist", type=float, default=1.5, help="meters -- start slowing below this")
+    ap.add_argument("--slow-dist", type=float, default=2.5,
+                     help="meters -- start slowing + curving below this (also where NavDP's "
+                          "clearance-aware trajectory selection takes over from pure goal-bearing "
+                          "servo) -- the main knob for how far out avoidance visibly starts")
     ap.add_argument("--corridor-half-width", type=float, default=0.35, help="meters, forward-corridor half-width")
     ap.add_argument("--max-range", type=float, default=4.0, help="meters -- ignore obstacle points beyond this")
     ap.add_argument("--avoid-confirm-ticks", type=int, default=2,
@@ -965,11 +974,18 @@ def main():
     ap.add_argument("--home-navdp-invert-angular", action="store_true",
                     help="flip NavDP leg turn direction (real-rover wiring escape hatch, matches "
                          "--invert-angular elsewhere)")
+    ap.add_argument("--footprint-length", type=float, default=GuardConfig().footprint_length,
+                    help="robot length (m) for obstacle_guard's swept-footprint clearance -- "
+                         "defaults to the ESP32 rover's real size, override for a different robot "
+                         "(e.g. the LanderPi, see landerpi/README.md) before trusting obstacle avoidance")
+    ap.add_argument("--footprint-width", type=float, default=GuardConfig().footprint_width,
+                    help="robot width (m), see --footprint-length")
     args = ap.parse_args()
 
     guard_cfg = GuardConfig(
         hard_stop_dist=args.hard_stop_dist, reverse_dist=args.reverse_dist, slow_dist=args.slow_dist,
         corridor_half_width=args.corridor_half_width, max_range=args.max_range,
+        footprint_length=args.footprint_length, footprint_width=args.footprint_width,
     )
 
     navdp_pipe = None
@@ -1028,7 +1044,8 @@ def main():
                daemon=True).start()
 
     root = tk.Tk()
-    App(root, st, obstacle_avoidance_enabled=args.enable_obstacle_avoidance)
+    App(root, st, obstacle_avoidance_enabled=args.enable_obstacle_avoidance,
+        imu_min_mag_calib=args.imu_min_mag_calib)
 
     signal.signal(signal.SIGINT, lambda *_: root.after(0, root.destroy))
     signal.signal(signal.SIGTERM, lambda *_: root.after(0, root.destroy))

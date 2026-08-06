@@ -46,6 +46,18 @@ Endpoints
   POST /reset      clears the object memory catalogue and restarts frame
                     numbering from 0, WITHOUT reloading SAM/DINOv3/BLIP
                     (fast) -> {"status": "reset"}
+  POST /confirm_arrival?target=<url-encoded text>
+                    body: one JPEG-encoded frame (BGR/cv2 convention), same
+                    as /infer -- asks the already-loaded InternVL model
+                    (features/internvl_classifier.py's confirm_arrival) a
+                    full-frame yes/no VQA question: has the robot reached
+                    `target`? -> {"arrived": true|false|null} (null = the
+                    model's answer didn't parse as yes/no). 501 if InternVL
+                    wasn't loaded (server started with --no-internvl or
+                    --use-blip). Used by nav_pipeline/remind_gui_vlm.py as
+                    a confirmation layer on top of (never instead of) the
+                    metric depth-threshold STOP -- see that module's
+                    docstring.
 
 Run (inside this repo's .venv -- see run_live_server.sh):
     python scripts/live_server.py --port 8765
@@ -61,6 +73,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional, Tuple
+from urllib.parse import parse_qs, urlparse
 
 import cv2
 import numpy as np
@@ -259,6 +272,23 @@ class Tracker:
             frame_hw = (int(frame_bgr.shape[0]), int(frame_bgr.shape[1]))
             return {"frame_id": fid, "objects": _pack_detections(p_out, u_out, frame_hw, memory=self.ctx.memory)}
 
+    def confirm_arrival(self, frame_bgr: np.ndarray, target_desc: str) -> dict:
+        """Full-frame VLM arrival VQA -- see InternVLClassifier.confirm_arrival
+        and this module's /confirm_arrival docstring. Reuses ctx.captioner,
+        the SAME already-loaded InternVL model detection labeling uses (no
+        second model load) -- guarded with self.lock since generate() isn't
+        safe to call concurrently with infer()'s pipeline.process_frame."""
+        captioner = getattr(self.ctx, "captioner", None)
+        if captioner is None or not hasattr(captioner, "confirm_arrival"):
+            raise RuntimeError(
+                "InternVL classifier not loaded on this server (started with "
+                "--no-internvl or --use-blip?) -- /confirm_arrival unavailable"
+            )
+        rgb = frame_bgr[:, :, ::-1]
+        with self.lock:
+            arrived = captioner.confirm_arrival(rgb, target_desc)
+        return {"arrived": arrived}
+
 
 class Handler(BaseHTTPRequestHandler):
     tracker: "Tracker" = None  # set by main() before serve_forever
@@ -301,6 +331,25 @@ class Handler(BaseHTTPRequestHandler):
                 self.rfile.read(length)
             self.tracker.reset()
             self._send_json(200, {"status": "reset"})
+        elif self.path.startswith("/confirm_arrival"):
+            qs = parse_qs(urlparse(self.path).query)
+            target_desc = qs.get("target", ["the target object"])[0]
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length > 0 else b""
+            frame = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if frame is None:
+                self._send_json(400, {"error": "could not decode JPEG"})
+                return
+            try:
+                result = self.tracker.confirm_arrival(frame, target_desc)
+            except RuntimeError as e:
+                self._send_json(501, {"error": str(e)})
+                return
+            except Exception as e:  # keep the server alive on a single bad call
+                print(f"[remind-live] confirm_arrival error: {e}")
+                self._send_json(500, {"error": str(e)})
+                return
+            self._send_json(200, result)
         else:
             self._send_json(404, {"error": "not found"})
 
