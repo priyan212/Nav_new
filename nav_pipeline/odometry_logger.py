@@ -32,6 +32,12 @@ from typing import Optional
 WHEEL_RADIUS_M = 0.056
 TRACK_WIDTH_M = 0.345
 
+# Below this, both wheels count as "not turning" for IMU-heading gating (see
+# _imu_theta) -- real driven rpm is always several times this on both bots,
+# so it comfortably separates genuine motion from encoder-register noise
+# while still catching the first tick or two of a real ramp-up/down.
+MIN_MOVING_RPM = 0.5
+
 
 class OdometryLogger:
     # retention for the spin_delta() rolling window -- must be >= the widest
@@ -53,6 +59,7 @@ class OdometryLogger:
         # isaac_gui.py, remind_gui.py) is byte-for-byte unaffected.
         self.imu_min_mag_calib = imu_min_mag_calib
         self._imu_heading0_deg: Optional[float] = None
+        self._last_imu_heading_deg_raw: Optional[float] = None
         self.theta_source = "enc"
         # last raw values seen in update() -- kept regardless of whether they
         # were good enough to gate theta onto the IMU (see is_imu_calibrated),
@@ -121,7 +128,8 @@ class OdometryLogger:
         mag_calib = int(round(imu_calib)) % 10
         return mag_calib >= self.imu_min_mag_calib
 
-    def _imu_theta(self, imu_heading_deg: Optional[float], imu_calib: Optional[float]) -> Optional[float]:
+    def _imu_theta(self, imu_heading_deg: Optional[float], imu_calib: Optional[float],
+                    moving: bool) -> Optional[float]:
         """Convert a raw BNO055 Euler heading (deg, compass CW+, see
         esp32/rover_6wd_complete.ino) into this run's theta convention (rad,
         CCW+, zeroed at start_new_goal()) -- or None if it isn't trustworthy
@@ -133,13 +141,40 @@ class OdometryLogger:
         uncalibrated mag reading is worse than no IMU at all. GYR/ACC/SYS
         aren't gated on -- verified live (see memory) that heading tracked a
         real 90deg turn to within ~1.6deg with SYS still stuck at 0.
+
+        Also gated on `moving` (see MIN_MOVING_RPM): live-logged on the
+        LanderPi (landerpi/README.md's IMU section), the BNO055 Euler heading
+        drifted up to ~150deg total across a session while both wheel
+        encoders read exactly 0 rpm -- a chassis can't physically rotate
+        without its wheels turning, so that drift is sensor noise, not real
+        motion, and previously got baked straight into theta (and from there
+        into every subsequent x/y integration, visibly bending the path in
+        home_gui).
+
+        Whenever this tick isn't trusted (not moving, or MAG calibration
+        below threshold), the reference is continuously re-synced against
+        the CURRENT theta (not just the raw IMU reading) rather than left
+        untouched. Live logs caught the untouched version of this bug
+        directly: MAG calibration flickers below threshold and back
+        mid-drive (BNO055 confidence bounces near the motors), and while it
+        was below threshold theta correctly free-ran on wheel-diff dead
+        reckoning up to 151deg away from wherever the session's very first
+        IMU sample happened to be -- then the instant MAG recovered, theta
+        snapped straight back to (stale reference - current reading),
+        discarding all the real turning that had happened in between. Both
+        gates funnel through this same re-sync so trust resuming -- wheels
+        moving again, or calibration recovering -- always continues smoothly
+        from wherever theta actually is, never jumps to a stale absolute
+        reference.
         """
         if imu_heading_deg is None or not math.isfinite(imu_heading_deg):
             return None
-        if imu_calib is not None and not self._mag_calib_ok(imu_calib):
+        mag_ok = imu_calib is None or self._mag_calib_ok(imu_calib)
+        if not (mag_ok and moving):
+            self._imu_heading0_deg = math.degrees(self.theta) + imu_heading_deg
             return None
         if self._imu_heading0_deg is None:
-            self._imu_heading0_deg = imu_heading_deg  # zero the reference at the first good sample
+            self._imu_heading0_deg = imu_heading_deg  # zero the reference at the first good sample (theta is 0 here)
         delta_deg = self._imu_heading0_deg - imu_heading_deg  # compass CW+ -> theta CCW+
         delta_deg = (delta_deg + 180.0) % 360.0 - 180.0
         return math.radians(delta_deg)
@@ -187,11 +222,12 @@ class OdometryLogger:
         w = (v_right - v_left) / TRACK_WIDTH_M
 
         lateral = 0.0 if lateral_m_s is None else lateral_m_s
+        moving = abs(left_rpm) > MIN_MOVING_RPM or abs(right_rpm) > MIN_MOVING_RPM
 
         dtheta = 0.0
         if dt > 0.0:
             dtheta = w * dt
-            imu_theta = self._imu_theta(imu_heading_deg, imu_calib)
+            imu_theta = self._imu_theta(imu_heading_deg, imu_calib, moving)
             if imu_theta is not None:
                 self.theta = imu_theta
                 self.theta_source = "imu"

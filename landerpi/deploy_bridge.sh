@@ -19,7 +19,7 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
-PI_IP=${1:-192.168.0.8}
+PI_IP=${1:-10.47.234.228}
 PI_USER=pi
 PI_PASS=${PI_PASS:-raspberrypi}
 SSH="sshpass -p $PI_PASS ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new $PI_USER@$PI_IP"

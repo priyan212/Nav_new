@@ -169,6 +169,13 @@ def load_rocks(sim, manifest_path: str):
         template.render_asset_handle = mesh
         template.collision_asset_handle = mesh
         template.is_collidable = False
+        # The scene's light setup doesn't match what these OBJ+MTL rocks were
+        # authored for ("incompatible light setup" warning from habitat-sim)
+        # -- under the default Phong/Material shader that blows every rock
+        # out to a near-white specular blob, invisible as "rock" to the DINO
+        # detector. Flat shading renders the material's own diffuse color
+        # instead of relighting it, which fixes this.
+        template.force_flat_shading = True
         tid = otm.register_template(template, f"rock_{rock['id']}")
         obj = rom.add_object_by_template_handle(otm.get_template_handle_by_id(tid))
         obj.motion_type = habitat_sim.physics.MotionType.KINEMATIC

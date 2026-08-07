@@ -872,7 +872,11 @@ class App:
             self.warn.configure(
                 text="⚠ NO CAMERA FRAMES — NavDP obstacle avoidance is blind, Go Home has no collision "
                      "protection until frames arrive (check rover-camera on the Pi)")
-        elif theta_src != "imu":
+        elif (int(round(imu_calib)) % 10 if math.isfinite(imu_calib) else 0) < self.imu_min_mag_calib:
+            # Mag-calib check, not theta_src -- theta_src also reads "enc"
+            # whenever the wheels aren't turning (OdometryLogger._imu_theta's
+            # motion gate, see landerpi/README.md's 2026-08-07 drift fix),
+            # which is unrelated to whether the IMU is actually calibrated.
             self.warn.configure(
                 text="⚠ heading source: wheel encoders only (IMU not calibrated yet — "
                      f"tilt/rotate the rover until magnetometer calib >={self.imu_min_mag_calib})")

@@ -74,6 +74,7 @@ from nav_pipeline.isaac_gui import (  # noqa: E402
 )
 from nav_pipeline.object_map import ObjectMap, local_to_world, world_to_local  # noqa: E402
 from nav_pipeline.object_query import ClipObjectMatcher, resolve_object_query  # noqa: E402
+from nav_pipeline.obstacle_guard import GuardConfig  # noqa: E402
 from nav_pipeline.odometry_logger import OdometryLogger  # noqa: E402
 from nav_pipeline.pipeline import DinoNavDPPipeline, PipelineConfig  # noqa: E402
 from nav_pipeline.remind_client import RemindClient, RemindObject  # noqa: E402
@@ -837,6 +838,12 @@ def main():
                          "throttled well below the control loop's own rate since objects don't move "
                          "fast enough for sub-second freshness to matter, and MANUAL mode's tighter "
                          "loop would otherwise pay this cost ~20x/sec")
+    ap.add_argument("--footprint-length", type=float, default=GuardConfig().footprint_length,
+                    help="robot length (m) for obstacle_guard's swept-footprint clearance -- "
+                         "defaults to the ESP32 rover's real size, override for a different robot "
+                         "(e.g. the LanderPi, see landerpi/README.md) before trusting obstacle avoidance")
+    ap.add_argument("--footprint-width", type=float, default=GuardConfig().footprint_width,
+                    help="robot width (m), see --footprint-length")
     args = ap.parse_args()
 
     print(f"[INFO] checking REMIND server at {args.remind_server} ...")
@@ -863,6 +870,7 @@ def main():
         use_belief_goal=not args.no_belief_goal,
         depth_encoder=args.depth_encoder,
         stop_distance=args.stop_distance,
+        guard=GuardConfig(footprint_length=args.footprint_length, footprint_width=args.footprint_width),
         # REMIND already provides persistent per-object identity; the
         # pipeline's own single-target DINOv2 appearance re-lock (tuned for
         # raw multi-candidate DINO streams) is redundant here and is fully

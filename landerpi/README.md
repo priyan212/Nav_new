@@ -15,8 +15,9 @@ the GPU side needed a code change, only a new bridge process on the Pi.
 
 SSH: `pi` / `raspberrypi` (Debian 12 bookworm on a Pi 5, **not** a blank
 image — Hiwonder pre-loads their demo stack). IP is DHCP and has changed
-several times already; if `192.168.0.8` doesn't respond, check the robot
-directly (`hostname -I` on its console) rather than guessing.
+several times already (currently `10.47.234.228`); if it doesn't respond,
+check the robot directly (`hostname -I` on its console) rather than
+guessing.
 
 Everything robot-specific runs inside a long-lived Docker container:
 
@@ -88,6 +89,69 @@ still hand-held (not mounted) showed a heading delta measurably larger than
 the encoder-only estimate for the same command, which is expected/
 meaningless if the IMU wasn't moving with the robot at that moment, not
 evidence of inaccuracy. Re-validate once permanently mounted.
+
+**Now-mounted validation (2026-08-07) — failed, and fixed in software**: a
+full `launch_bot.sh --hiwonder` Go-Home session (`odometry_log/odom_home_
+session_20260807_122816.csv`) showed the on-screen path visibly bent away
+from the real one. Root cause: while genuinely stationary (both wheel
+encoders reading exactly `0.0` rpm, so the Mecanum chassis physically could
+not have rotated), `imu_heading_deg` still drifted — ~150° of accumulated
+heading change across the session, in bursts up to ~60° over 1-2s, including
+one burst right at session start before any motion. `odometry_logger.py`
+was replacing `theta` outright from that heading whenever MAG calib was ≥3,
+with no check that the wheels were actually turning, so the drift got baked
+straight into `theta` and, from there, into every subsequent x/y
+integration. Fixed in `OdometryLogger._imu_theta()`: heading updates are now
+also gated on wheel motion (`MIN_MOVING_RPM`, both bots) — while stationary,
+the IMU-heading reference re-zeros against the current reading instead of
+being trusted, so `theta` stays put and the drift can't surface as a jump
+once the wheels turn again either. Encoder-only heading (the old rover) is
+unaffected by this change. **Needs a real re-run of the same Go-Home route**
+to confirm the path now tracks correctly — this fix was validated by
+replaying the recorded session's raw rpm/heading samples through the new
+gating logic (final pose changed from `theta≈-1.14` to `theta≈1.91` for the
+same input — consistent with removing ~150° of phantom rotation), not yet
+by a fresh live drive.
+
+**Second, distinct bug found the same day**: even after the above fix,
+`theta` could still snap by 20-150° mid-drive. Root cause was in the same
+function: `_imu_heading0_deg` (the IMU's zero-reference) was set once early
+in a session and never touched while MAG calibration was below threshold —
+live logs caught a case where the robot turned a real ~151° on encoder
+dead-reckoning while MAG was uncalibrated, then the instant MAG calibration
+flickered back to ≥3, `theta` snapped straight back to a value computed
+against that stale, session-start reference, discarding all the real turning
+in between. Fixed by re-syncing `_imu_heading0_deg` against the robot's
+*current* `theta` (not just the raw IMU reading) any time the IMU isn't
+trusted, whether that's because the wheels aren't moving or MAG isn't
+calibrated — so regaining trust always continues smoothly from wherever
+`theta` actually is. Verified by replaying the same buggy session end to
+end: zero jumps >15° anywhere (previously 11, up to 151°).
+
+**Third bug, found live-driving the robot directly over Zenoh to
+investigate the above**: MAG calibration is often the actual blocker, not a
+transient flicker — a scripted test driving 180°+ of turns in both
+directions over 25s never got MAG off `2` even once, meaning IMU fusion
+wasn't engaging *at all* for that whole test (pure encoder dead-reckoning,
+which tracked correctly). `init_bno055()` never saved/restored the BNO055's
+learned calibration offsets, so **every bridge restart forced magnetometer
+calibration to relearn from zero** — restarting the bridge for any reason
+(a redeploy, a Pi reboot) was quietly resetting calibration progress.
+Fixed: `save_calib_profile()` persists the 22-byte accel/mag/gyro
+offset+radius profile (BNO055 registers `0x55`-`0x6A`) to
+`~/nav_new_bridge/bno055_calib.bin` every `CALIB_SAVE_PERIOD_S` (15s) and
+once more on clean shutdown; `init_bno055()` restores it before switching to
+NDOF mode if present. Verified live (2026-08-07): after one restart with a
+restored profile, `ACC` calibration read `3` immediately (it had never been
+above `0` in any prior session) and `MAG` began climbing again instead of
+resetting to `0`. Note `deploy_bridge.sh` SIGKILLs the previous instance
+(see its own comment on why), so the shutdown-time save never actually
+fires there — the periodic 15s save is what matters in practice; a redeploy
+loses at most the last <15s of calibration progress. Whether pure yaw
+motion on a flat floor can ever fully complete MAG calibration (vs. needing
+the pitch/roll variation only hand-tumbling provides, per the "Mounting
+note" above) is still an open question — persistence at least stops
+"bridge just restarted" from being a recurring cause of it being stuck at 0.
 
 No depth camera / LiDAR in this ROS1 package set — RGB only, same as the old
 rover. `pipeline.py`'s monocular Depth-Anything-V2 fallback applies

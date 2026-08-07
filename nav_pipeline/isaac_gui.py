@@ -42,6 +42,7 @@ except ImportError:
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from nav_pipeline.obstacle_guard import GuardConfig  # noqa: E402
 from nav_pipeline.odometry_logger import OdometryLogger  # noqa: E402
 from nav_pipeline.pipeline import DinoNavDPPipeline, PipelineConfig  # noqa: E402
 from nav_pipeline.zenoh_node import (  # noqa: E402
@@ -539,6 +540,12 @@ def main():
                     help="subscribe only the JPEG camera stream (REQUIRED over rover Wi-Fi)")
     ap.add_argument("--odometry-log-dir", type=str, default="odometry_log",
                     help="dead-reckoned pose CSV log dir (from /rover/rpm)")
+    ap.add_argument("--footprint-length", type=float, default=GuardConfig().footprint_length,
+                    help="robot length (m) for obstacle_guard's swept-footprint clearance -- "
+                         "defaults to the ESP32 rover's real size, override for a different robot "
+                         "(e.g. the LanderPi, see landerpi/README.md) before trusting obstacle avoidance")
+    ap.add_argument("--footprint-width", type=float, default=GuardConfig().footprint_width,
+                    help="robot width (m), see --footprint-length")
     args = ap.parse_args()
 
     print("[INFO] loading models...")
@@ -553,6 +560,7 @@ def main():
         invert_angular=args.invert_angular,
         use_belief_goal=not args.no_belief_goal,
         depth_encoder=args.depth_encoder,
+        guard=GuardConfig(footprint_length=args.footprint_length, footprint_width=args.footprint_width),
     ))
 
     config = zenoh.Config()

@@ -66,6 +66,7 @@ from nav_pipeline.isaac_gui import (  # noqa: E402
 )
 from nav_pipeline.object_map import ObjectMap, world_to_local  # noqa: E402
 from nav_pipeline.object_query import ClipObjectMatcher  # noqa: E402
+from nav_pipeline.obstacle_guard import GuardConfig  # noqa: E402
 from nav_pipeline.odometry_logger import OdometryLogger  # noqa: E402
 from nav_pipeline.pipeline import DinoNavDPPipeline, PipelineConfig  # noqa: E402
 from nav_pipeline.remind_client import RemindClient  # noqa: E402
@@ -405,6 +406,12 @@ def main():
                     help="seconds to wait for a pending VLM confirmation call before treating "
                          "it as failed and allowing a retry (InternVL measured ~0.5s/call "
                          "locally -- this is a generous ceiling for the extra HTTP hop)")
+    ap.add_argument("--footprint-length", type=float, default=GuardConfig().footprint_length,
+                    help="robot length (m) for obstacle_guard's swept-footprint clearance -- "
+                         "defaults to the ESP32 rover's real size, override for a different robot "
+                         "(e.g. the LanderPi, see landerpi/README.md) before trusting obstacle avoidance")
+    ap.add_argument("--footprint-width", type=float, default=GuardConfig().footprint_width,
+                    help="robot width (m), see --footprint-length")
     args = ap.parse_args()
 
     print(f"[INFO] checking REMIND server at {args.remind_server} ...")
@@ -431,6 +438,7 @@ def main():
         use_belief_goal=not args.no_belief_goal,
         depth_encoder=args.depth_encoder,
         stop_distance=args.stop_distance,
+        guard=GuardConfig(footprint_length=args.footprint_length, footprint_width=args.footprint_width),
         use_appearance_reid=False,
         use_sam=False,
         use_clip=False,

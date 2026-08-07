@@ -90,10 +90,13 @@ class BeliefOnlyPipeline(MarsPipeline):
         self.distractor_gate_m = float(distractor_gate_m)
 
     def _step_inner(self, rgb: np.ndarray, target_text: str, depth: Optional[np.ndarray] = None,
-                     pose: Optional[tuple] = None) -> StepResult:
+                     pose: Optional[tuple] = None, external_dets: Optional[list] = None,
+                     external_goal: Optional[np.ndarray] = None) -> StepResult:
         # `pose` is accepted only for signature parity with
         # DinoNavDPPipeline.step()/_step_inner(); this subclass sources pose
         # from self._pose_for_tick, set via set_pose() before each step().
+        # `external_dets`/`external_goal` (REMIND object-map passthrough) are
+        # likewise accepted only for signature parity -- unused here.
         cfg = self.cfg
         res = StepResult()
         H, W = rgb.shape[:2]

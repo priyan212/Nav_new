@@ -89,6 +89,7 @@ Run inside the container (see landerpi/README.md / LAUNCH/launch_bot.sh
 """
 
 import math
+import os
 import struct
 import sys
 import threading
@@ -163,18 +164,76 @@ IMU_MODE_CONFIG = 0x00
 IMU_MODE_NDOF = 0x0C   # full 9-DOF sensor fusion
 IMU_RETRY_PERIOD_S = 5.0   # re-probe if not detected at startup (e.g. still being wired up)
 
+# Accel/mag/gyro offset + radius calibration profile, 22 bytes -- readable in
+# any operating mode, but only WRITABLE in CONFIG_MODE (Bosch BNO055
+# datasheet 3.6.4). init_bno055() never previously saved/restored this, so
+# every bridge restart forced the magnetometer to relearn calibration from
+# zero -- live-tested (2026-08-07) driving the robot through 180+ degrees of
+# turns in both directions across 25s and MAG calibration never moved off 2,
+# staying below odometry_logger.py's MAG>=3 trust gate the whole time (pure
+# yaw motion on a flat floor may not be enough for BNO055's calibration
+# algorithm regardless -- persistence at least removes "just restarted" as a
+# recurring cause).
+IMU_REG_CALIB_PROFILE_START = 0x55
+IMU_CALIB_PROFILE_LEN = 22
+CALIB_SAVE_PERIOD_S = 15.0
+BNO055_CALIB_FILE = os.path.expanduser("~/nav_new_bridge/bno055_calib.bin")
+
+
+def load_saved_calib() -> "bytes | None":
+    try:
+        with open(BNO055_CALIB_FILE, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        return None
+    return data if len(data) == IMU_CALIB_PROFILE_LEN else None
+
+
+def save_calib_profile(bus: smbus2.SMBus):
+    """Persist the BNO055's current calibration profile to disk (atomic
+    write) so a future bridge restart can restore it in init_bno055()
+    instead of relearning from scratch. Safe to call at any calibration
+    completeness -- even a partially-learned profile (e.g. MAG stuck at 2)
+    is a strictly better starting point than none. Called periodically from
+    _rpm_loop and once more on rospy shutdown."""
+    try:
+        data = bytes(bus.read_i2c_block_data(IMU_I2C_ADDR, IMU_REG_CALIB_PROFILE_START,
+                                              IMU_CALIB_PROFILE_LEN))
+    except Exception:
+        return
+    try:
+        os.makedirs(os.path.dirname(BNO055_CALIB_FILE), exist_ok=True)
+        tmp = BNO055_CALIB_FILE + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, BNO055_CALIB_FILE)
+    except OSError as e:
+        rospy.logwarn_throttle(60, "BNO055 calib save failed: %s", e)
+
 
 def init_bno055(bus: smbus2.SMBus) -> bool:
     """Bring the BNO055 up into NDOF fusion mode. Returns False (heading
     fusion just stays unavailable, same as before this chip existed) if it
     isn't present/responding -- e.g. not yet connected, or briefly
-    disconnected during hand-wiring."""
+    disconnected during hand-wiring.
+
+    Restores a previously-saved calibration profile (see save_calib_profile)
+    if one exists, so calibration progress survives a bridge restart instead
+    of starting from zero every time."""
     try:
         if bus.read_byte_data(IMU_I2C_ADDR, IMU_REG_CHIP_ID) != IMU_CHIP_ID_EXPECTED:
             return False
         bus.write_byte_data(IMU_I2C_ADDR, IMU_REG_OPR_MODE, IMU_MODE_CONFIG); time.sleep(0.025)
         bus.write_byte_data(IMU_I2C_ADDR, IMU_REG_PWR_MODE, 0x00); time.sleep(0.01)
         bus.write_byte_data(IMU_I2C_ADDR, IMU_REG_SYS_TRIGGER, 0x00); time.sleep(0.01)
+        saved = load_saved_calib()
+        if saved is not None:
+            try:
+                bus.write_i2c_block_data(IMU_I2C_ADDR, IMU_REG_CALIB_PROFILE_START, list(saved))
+                rospy.loginfo("BNO055: restored saved calibration profile from %s", BNO055_CALIB_FILE)
+            except Exception as e:
+                rospy.logwarn("BNO055: failed to restore saved calibration (%s) -- "
+                               "continuing, will relearn from scratch", e)
         bus.write_byte_data(IMU_I2C_ADDR, IMU_REG_OPR_MODE, IMU_MODE_NDOF); time.sleep(0.025)
         return True
     except Exception:
@@ -348,6 +407,8 @@ class LanderPiBridge:
         bus = smbus2.SMBus(ENCODER_I2C_BUS)
         imu_ok = init_bno055(bus)
         imu_last_probe_t = time.time()
+        last_calib_save_t = time.time()
+        rospy.on_shutdown(lambda: imu_ok and save_calib_profile(bus))
         rospy.loginfo("BNO055 IMU: %s", "detected, NDOF fusion enabled" if imu_ok
                        else "not detected -- retrying every %.0fs (odometry falls back to "
                             "encoder-only meanwhile)" % IMU_RETRY_PERIOD_S)
@@ -357,6 +418,9 @@ class LanderPiBridge:
             try:
                 r = read_encoder_totals(bus)
                 t = time.time()
+                if imu_ok and t - last_calib_save_t >= CALIB_SAVE_PERIOD_S:
+                    last_calib_save_t = t
+                    save_calib_profile(bus)
                 if prev is not None:
                     dt = t - prev_t
                     if dt > 0:

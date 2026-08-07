@@ -250,7 +250,8 @@ class EarthPipeline(DinoNavDPPipeline):
         return res
 
     def _step_inner(self, rgb: np.ndarray, target_text: str, depth: Optional[np.ndarray] = None,
-                     pose: Optional[tuple] = None) -> StepResult:
+                     pose: Optional[tuple] = None, external_dets: Optional[list] = None,
+                     external_goal: Optional[np.ndarray] = None) -> StepResult:
         """Same as DinoNavDPPipeline._step_inner, except the DINO/SAM goal
         point feeds a persistent SubgoalBeliefBank instead of a frozen
         last-seen vector: while the target is out of view its estimated
@@ -260,7 +261,12 @@ class EarthPipeline(DinoNavDPPipeline):
 
         `pose` is accepted only for signature parity with
         DinoNavDPPipeline.step()/_step_inner(); this subclass sources pose
-        from self._pose_for_tick, set via set_pose() before each step()."""
+        from self._pose_for_tick, set via set_pose() before each step().
+
+        `external_dets`/`external_goal` (REMIND object-map passthrough) are
+        also accepted only for signature parity with the base class's step(),
+        which always passes them positionally -- this Earth GUI has no
+        REMIND integration, so they're unused here and always None."""
         cfg = self.cfg
         res = StepResult()
         H, W = rgb.shape[:2]

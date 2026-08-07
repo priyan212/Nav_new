@@ -92,6 +92,15 @@ def register_semantic_mesh(sim, mesh_path: str, semantic_id: int):
     template.render_asset_handle = mesh_path
     template.collision_asset_handle = mesh_path
     template.is_collidable = False
+    # The scene's light setup doesn't match what these procedurally-authored
+    # OBJ+MTL meshes expect (habitat-sim logs "incompatible light setup" for
+    # every one) -- under the default Phong/Material shader this blows the
+    # matte diffuse color save_obj() wrote out to a near-white specular blob,
+    # defeating save_obj's whole "non-shiny" intent and making rocks
+    # unrecognizable to anything looking at the rendered RGB (DINO, VLM,
+    # SAM, ...). Flat shading renders the material's own diffuse color
+    # as-is instead of relighting it.
+    template.force_flat_shading = True
     template_id = otm.register_template(template, f"sem_{semantic_id}_{Path(mesh_path).name}")
     obj = rom.add_object_by_template_handle(otm.get_template_handle_by_id(template_id))
     obj.motion_type = habitat_sim.physics.MotionType.KINEMATIC
