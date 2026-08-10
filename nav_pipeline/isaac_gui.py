@@ -143,7 +143,17 @@ def zenoh_setup(session: zenoh.Session, st: SharedState, compressed_only: bool =
         try:
             data = parse_float32_multiarray(bytes(sample.payload))
             if len(data) >= 2:
-                odom.update(data[0], data[1])
+                # [left_rpm, right_rpm, imu_heading_deg, imu_calib, lateral_m_s]
+                # -- matches home_gui.py's/zenoh_node.py's on_rpm parsing.
+                # Dropping data[2:] here (as this used to) meant IMU calib
+                # never reached OdometryLogger, so callers of zenoh_setup()
+                # (remind_gui.py, this file) always showed "no data received
+                # yet" regardless of actual BNO055 calibration state.
+                imu_heading = data[2] if len(data) >= 4 else None
+                imu_calib = data[3] if len(data) >= 4 else None
+                lateral = data[4] if len(data) >= 5 else None
+                odom.update(data[0], data[1], imu_heading_deg=imu_heading,
+                            imu_calib=imu_calib, lateral_m_s=lateral)
         except Exception as e:
             print(f"[WARN] rpm parse failed: {e}")
 

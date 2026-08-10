@@ -40,8 +40,10 @@ export TRANSFORMERS_CACHE=${TRANSFORMERS_CACHE:-/mnt/bigdisk/hf_cache/transforme
 pkill -f "nav_pipeline.isaac_gui" 2>/dev/null && sleep 1
 pkill -f "nav_pipeline.zenoh_node" 2>/dev/null && sleep 1
 
-# max-angular 1.2 matches the working OmniVLA node — the ESP32 firmware
-# normalizes angular by this value, so 0.25 gave only ~1/5 of real steering.
+# max-angular ($BACKEND_MAX_ANGULAR, see LAUNCH/_backend.sh): 1.2 for the
+# rover matches the working OmniVLA node — the ESP32 firmware normalizes
+# angular by this value, so 0.25 gave only ~1/5 of real steering. Reduced to
+# 0.5 for --hiwonder (2026-08-07, see _backend.sh's comment).
 # fov 60 matches the Logitech camera on the old rover (64.6 for the
 # LanderPi's real usb_cam intrinsics, see LAUNCH/_backend.sh).
 # search-angular 0.13 (down from the 0.15 default) — the real rover was
@@ -60,10 +62,10 @@ EXTRA_ARGS=()
 if [[ "$BACKEND" == "hiwonder" ]]; then
     EXTRA_ARGS+=(--footprint-length "$BACKEND_FOOTPRINT_LENGTH" --footprint-width "$BACKEND_FOOTPRINT_WIDTH")
 fi
-info "Starting Nav_new GUI [$BACKEND] (pi-ip=$PI_IP, caps 0.15 m/s / 1.2 rad/s, fov $BACKEND_FOV, search 0.13 rad/s, ramp 70deg)..."
+info "Starting Nav_new GUI [$BACKEND] (pi-ip=$PI_IP, caps 0.15 m/s / $BACKEND_MAX_ANGULAR rad/s, fov $BACKEND_FOV, search 0.13 rad/s, ramp 70deg)..."
 exec python -u -m nav_pipeline.isaac_gui \
     --pi-ip "$PI_IP" \
-    --max-linear 0.15 --max-angular 1.2 --fov "$BACKEND_FOV" \
+    --max-linear 0.15 --max-angular "$BACKEND_MAX_ANGULAR" --fov "$BACKEND_FOV" \
     --search-angular 0.13 --servo-ramp-deg 70 \
     --compressed-only \
     "${EXTRA_ARGS[@]}" \

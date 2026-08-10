@@ -55,12 +55,22 @@ backend_parse_args() {
         BACKEND_DEFAULT_IP=10.47.234.125
         BACKEND_PI_PASS_DEFAULT=hri
         BACKEND_FOV=60
+        # Matches the ESP32 firmware's own angular normalization (see
+        # launch_rover.sh's comment) -- real, measured tuning for this bot.
+        BACKEND_MAX_ANGULAR=1.2
     else
         BACKEND_DEFAULT_IP=10.47.234.228
         BACKEND_PI_PASS_DEFAULT=raspberrypi
         BACKEND_FOV=64.6   # from /usb_cam/camera_info: fx=507.2, width=640 -> 2*atan(320/507.2)
         BACKEND_FOOTPRINT_LENGTH=0.298
         BACKEND_FOOTPRINT_WIDTH=0.256
+        # 1.2 was only ever the ROVER's ESP32-normalization value, carried
+        # over unvalidated (see warning below) -- reduced 2026-08-07 to the
+        # same conservative cap already live-validated on this exact chassis
+        # via launch_bot.sh/home_gui.py (README: "Velocity caps start at the
+        # same conservative real-rover defaults"). Bump this specifically
+        # (not the rover's) if 0.5 turns out too slow once re-tuned properly.
+        BACKEND_MAX_ANGULAR=0.5
     fi
 
     if [[ "${BACKEND_ARGS[0]:-}" == -* || -z "${BACKEND_ARGS[0]:-}" ]]; then

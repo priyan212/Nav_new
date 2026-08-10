@@ -39,8 +39,8 @@ pkill -f "scripts.odom_accuracy_gui" 2>/dev/null && sleep 1
 pkill -f "nav_pipeline.isaac_gui" 2>/dev/null && sleep 1
 pkill -f "nav_pipeline.zenoh_node" 2>/dev/null && sleep 1
 
-info "Starting odometry-accuracy GUI [$BACKEND] (pi-ip=$PI_IP, caps 0.15 m/s / 1.2 rad/s)..."
+info "Starting odometry-accuracy GUI [$BACKEND] (pi-ip=$PI_IP, caps 0.15 m/s / $BACKEND_MAX_ANGULAR rad/s)..."
 exec python -u scripts/odom_accuracy_gui.py \
     --pi-ip "$PI_IP" \
-    --max-linear 0.15 --max-angular 1.2 \
+    --max-linear 0.15 --max-angular "$BACKEND_MAX_ANGULAR" \
     "$@"
