@@ -8,7 +8,7 @@ conda activate isaacsim
 
 
 # 2. Force EULA acceptance (Environment Variable)
-export OMNI_KIT_ACCEPT_Eros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.8}, angular: {z: 0.5}}"EULA=YES
+export OMNI_KIT_ACCEPT_EULA=YES
 
 
 # 3. Fix paths for ROS 2 Jazzy (Internal 3.11 libs)

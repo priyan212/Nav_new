@@ -894,6 +894,25 @@ class DinoNavDPPipeline:
                 if self.cfg.use_belief_goal:
                     print(f"[belief-debug] coasting tick {self._lost_count} "
                           f"sigma={self.belief.sigma:.3f}/{self.cfg.belief_max_sigma}")
+                if np.linalg.norm(goal[:2]) < self.cfg.stop_distance:
+                    # Same self-declared-arrival check as the live-detection
+                    # path above (~line 855) -- without this, a goal only
+                    # reachable via belief-coasting never gets a chance to
+                    # self-declare STOP at all. Live-captured 2026-08-10: CLIP
+                    # verify started rejecting a real, correctly-tracked door
+                    # (score ~0.03-0.13 < 0.5) once the crop filled the whole
+                    # frame at close range and no longer looked like a
+                    # recognizable "door" to CLIP's zero-shot classifier --
+                    # the pipeline fell to belief-coasting for the rest of the
+                    # approach and, absent this check, kept creeping forward
+                    # with no distance safeguard until the obstacle guard's
+                    # hard_stop_dist (a much closer, collision-avoidance-only
+                    # threshold, not the intended 1.5m stop) was the only
+                    # thing left to catch it.
+                    res.state = "STOP"
+                    res.goal_point = goal
+                    res.timing = timing
+                    return res
             else:
                 if self.cfg.use_belief_goal:
                     reason = "sigma too high" if self.belief.initialized else "belief not initialized"
@@ -934,6 +953,34 @@ class DinoNavDPPipeline:
             res.min_forward = min_fwd
             timing["guard"] = time.time() - t0
             if min_fwd < self.cfg.guard.hard_stop_dist:
+                if (res.state == "TRACK" and goal is not None
+                        and np.linalg.norm(goal[:2]) < self.cfg.guard.slow_dist):
+                    # A close-in-front reading this near our OWN live tracked
+                    # goal is far more likely to BE the goal than a
+                    # coincidental unrelated obstacle. exclude_mask above
+                    # should already keep the target out of obstacle_pts, but
+                    # SAM/monocular depth both commonly degrade once the
+                    # object fills/overflows the frame -- real surface points
+                    # can leak through unmasked here while the STOP check's
+                    # own mask-median-depth goal distance (~line 855)
+                    # simultaneously reads too far to have triggered yet.
+                    # Symptom this fixes: rover visibly approaching its
+                    # target, then suddenly spinning full-authority away from
+                    # it right before arrival. Declare arrival instead of
+                    # avoiding. Real obstacles blocking the path to a still-
+                    # distant goal (norm(goal) >= slow_dist) are NOT covered
+                    # by this gate and still trigger AVOID exactly as before.
+                    # Gated on state=="TRACK" (not "GOTO"): a blind
+                    # navigate-back leg's goal is a remembered point that can
+                    # be stale from drift, so proximity alone must NOT be
+                    # trusted as arrival there (see the GOTO branch's own
+                    # docstring above) -- AVOID still applies normally on
+                    # GOTO legs.
+                    res.state = "STOP"
+                    res.goal_point = goal
+                    self._avoid_streak = 0
+                    res.timing = timing
+                    return res
                 # hysteresis: monocular depth is noisy — require consecutive
                 # confirmations before engaging AVOID (prevents state flapping
                 # that looks like random movement)

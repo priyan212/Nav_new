@@ -26,7 +26,7 @@
 #
 #  Examples:
 #    ./launch_rover_remind_vlm.sh                          # default rover, default Pi IP
-#    ./launch_rover_remind_vlm.sh 10.47.234.125 --target "chair id 1"
+#    ./launch_rover_remind_vlm.sh 192.168.21.125 --target "chair id 1"
 #    ./launch_rover_remind_vlm.sh --hiwonder --target "chair id 1"
 #    ./launch_rover_remind_vlm.sh --no-vlm-confirm          # A/B: pure metric, same as launch_rover_remind.sh
 # ============================================================

@@ -17,7 +17,7 @@
 #
 #  Examples:
 #    ./launch_odom_test.sh                          # default rover, default Pi IP
-#    ./launch_odom_test.sh 10.47.234.125 --max-angular 1.0
+#    ./launch_odom_test.sh 192.168.21.125 --max-angular 1.0
 #    ./launch_odom_test.sh --hiwonder
 # ============================================================
 set -uo pipefail

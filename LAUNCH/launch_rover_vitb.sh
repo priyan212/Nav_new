@@ -10,8 +10,8 @@
 #   python scripts/download_models.py --depth-encoder vitb
 #
 # Examples:
-#   ./launch_rover_vitb.sh                          # default Pi IP (10.47.234.125)
-#   ./launch_rover_vitb.sh 10.47.234.125 --target "trash bin"
+#   ./launch_rover_vitb.sh                          # default Pi IP (192.168.21.125)
+#   ./launch_rover_vitb.sh 192.168.21.125 --target "trash bin"
 set -uo pipefail
 cd "$(dirname "$0")"
 exec ./launch_rover.sh "$@" --depth-encoder vitb

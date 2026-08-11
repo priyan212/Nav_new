@@ -2,7 +2,17 @@
 # Runs ON THE PI (once). Installs systemd services for the three rover-side
 # components so they survive SSH drops, Wi-Fi hiccups, crashes and reboots:
 #
-#   rover-camera.service : v4l2 camera -> /image_raw (ROS 2)
+#   rover-camera.service : RealSense D435i color stream -> /image_raw (ROS 2)
+#                          (was a v4l2 webcam until 2026-08-11 -- swapped to
+#                          RealSense, see realsense_only_bringup.launch.py.
+#                          Requires ros-humble-realsense2-camera +
+#                          ros-humble-diagnostic-updater, apt-installed
+#                          below; and a genuine USB3-rated cable -- a
+#                          USB2-only cable link-negotiates at 480M even in
+#                          a USB3 port and the driver fails its XU control
+#                          queries, never coming up (check with
+#                          `lsusb -t` on the Pi: should read 5000M, not
+#                          480M, for the RealSense's bus).)
 #   rover-agent.service  : micro-ROS agent (ESP32 motors), with an automatic
 #                          ESP32 hardware reset (RTS pulse) before each start
 #   rover-zenoh.service  : zenoh-bridge-ros2dds router :7447 (ROS_DISTRO=humble)
@@ -16,14 +26,18 @@ set -e
 SUDO="sudo -S"
 PASS=hri
 
+# ── RealSense driver (not preinstalled on a fresh Pi image) ──────
+echo "$PASS" | $SUDO -v
+echo "$PASS" | $SUDO apt-get install -y ros-humble-realsense2-camera ros-humble-diagnostic-updater
+
 # ── helper scripts the services call ─────────────────────────────
+cp "$(dirname "$0")/realsense_only_bringup.launch.py" /home/pi/realsense_only_bringup.launch.py
+
 cat > /home/pi/rover_camera_start.sh << 'EOF'
 #!/bin/bash
 source /opt/ros/humble/setup.bash
-source /home/pi/rover_ws/install/setup.bash
 export ROS_LOCALHOST_ONLY=0 ROS_DOMAIN_ID=0
-exec ros2 launch omnivla_nav camera_only_bringup.launch.py \
-    video_device:=/dev/video0 pixel_format:=YUYV "image_size:=[640,480]"
+exec ros2 launch /home/pi/realsense_only_bringup.launch.py
 EOF
 
 cat > /home/pi/rover_agent_start.sh << 'EOF'
@@ -78,6 +92,7 @@ make_unit rover_zenoh_start.sh "Rover zenoh-bridge-ros2dds router :7447" rover-z
 # ── stop every ad-hoc leftover, then hand over to systemd ────────
 pkill -9 -f micro_ros_agent 2>/dev/null || true
 pkill -9 -f v4l2_camera_node 2>/dev/null || true
+pkill -9 -f realsense2_camera_node 2>/dev/null || true
 pkill -9 -f zenoh-bridge 2>/dev/null || true
 pkill -9 -f rover_bringup 2>/dev/null || true
 sleep 2

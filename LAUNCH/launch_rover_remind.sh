@@ -28,7 +28,7 @@
 #
 #  Examples:
 #    ./launch_rover_remind.sh                          # default rover, default Pi IP
-#    ./launch_rover_remind.sh 10.47.234.125 --target "chair id 1"
+#    ./launch_rover_remind.sh 192.168.21.125 --target "chair id 1"
 #    ./launch_rover_remind.sh --hiwonder --target "chair id 1"
 # ============================================================
 set -uo pipefail
@@ -106,12 +106,12 @@ EXTRA_ARGS=()
 if [[ "$BACKEND" == "hiwonder" ]]; then
     EXTRA_ARGS+=(--footprint-length "$BACKEND_FOOTPRINT_LENGTH" --footprint-width "$BACKEND_FOOTPRINT_WIDTH")
 fi
-info "Starting Nav_new REMIND+NavDP GUI [$BACKEND] (pi-ip=$PI_IP, caps 0.15 m/s / $BACKEND_MAX_ANGULAR rad/s, fov $BACKEND_FOV, search 0.13 rad/s, ramp 70deg)..."
+info "Starting Nav_new REMIND+NavDP GUI [$BACKEND] (pi-ip=$PI_IP, caps 0.15 m/s / $BACKEND_MAX_ANGULAR rad/s, fov $BACKEND_FOV, search 0.13 rad/s, ramp 70deg, slew $BACKEND_ANGULAR_SLEW_MAX rad/s/tick)..."
 python -u -m nav_pipeline.remind_gui \
     --pi-ip "$PI_IP" \
     --remind-server "http://127.0.0.1:${REMIND_PORT}" \
     --max-linear 0.15 --max-angular "$BACKEND_MAX_ANGULAR" --fov "$BACKEND_FOV" \
-    --search-angular 0.13 --servo-ramp-deg 70 \
+    --search-angular 0.13 --servo-ramp-deg 70 --angular-slew-max "$BACKEND_ANGULAR_SLEW_MAX" \
     --compressed-only \
     "${EXTRA_ARGS[@]}" \
     "$@"

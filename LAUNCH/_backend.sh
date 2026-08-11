@@ -52,12 +52,24 @@ backend_parse_args() {
     done
 
     if [[ "$BACKEND" == "rover" ]]; then
-        BACKEND_DEFAULT_IP=10.47.234.125
+        BACKEND_DEFAULT_IP=192.168.21.125   # updated 2026-08-11, Pi IP churns -- verify if unreachable
         BACKEND_PI_PASS_DEFAULT=hri
-        BACKEND_FOV=60
+        # 60 was the Logitech webcam's FOV. Camera swapped to an Intel
+        # RealSense D435i 2026-08-11 (scripts/realsense_only_bringup.launch.py,
+        # replaces the old v4l2_camera_node camera_only_bringup.launch.py) --
+        # D435i color stream nominal HFOV is ~69deg at 640x480, but this
+        # hasn't been confirmed yet against the real /image_raw/camera_info
+        # fx (2026-08-11: device errors out on its XU control queries --
+        # `lsusb -t` shows it link-negotiated at 480M even though it's in a
+        # USB3 port on the Pi, because the cable in use is USB2-only; needs
+        # a genuine USB3-rated cable before the camera comes up at all --
+        # see journalctl -u rover-camera on the Pi). Re-measure FOV once
+        # that's fixed: 2*atan(320/fx) from camera_info.
+        BACKEND_FOV=69
         # Matches the ESP32 firmware's own angular normalization (see
         # launch_rover.sh's comment) -- real, measured tuning for this bot.
         BACKEND_MAX_ANGULAR=1.2
+        BACKEND_ANGULAR_SLEW_MAX=0.10   # pipeline.py's own default, unchanged
     else
         BACKEND_DEFAULT_IP=10.47.234.228
         BACKEND_PI_PASS_DEFAULT=raspberrypi
@@ -71,6 +83,18 @@ backend_parse_args() {
         # same conservative real-rover defaults"). Bump this specifically
         # (not the rover's) if 0.5 turns out too slow once re-tuned properly.
         BACKEND_MAX_ANGULAR=0.5
+        # Reduced 2026-08-10 from pipeline.py's 0.10 default: a fresh
+        # SEARCH->TRACK correction (bearing error is large right after a
+        # glimpse at frame edge) commands a real turn, and that turn's own
+        # viewpoint change was breaking the very re-identification continuity
+        # (IoU + DINOv2 appearance similarity, see PipelineConfig's
+        # appearance_min_similarity/appearance_iou_override comments) needed
+        # to confirm the lock -- symptom: bot "gets excited" toward the
+        # object, swings, loses it mid-swing, reverts to SEARCH, repeats.
+        # Halving the slew rate spreads the same correction over ~2x the
+        # ticks, so each tick's viewpoint change is smaller and more likely
+        # to stay within the IoU-override/appearance-similarity bounds.
+        BACKEND_ANGULAR_SLEW_MAX=0.05
     fi
 
     if [[ "${BACKEND_ARGS[0]:-}" == -* || -z "${BACKEND_ARGS[0]:-}" ]]; then

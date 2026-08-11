@@ -13,7 +13,7 @@
 #
 #  Examples:
 #    ./launch_rover_home.sh                          # default rover, default Pi IP
-#    ./launch_rover_home.sh 10.47.234.125 --home-dist-tol 0.05
+#    ./launch_rover_home.sh 192.168.21.125 --home-dist-tol 0.05
 #    ./launch_rover_home.sh --hiwonder --enable-obstacle-avoidance
 # ============================================================
 set -uo pipefail
