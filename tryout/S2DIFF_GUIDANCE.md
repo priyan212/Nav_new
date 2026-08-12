@@ -56,24 +56,40 @@ a zero trajectory so the robot stops and re-observes.
 
 ## Files
 
-- `pixel_obstacles.py`: supplied `[u,v]` pixels plus depth to local obstacle points.
-- `s2diff_guidance.py`: Gibbs energy, SMC reweighting, guided DDPM and selection.
-- `s2diff_agent.py`: released `NavDP_Agent` preprocessing/history wrapper.
-- `../navdp_s2diff_server.py`: API-compatible PointGoal server with the additional
+- `tube_planner/pixel_obstacles.py`: supplied `[u,v]` pixels plus depth to local obstacle points.
+- `tube_planner/s2diff_guidance.py`: Gibbs energy, SMC reweighting, guided DDPM and selection.
+- `tube_planner/s2diff_agent.py`: released `NavDP_Agent` preprocessing/history wrapper.
+- `tube_planner/depth_obstacles.py`: dense whole-frame depth -> obstacle points (alternate
+  to pixel_obstacles.py; not used by policy_agent.py's server path below).
+- `navdp_s2diff_server.py`: API-compatible PointGoal server with the additional
   required `obstacle_pixels` field.
+- `policy_agent.py`: **not from the released NavDP baseline** -- this repo never had
+  the official `NavDP_Agent`/its `cross-waic-*.ckpt` checkpoint, so this adapter wraps
+  `nav_pipeline/navdp_net.py`'s `NavDPStandalone` + `checkpoints/navdp_extracted.pth`
+  (the same weights the real rover pipeline runs) behind the interface
+  `tube_planner/s2diff_agent.py`/`s2diff_guidance.py` expect. See its module docstring
+  for the exact deviations (forced memory_size=2/predict_size=32, batch_size=1 only,
+  goal y-sign flip). This is a *separate* integration path from
+  `nav_pipeline/s2diff_navdp.py` (used by `LAUNCH/launch_rover_s2diff.sh`), which runs
+  guided sampling in-process instead of over HTTP -- pick one, they don't share state.
 
 ## Run
 
-From `baselines/navdp`:
+From `tryout/` (so `tube_planner` and `policy_agent` resolve as top-level imports):
 
 ```bash
+cd tryout
 python navdp_s2diff_server.py \
-  --checkpoint checkpoints/cross-waic-final4-125.ckpt \
+  --checkpoint ../checkpoints/navdp_extracted.pth \
   --port 8888 \
   --particles 8 \
   --safe-distance 0.42 \
   --hard-collision-distance 0.24
 ```
+
+`--memory-size`/`--predict-size` aren't exposed as flags (the server hardcodes 8/24 for
+the released checkpoint); `policy_agent.py` ignores those and forces (2, 32) to match
+`navdp_extracted.pth`, printing a warning when it does.
 
 This remains an S2Diff-style adaptation rather than the paper's formal guarantee:
 safety depends on the accuracy, coverage and freshness of the supplied pixels and

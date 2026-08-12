@@ -54,18 +54,15 @@ backend_parse_args() {
     if [[ "$BACKEND" == "rover" ]]; then
         BACKEND_DEFAULT_IP=192.168.21.125   # updated 2026-08-11, Pi IP churns -- verify if unreachable
         BACKEND_PI_PASS_DEFAULT=hri
-        # 60 was the Logitech webcam's FOV. Camera swapped to an Intel
-        # RealSense D435i 2026-08-11 (scripts/realsense_only_bringup.launch.py,
-        # replaces the old v4l2_camera_node camera_only_bringup.launch.py) --
-        # D435i color stream nominal HFOV is ~69deg at 640x480, but this
-        # hasn't been confirmed yet against the real /image_raw/camera_info
-        # fx (2026-08-11: device errors out on its XU control queries --
-        # `lsusb -t` shows it link-negotiated at 480M even though it's in a
-        # USB3 port on the Pi, because the cable in use is USB2-only; needs
-        # a genuine USB3-rated cable before the camera comes up at all --
-        # see journalctl -u rover-camera on the Pi). Re-measure FOV once
-        # that's fixed: 2*atan(320/fx) from camera_info.
-        BACKEND_FOV=69
+        # 60 is the Logitech webcam's FOV. Camera was briefly swapped to an
+        # Intel RealSense D435i on 2026-08-11 (scripts/realsense_only_bringup.
+        # launch.py, FOV=69, nominal HFOV at 640x480 -- see git history) but
+        # that D435i never actually came up cleanly (USB2-only cable
+        # link-negotiated at 480M in a USB3 port, failing its XU control
+        # queries) and the Pi has been switched back to the RGB webcam
+        # (v4l2_camera_node) as of 2026-08-11. Re-measure with
+        # 2*atan(320/fx) from /image_raw/camera_info if this drifts.
+        BACKEND_FOV=60
         # Matches the ESP32 firmware's own angular normalization (see
         # launch_rover.sh's comment) -- real, measured tuning for this bot.
         BACKEND_MAX_ANGULAR=1.2

@@ -142,17 +142,29 @@ class PipelineConfig:
     # Ego-motion goal belief (see goal_belief.py): while the target isn't
     # detected, propagate the goal by the rover's own dead-reckoned motion
     # instead of coasting on a frozen last-seen point. False reverts to the
-    # exact pre-belief behavior (goal frozen at self._last_goal). Still
-    # bounded by lost_patience above either way -- belief only changes what
-    # the goal IS while coasting, not how many frames coasting is allowed.
+    # exact pre-belief behavior (goal frozen at self._last_goal). Coasting
+    # duration when belief is ON is NOT bounded by lost_patience below --
+    # sigma crossing belief_max_sigma is the only cutoff (see the "lost_patience
+    # is NOT applied here on purpose" comment at its use site) -- lost_patience
+    # only still applies to the belief-OFF fallback path.
     use_belief_goal: bool = True
     belief_sigma_init: float = 1000.0
     belief_sigma_visible: float = 0.05
-    belief_odom_noise: float = 0.0015 # <--------------------------------------------------------------------------------------
+    belief_odom_noise: float = 0.0015
     # see goal_belief.py's module docstring for where this starting point
     # comes from (real spin-accuracy trials, not a physical constant)
-    belief_rot_noise_gain: float = 0.35
-    belief_max_sigma: float = 0.15    # above this, distrust belief and go to SEARCH # <----------------------------------------
+    #
+    # belief_rot_noise_gain=0.35 was tuned against belief_max_sigma=1.0 (budget
+    # 0.95 above sigma_visible), crossing distrust at 0.95/0.35 ~= 155deg --
+    # inside the trial-backed 135-165deg range. The 2026-08-07 Hiwonder commit
+    # cut belief_max_sigma to 0.15 (budget 0.10) without rescaling this, which
+    # silently dropped the crossing angle to 0.10/0.35 ~= 16deg for EVERY
+    # backend (not just Hiwonder) -- belief gave up and reverted to SEARCH
+    # after barely any rotation instead of the intended ~135-165deg. Rescaled
+    # by the same budget ratio (0.10/0.95) to restore the original ~155deg
+    # crossing point: 0.35 * (0.10/0.95) ~= 0.037.
+    belief_rot_noise_gain: float = 0.037
+    belief_max_sigma: float = 0.15    # above this, distrust belief and go to SEARCH
     belief_decay_factor: float = 0.95
     # Target-ambiguity detection: a bare category prompt ("chair") is
     # genuinely underspecified when several same-class objects score

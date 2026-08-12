@@ -48,3 +48,12 @@ cd /mnt/bigdisk/Priyan/Nav_new
 
 # Indoor-relevant (the ones you'll actually encounter navigating a room):
 chair, couch, dining table, bed, potted plant, tv, laptop, mouse, keyboard, remote, cell phone, book, clock, vase, scissors, teddy bear, backpack, handbag, suitcase, umbrella, bottle, wine glass, cup, bowl, microwave, oven, toaster, sink, refrigerator, toilet, bench, person.
+
+
+
+# terminal 1 — the server
+source /home/i3d/exit/etc/profile.d/conda.sh && conda activate internnav
+cd tryout && python navdp_s2diff_server.py --checkpoint ../checkpoints/navdp_extracted.pth --port 8888
+
+# terminal 2 — the rover GUI, talking to it
+./LAUNCH/launch_rover_s2diff_http.sh 10.93.142.125
