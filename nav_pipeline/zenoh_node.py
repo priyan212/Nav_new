@@ -8,6 +8,7 @@ Subscribes (Zenoh, CDR ROS 2 msgs):
   image_raw, rt/image_raw, rover_camera, rt/rover_camera     - sensor_msgs/Image
   image_raw/compressed, rt/image_raw/compressed              - sensor_msgs/CompressedImage
   depth_raw, rt/depth_raw                                    - sensor_msgs/Image (32FC1 m) [optional]
+  image_raw/camera_info, rt/image_raw/camera_info            - sensor_msgs/CameraInfo [optional]
   omnivla/goal_text                                          - std_msgs/String (target phrase)
 Publishes (Zenoh, CDR):
   cmd_vel              - geometry_msgs/Twist
@@ -90,6 +91,12 @@ class CDRReader:
         self.offset += 4
         return v
 
+    def read_float64(self) -> float:
+        self._align(8)
+        (v,) = struct.unpack_from(self.end + "d", self.data, self.offset)
+        self.offset += 8
+        return v
+
     def read_string(self) -> str:
         length = self.read_uint32()
         s = self.data[self.offset : self.offset + length - 1].decode("utf-8", errors="replace")
@@ -170,6 +177,29 @@ def parse_image(cdr_data: bytes) -> Optional[np.ndarray]:
     return None
 
 
+def parse_camera_info(cdr_data: bytes) -> Optional[Tuple[float, float, float, float]]:
+    """sensor_msgs/CameraInfo CDR -> (fx, fy, cx, cy) from the K[9] matrix.
+
+    Only reads through height/width/distortion_model/d/k -- r, p, binning,
+    roi are never consumed by this pipeline so they're left unparsed.
+    """
+    r = CDRReader(cdr_data)
+    r.read_int32(); r.read_uint32(); r.read_string()  # header
+    r.read_uint32()  # height
+    r.read_uint32()  # width
+    r.read_string()  # distortion_model
+    d_count = r.read_uint32()  # d[] (variable length) -- skip its payload
+    r.offset += d_count * 8
+    try:
+        k = [r.read_float64() for _ in range(9)]
+    except (struct.error, IndexError):
+        return None
+    fx, cx, fy, cy = k[0], k[2], k[4], k[5]
+    if fx <= 0 or fy <= 0:
+        return None
+    return fx, fy, cx, cy
+
+
 def parse_compressed_image(cdr_data: bytes) -> Optional[np.ndarray]:
     """sensor_msgs/CompressedImage CDR -> RGB uint8 (H,W,3)."""
     r = CDRReader(cdr_data)
@@ -239,6 +269,11 @@ def serialize_path(points_xy: List[Tuple[float, float]], frame_id: str = "base_l
 CAMERA_KEYS = ["image_raw", "rt/image_raw", "rover_camera", "rt/rover_camera"]
 CAMERA_COMPRESSED_KEYS = ["image_raw/compressed", "rt/image_raw/compressed"]
 DEPTH_KEYS = ["depth_raw", "rt/depth_raw", "rover_camera_depth", "rt/rover_camera_depth"]
+# Real factory-calibrated intrinsics (sensor_msgs/CameraInfo), published
+# alongside image_raw by realsense_only_bringup.launch.py. Optional: falls
+# back to intrinsics_from_fov(...) (goal_utils.py) when absent/stale, same
+# pattern as DEPTH_KEYS falling back to monocular depth estimation.
+CAMERA_INFO_KEYS = ["image_raw/camera_info", "rt/image_raw/camera_info"]
 GOAL_KEYS = ["omnivla/goal_text", "rt/omnivla/goal_text"]
 # ESP32 signed wheel-encoder RPM (see esp32/rover_6wd_complete.ino) -> odometry
 RPM_KEYS = ["rover/rpm", "rt/rover/rpm"]
@@ -249,6 +284,7 @@ class DinoNavDPZenohNode:
     # heartbeat re-sends the last command well under that deadline.
     HEARTBEAT_PERIOD_S = 0.15
     DEPTH_STALE_S = 1.0  # external depth older than this -> fall back to monocular
+    INTRINSICS_STALE_S = 5.0  # camera_info is static per session, no need for depth's tight 1s window
     # Spin-stall watchdog, ported from isaac_gui.py (which has always had
     # this -- see its comment for the real 145s/17-turn incident it guards
     # against). Replayed against odom_chair_20260729_170317.csv: this run
@@ -273,6 +309,8 @@ class DinoNavDPZenohNode:
         self.latest_rgb: Optional[np.ndarray] = None
         self.latest_depth: Optional[np.ndarray] = None
         self.latest_depth_t = 0.0
+        self.latest_intrinsics: Optional[tuple] = None  # (fx, fy, cx, cy)
+        self.latest_intrinsics_t = 0.0
         self._running = True
         self._frame_count = 0
         self._infer_count = 0
@@ -287,10 +325,11 @@ class DinoNavDPZenohNode:
             [session.declare_subscriber(k, self._on_image) for k in CAMERA_KEYS]
             + [session.declare_subscriber(k, self._on_image_compressed) for k in CAMERA_COMPRESSED_KEYS]
             + [session.declare_subscriber(k, self._on_depth) for k in DEPTH_KEYS]
+            + [session.declare_subscriber(k, self._on_camera_info) for k in CAMERA_INFO_KEYS]
             + [session.declare_subscriber(k, self._on_goal) for k in GOAL_KEYS]
             + [session.declare_subscriber(k, self._on_rpm) for k in RPM_KEYS]
         )
-        print(f"[INFO] Zenoh subs: {CAMERA_KEYS + CAMERA_COMPRESSED_KEYS + DEPTH_KEYS + GOAL_KEYS + RPM_KEYS}")
+        print(f"[INFO] Zenoh subs: {CAMERA_KEYS + CAMERA_COMPRESSED_KEYS + DEPTH_KEYS + CAMERA_INFO_KEYS + GOAL_KEYS + RPM_KEYS}")
         print("[INFO] Zenoh pubs: cmd_vel, omnivla/explanation, omnivla/waypoints")
 
         Thread(target=self._heartbeat_loop, daemon=True).start()
@@ -325,6 +364,16 @@ class DinoNavDPZenohNode:
                     self.latest_depth_t = time.time()
         except Exception as e:
             print(f"[WARN] depth parse failed: {e}")
+
+    def _on_camera_info(self, sample):
+        try:
+            k = parse_camera_info(bytes(sample.payload))
+            if k is not None:
+                with self.lock:
+                    self.latest_intrinsics = k
+                    self.latest_intrinsics_t = time.time()
+        except Exception as e:
+            print(f"[WARN] camera_info parse failed: {e}")
 
     def _on_rpm(self, sample):
         try:
@@ -396,6 +445,8 @@ class DinoNavDPZenohNode:
             rgb = self.latest_rgb
             depth = self.latest_depth
             depth_age = time.time() - self.latest_depth_t
+            intrinsics = self.latest_intrinsics
+            intrinsics_age = time.time() - self.latest_intrinsics_t
         if rgb is None:
             return
         if self._goal_reached:
@@ -403,10 +454,13 @@ class DinoNavDPZenohNode:
             return
         if depth is not None and (depth_age > self.DEPTH_STALE_S or depth.shape[:2] != rgb.shape[:2]):
             depth = None  # stale or mismatched -> monocular fallback
+        if intrinsics is not None and intrinsics_age > self.INTRINSICS_STALE_S:
+            intrinsics = None
 
         t0 = time.time()
         try:
-            res = self.pipe.step(rgb, self.target, depth=depth, pose=(self.odom.x, self.odom.y, self.odom.theta))
+            res = self.pipe.step(rgb, self.target, depth=depth, pose=(self.odom.x, self.odom.y, self.odom.theta),
+                                  intrinsics=intrinsics)
         except Exception as e:
             print(f"[ERROR] pipeline step failed: {e}")
             self.publish_cmd(0.0, 0.0)

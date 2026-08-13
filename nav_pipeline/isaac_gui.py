@@ -47,9 +47,11 @@ from nav_pipeline.odometry_logger import OdometryLogger  # noqa: E402
 from nav_pipeline.pipeline import DinoNavDPPipeline, PipelineConfig  # noqa: E402
 from nav_pipeline.zenoh_node import (  # noqa: E402
     CAMERA_COMPRESSED_KEYS,
+    CAMERA_INFO_KEYS,
     CAMERA_KEYS,
     DEPTH_KEYS,
     RPM_KEYS,
+    parse_camera_info,
     parse_compressed_image,
     parse_float32_multiarray,
     parse_image,
@@ -61,6 +63,7 @@ from nav_pipeline.zenoh_node import (  # noqa: E402
 PRESETS = ["trash bin", "cardboard box", "wooden pallet", "door", "chair"]
 HEARTBEAT_PERIOD_S = 0.15
 DEPTH_STALE_S = 1.0
+INTRINSICS_STALE_S = 5.0  # camera_info is static per session, no need for depth's tight 1s window
 # Spin-stall watchdog: with a generic/multi-instance target (e.g. "chair" in a
 # room full of chairs), DINO's re-acquire-on-loss can hop to a different
 # physical object each time the tracked one scrolls out of frame, so the
@@ -80,6 +83,8 @@ class SharedState:
         self.latest_rgb: Optional[np.ndarray] = None
         self.latest_depth: Optional[np.ndarray] = None
         self.latest_depth_t = 0.0
+        self.latest_intrinsics: Optional[tuple] = None  # (fx, fy, cx, cy)
+        self.latest_intrinsics_t = 0.0
         self.frame_count = 0
         self.mode = "manual"                    # "text" | "manual" -- starts inert: no
         #                                          target means nothing to autonomously
@@ -139,6 +144,16 @@ def zenoh_setup(session: zenoh.Session, st: SharedState, compressed_only: bool =
         except Exception as e:
             print(f"[WARN] depth parse failed: {e}")
 
+    def on_camera_info(sample):
+        try:
+            k = parse_camera_info(bytes(sample.payload))
+            if k is not None:
+                with st.lock:
+                    st.latest_intrinsics = k
+                    st.latest_intrinsics_t = time.time()
+        except Exception as e:
+            print(f"[WARN] camera_info parse failed: {e}")
+
     def on_rpm(sample):
         if odom is None:
             return
@@ -166,6 +181,7 @@ def zenoh_setup(session: zenoh.Session, st: SharedState, compressed_only: bool =
         [session.declare_subscriber(k, on_image) for k in raw_keys]
         + [session.declare_subscriber(k, on_compressed) for k in CAMERA_COMPRESSED_KEYS]
         + [session.declare_subscriber(k, on_depth) for k in DEPTH_KEYS]
+        + [session.declare_subscriber(k, on_camera_info) for k in CAMERA_INFO_KEYS]
         + [session.declare_subscriber(k, on_rpm) for k in RPM_KEYS]
     )
     pubs = {
@@ -195,6 +211,8 @@ def inference_loop(pipe: DinoNavDPPipeline, st: SharedState, pubs, running,
             rgb = st.latest_rgb
             depth = st.latest_depth
             depth_age = time.time() - st.latest_depth_t
+            intrinsics = st.latest_intrinsics
+            intrinsics_age = time.time() - st.latest_intrinsics_t
             mode = st.mode
             target = st.target
             avoid = st.avoid
@@ -235,10 +253,12 @@ def inference_loop(pipe: DinoNavDPPipeline, st: SharedState, pubs, running,
             continue
         if depth is not None and (depth_age > DEPTH_STALE_S or depth.shape[:2] != rgb.shape[:2]):
             depth = None
+        if intrinsics is not None and intrinsics_age > INTRINSICS_STALE_S:
+            intrinsics = None
 
         try:
             pose = (odom.x, odom.y, odom.theta) if odom is not None else None
-            res = pipe.step(rgb, target, depth=depth, pose=pose, avoid_text=avoid)
+            res = pipe.step(rgb, target, depth=depth, pose=pose, avoid_text=avoid, intrinsics=intrinsics)
         except Exception as e:
             print(f"[ERROR] pipeline step: {e}")
             with st.lock:

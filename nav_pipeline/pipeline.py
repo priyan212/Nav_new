@@ -676,7 +676,8 @@ class DinoNavDPPipeline:
     # ------------------------------------------------------------------ #
     def step(self, rgb: np.ndarray, target_text: str, depth: Optional[np.ndarray] = None,
              pose: Optional[tuple] = None, external_dets: Optional[list] = None,
-             external_goal: Optional[np.ndarray] = None, avoid_text: str = "") -> StepResult:
+             external_goal: Optional[np.ndarray] = None, avoid_text: str = "",
+             intrinsics: Optional[tuple] = None) -> StepResult:
         """pose, if given: (x, y, theta) odometry at capture time -- stamped onto
         this tick's scene_log entry (see PipelineConfig.use_scene_tagger), and
         required for external_goal below. As of the object-map feature,
@@ -712,8 +713,17 @@ class DinoNavDPPipeline:
         res.avoid_pixels (merged into its S2Diff pixel-obstacle guidance);
         the plain and in-process-S2Diff launchers detect it but don't act on
         it. "" (default) skips the extra DINO pass entirely.
+
+        intrinsics, if given: (fx, fy, cx, cy) from the camera's real
+        factory calibration (sensor_msgs/CameraInfo) -- e.g.
+        nav_pipeline/zenoh_node.py's CAMERA_INFO_KEYS. Used in place of
+        the coarse intrinsics_from_fov(...) approximation for this tick's
+        goal-point/obstacle-guard projection; None (the default, or a
+        stale/missing camera_info) falls back to the FOV approximation
+        exactly as before -- never regresses to "no intrinsics".
         """
-        res = self._step_inner(rgb, target_text, depth, pose, external_dets, external_goal, avoid_text)
+        res = self._step_inner(rgb, target_text, depth, pose, external_dets, external_goal,
+                                avoid_text, intrinsics)
         # stiction floor is now baked into bearing_to_angular's smooth ramp
         # for TRACK; AVOID commands max_angular directly and SEARCH's
         # search_angular is already comfortably above ang_min_cmd, so
@@ -742,7 +752,8 @@ class DinoNavDPPipeline:
 
     def _step_inner(self, rgb: np.ndarray, target_text: str, depth: Optional[np.ndarray] = None,
                      pose: Optional[tuple] = None, external_dets: Optional[list] = None,
-                     external_goal: Optional[np.ndarray] = None, avoid_text: str = "") -> StepResult:
+                     external_goal: Optional[np.ndarray] = None, avoid_text: str = "",
+                     intrinsics: Optional[tuple] = None) -> StepResult:
         res = StepResult()
         H, W = rgb.shape[:2]
         timing = {}
@@ -860,7 +871,10 @@ class DinoNavDPPipeline:
             self._prev_pose = pose
 
         # --- goal ------------------------------------------------------ #
-        fx, fy, cx, cy = intrinsics_from_fov(W, H, self.cfg.horizontal_fov_deg)
+        if intrinsics is not None:
+            fx, fy, cx, cy = intrinsics
+        else:
+            fx, fy, cx, cy = intrinsics_from_fov(W, H, self.cfg.horizontal_fov_deg)
         goal = None
         if det is not None:
             res.detection = det
