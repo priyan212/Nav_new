@@ -67,6 +67,22 @@ backend_parse_args() {
         # launch_rover.sh's comment) -- real, measured tuning for this bot.
         BACKEND_MAX_ANGULAR=1.2
         BACKEND_ANGULAR_SLEW_MAX=0.10   # pipeline.py's own default, unchanged
+        # 0.18 as of 2026-08-12 (was 0.15 default, then 0.13, then 0.14 --
+        # rover didn't move at any of those; briefly 0.20). Root cause: the
+        # ESP32 firmware actually flashed here (esp32/rover_6wd_complete.ino)
+        # hard-zeros any per-wheel target below VEL_DEADBAND_MS=0.03 m/s, and
+        # SEARCH's pure rotation converts to a per-wheel target of
+        # angular_z * TRACK_WIDTH_M/2 (0.345m track width) -- 0.13-0.15 all
+        # land at 0.022-0.026 m/s, under the deadband, so the firmware
+        # silently commanded zero PWM regardless of what pipeline.py sent.
+        # The hard minimum to clear the deadband is ~0.174 rad/s (0.03 * 2 /
+        # 0.345). 0.18 is the lowest value tested that still clears it, with
+        # only ~3.5% margin (0.031 m/s/wheel) -- deliberately chosen close to
+        # the deadband rather than 0.20's larger margin, so if this ever
+        # stops moving again, that thin margin (not the deadband model
+        # itself) is the first thing to suspect; 0.20 is the safer fallback.
+        # See LAUNCH/launch_rover.sh's comment for the full derivation.
+        BACKEND_SEARCH_ANGULAR=0.18
     else
         BACKEND_DEFAULT_IP=10.47.234.228
         BACKEND_PI_PASS_DEFAULT=raspberrypi
@@ -80,6 +96,13 @@ backend_parse_args() {
         # same conservative real-rover defaults"). Bump this specifically
         # (not the rover's) if 0.5 turns out too slow once re-tuned properly.
         BACKEND_MAX_ANGULAR=0.5
+        # Unchanged (still the old rover's carried-over 0.13, see
+        # launch_rover.sh's comment) -- the 0.18 rover fix above is derived
+        # from this exact ESP32 firmware's VEL_DEADBAND_MS/TRACK_WIDTH_M,
+        # which don't apply to this chassis's own bridge/firmware. Not
+        # re-derived or validated for the Hiwonder; check landerpi's actual velocity
+        # deadband before bumping this one too.
+        BACKEND_SEARCH_ANGULAR=0.13
         # Reduced 2026-08-10 from pipeline.py's 0.10 default: a fresh
         # SEARCH->TRACK correction (bearing error is large right after a
         # glimpse at frame edge) commands a real turn, and that turn's own

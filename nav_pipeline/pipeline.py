@@ -52,6 +52,45 @@ from .obstacle_guard import (
 from .scene_tagger import DEFAULT_VOCAB
 
 
+def _bbox_to_pixel_grid(
+    box: np.ndarray, width: int, height: int, image_size: int = 224,
+    stride: int = 8, max_points: int = 400,
+) -> np.ndarray:
+    """Strided [u,v] pixel grid over a DINO box interior -- the named-obstacle
+    footprint fed into S2Diff's pixel-obstacle avoidance (see
+    tube_planner/pixel_obstacles.py). A bbox, not a SAM mask: cheap (no extra
+    segmentation pass every tick) at the cost of including some background
+    inside the box. Depth/finite validity is filtered server-side by
+    PixelObstacleConfig -- this only needs pixels that land inside the image.
+
+    ``box`` is in the ORIGINAL rgb frame (what self.detector ran on), but
+    sample_pointgoal (see s2diff_http_client.py) sends the resize+center-pad
+    letterboxed image_size x image_size frame goal_utils.preprocess_rgb/
+    preprocess_depth actually build for NavDP's memory -- NOT the original
+    resolution. Pixels left in original-frame coordinates land outside that
+    224x224 image and the server 400s every request (an obstacle pixel
+    outside its depth image). Reproduce preprocess_rgb's exact transform here
+    so the returned pixels land correctly in the frame that gets sent."""
+
+    prop = image_size / max(height, width)
+    pad_w = max((image_size - round(width * prop)) // 2, 0)
+    pad_h = max((image_size - round(height * prop)) // 2, 0)
+    x0 = max(0, int(np.floor(box[0] * prop)) + pad_w)
+    y0 = max(0, int(np.floor(box[1] * prop)) + pad_h)
+    x1 = min(image_size - 1, int(np.ceil(box[2] * prop)) + pad_w)
+    y1 = min(image_size - 1, int(np.ceil(box[3] * prop)) + pad_h)
+    if x1 <= x0 or y1 <= y0:
+        return np.zeros((0, 2), dtype=np.int64)
+    us = np.arange(x0, x1 + 1, stride)
+    vs = np.arange(y0, y1 + 1, stride)
+    uu, vv = np.meshgrid(us, vs, indexing="xy")
+    pixels = np.stack([uu.ravel(), vv.ravel()], axis=1).astype(np.int64)
+    if pixels.shape[0] > max_points:
+        idx = np.linspace(0, pixels.shape[0] - 1, max_points).astype(np.int64)
+        pixels = pixels[idx]
+    return pixels
+
+
 @dataclass
 class PipelineConfig:
     device: str = "cuda:0"
@@ -317,6 +356,8 @@ class StepResult:
     critic: Optional[np.ndarray] = None
     obstacle_points: Optional[np.ndarray] = None
     min_forward: float = float("inf")
+    avoid_detection: Optional[object] = None  # this tick's named-obstacle DINO box, if avoid_text set
+    avoid_pixels: Optional[np.ndarray] = None  # [N,2] u,v pixels covering it -- see _bbox_to_pixel_grid
     timing: dict = field(default_factory=dict)
 
 
@@ -635,7 +676,7 @@ class DinoNavDPPipeline:
     # ------------------------------------------------------------------ #
     def step(self, rgb: np.ndarray, target_text: str, depth: Optional[np.ndarray] = None,
              pose: Optional[tuple] = None, external_dets: Optional[list] = None,
-             external_goal: Optional[np.ndarray] = None) -> StepResult:
+             external_goal: Optional[np.ndarray] = None, avoid_text: str = "") -> StepResult:
         """pose, if given: (x, y, theta) odometry at capture time -- stamped onto
         this tick's scene_log entry (see PipelineConfig.use_scene_tagger), and
         required for external_goal below. As of the object-map feature,
@@ -663,8 +704,16 @@ class DinoNavDPPipeline:
         rooms makes a purely odometric "arrived" unsafe to trust. The caller
         decides when to stop coasting on GOTO (e.g. switch to a search spin
         once close with no visual reacquisition) and give up.
+
+        avoid_text, if non-empty: a free-text phrase (e.g. "trash bin") DINO-
+        detected every tick same as target_text, but only to mark its box as
+        a named obstacle (res.avoid_pixels) -- it never affects target
+        selection. Only nav_pipeline/s2diff_http_client.py currently reads
+        res.avoid_pixels (merged into its S2Diff pixel-obstacle guidance);
+        the plain and in-process-S2Diff launchers detect it but don't act on
+        it. "" (default) skips the extra DINO pass entirely.
         """
-        res = self._step_inner(rgb, target_text, depth, pose, external_dets, external_goal)
+        res = self._step_inner(rgb, target_text, depth, pose, external_dets, external_goal, avoid_text)
         # stiction floor is now baked into bearing_to_angular's smooth ramp
         # for TRACK; AVOID commands max_angular directly and SEARCH's
         # search_angular is already comfortably above ang_min_cmd, so
@@ -693,7 +742,7 @@ class DinoNavDPPipeline:
 
     def _step_inner(self, rgb: np.ndarray, target_text: str, depth: Optional[np.ndarray] = None,
                      pose: Optional[tuple] = None, external_dets: Optional[list] = None,
-                     external_goal: Optional[np.ndarray] = None) -> StepResult:
+                     external_goal: Optional[np.ndarray] = None, avoid_text: str = "") -> StepResult:
         res = StepResult()
         H, W = rgb.shape[:2]
         timing = {}
@@ -750,6 +799,14 @@ class DinoNavDPPipeline:
                       f"specific phrase (e.g. '{target_text} near the window') if it picks the wrong one.")
         else:
             self._ambiguity_warned = False
+
+        if avoid_text:
+            t0 = time.time()
+            avoid_det = self.detector.detect_best(rgb, avoid_text)
+            if avoid_det is not None:
+                res.avoid_detection = avoid_det
+                res.avoid_pixels = _bbox_to_pixel_grid(avoid_det.box, W, H)
+            timing["dino_avoid"] = time.time() - t0
 
         t0 = time.time()
         if depth is None:
@@ -1045,6 +1102,11 @@ class DinoNavDPPipeline:
                 dframes = np.concatenate([pad, dframes], axis=0)
             depths = torch.from_numpy(dframes).unsqueeze(0)
         goal_native = np.array([goal[0], self._goal_y_sign * goal[1], goal[2]], dtype=np.float32)
+        # Plain instance attribute, not part of NavDPStandalone's own API --
+        # only nav_pipeline/s2diff_http_client.py's monkeypatched
+        # sample_pointgoal reads it (via getattr(self, ...), self is this
+        # same self.policy). Harmless no-op for every other policy backend.
+        self.policy._pending_avoid_pixels = res.avoid_pixels
         trajs, critic = self.policy.sample_pointgoal(
             goal_native.reshape(1, 3), images, depths, sample_num=self.cfg.sample_num
         )

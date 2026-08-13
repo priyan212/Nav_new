@@ -43,11 +43,11 @@ EXTRA_ARGS=()
 if [[ "$BACKEND" == "hiwonder" ]]; then
     EXTRA_ARGS+=(--footprint-length "$BACKEND_FOOTPRINT_LENGTH" --footprint-width "$BACKEND_FOOTPRINT_WIDTH")
 fi
-info "Starting Nav_new GUI [$BACKEND, S2Diff-guided NavDP] (pi-ip=$PI_IP, caps 0.15 m/s / $BACKEND_MAX_ANGULAR rad/s, fov $BACKEND_FOV, search 0.13 rad/s, ramp 70deg, slew $BACKEND_ANGULAR_SLEW_MAX rad/s/tick)..."
+info "Starting Nav_new GUI [$BACKEND, S2Diff-guided NavDP] (pi-ip=$PI_IP, caps 0.15 m/s / $BACKEND_MAX_ANGULAR rad/s, fov $BACKEND_FOV, search $BACKEND_SEARCH_ANGULAR rad/s, ramp 70deg, slew $BACKEND_ANGULAR_SLEW_MAX rad/s/tick)..."
 exec python -u -m nav_pipeline.s2diff_runner \
     --pi-ip "$PI_IP" \
     --max-linear 0.15 --max-angular "$BACKEND_MAX_ANGULAR" --fov "$BACKEND_FOV" \
-    --search-angular 0.13 --servo-ramp-deg 70 --angular-slew-max "$BACKEND_ANGULAR_SLEW_MAX" \
+    --search-angular "$BACKEND_SEARCH_ANGULAR" --servo-ramp-deg 70 --angular-slew-max "$BACKEND_ANGULAR_SLEW_MAX" \
     --compressed-only \
     "${EXTRA_ARGS[@]}" \
     "$@"

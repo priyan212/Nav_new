@@ -85,6 +85,7 @@ class SharedState:
         #                                          target means nothing to autonomously
         #                                          navigate to; send one to switch to "text"
         self.target = target
+        self.avoid = ""                          # named obstacle text, "" = disabled; see --avoid
         self.stopped = False
         self.goal_reached = False
         self.last_cmd = (0.0, 0.0)
@@ -93,6 +94,7 @@ class SharedState:
         # for display
         self.display_rgb: Optional[np.ndarray] = None
         self.detection = None
+        self.avoid_detection = None
         self.mask: Optional[np.ndarray] = None
         self.state_text = "waiting for camera"
         self.vel_text = "lin 0.000  ang +0.000"
@@ -195,6 +197,7 @@ def inference_loop(pipe: DinoNavDPPipeline, st: SharedState, pubs, running,
             depth_age = time.time() - st.latest_depth_t
             mode = st.mode
             target = st.target
+            avoid = st.avoid
             paused = st.stopped or st.goal_reached
         if target and target != last_target:
             if last_target is not None:
@@ -235,7 +238,7 @@ def inference_loop(pipe: DinoNavDPPipeline, st: SharedState, pubs, running,
 
         try:
             pose = (odom.x, odom.y, odom.theta) if odom is not None else None
-            res = pipe.step(rgb, target, depth=depth, pose=pose)
+            res = pipe.step(rgb, target, depth=depth, pose=pose, avoid_text=avoid)
         except Exception as e:
             print(f"[ERROR] pipeline step: {e}")
             with st.lock:
@@ -276,6 +279,7 @@ def inference_loop(pipe: DinoNavDPPipeline, st: SharedState, pubs, running,
         with st.lock:
             st.display_rgb = rgb
             st.detection = res.detection
+            st.avoid_detection = res.avoid_detection
             st.mask = res.mask
             st.trajs = res.all_trajectories
             st.chosen = res.trajectory
@@ -449,6 +453,7 @@ class App:
             # what showing display_rgb here produced during movement.
             rgb = self.st.latest_rgb if self.st.latest_rgb is not None else self.st.display_rgb
             det = self.st.detection
+            avoid_det = self.st.avoid_detection
             mask = self.st.mask
             trajs, chosen, goal = self.st.trajs, self.st.chosen, self.st.goal_pt
             obstacles, min_fwd = self.st.obstacles, self.st.min_forward
@@ -465,11 +470,17 @@ class App:
             img = Image.fromarray(frame).convert("RGB")
             sx, sy = self.CAM_SIZE / img.width, self.CAM_SIZE / img.height
             img = img.resize((self.CAM_SIZE, self.CAM_SIZE))
-            if det is not None:
+            if det is not None or avoid_det is not None:
                 d = ImageDraw.Draw(img)
-                x0, y0, x1, y1 = det.box
-                d.rectangle([x0 * sx, y0 * sy, x1 * sx, y1 * sy], outline=(0, 255, 60), width=3)
-                d.text((x0 * sx + 4, max(y0 * sy - 14, 2)), f"{det.label} {det.score:.2f}", fill=(0, 255, 60))
+                if det is not None:
+                    x0, y0, x1, y1 = det.box
+                    d.rectangle([x0 * sx, y0 * sy, x1 * sx, y1 * sy], outline=(0, 255, 60), width=3)
+                    d.text((x0 * sx + 4, max(y0 * sy - 14, 2)), f"{det.label} {det.score:.2f}", fill=(0, 255, 60))
+                if avoid_det is not None:
+                    x0, y0, x1, y1 = avoid_det.box
+                    d.rectangle([x0 * sx, y0 * sy, x1 * sx, y1 * sy], outline=(255, 40, 40), width=3)
+                    d.text((x0 * sx + 4, max(y0 * sy - 14, 2)), f"avoid: {avoid_det.label} {avoid_det.score:.2f}",
+                            fill=(255, 40, 40))
             self._photo = ImageTk.PhotoImage(img)
             self.cam_label.configure(image=self._photo)
 
@@ -509,6 +520,20 @@ def main():
     ap.add_argument("--target", default="",
                     help="starts empty -- rover stays in manual drive with nothing to "
                          "navigate to until a target is sent from the GUI (or passed here)")
+    ap.add_argument("--avoid", default="",
+                    help="named obstacle to steer away from, e.g. 'trash bin' -- DINO-detected "
+                         "every tick like --target, but only fed into S2Diff pixel-obstacle "
+                         "avoidance (nav_pipeline/s2diff_http_client.py); no effect on the "
+                         "plain or in-process-S2Diff launchers. '' (default) disables it")
+    ap.add_argument("--policy-type", choices=["crossmodal", "extracted"], default="crossmodal",
+                    help="NavDP policy backend (see PipelineConfig.policy_type). \"crossmodal\" "
+                         "(default) is the official standalone checkpoint, in-process. "
+                         "nav_pipeline.s2diff_http_runner (LAUNCH/launch_rover_s2diff_http.sh) "
+                         "REQUIRES \"extracted\" here -- its HTTP client monkeypatches "
+                         "NavDPStandalone.sample_pointgoal, which only takes effect if this "
+                         "pipeline's self.policy is actually a NavDPStandalone instance "
+                         "(policy_type=\"extracted\"); left at \"crossmodal\" the HTTP server is "
+                         "silently never called and NavDP runs local crossmodal inference instead.")
     ap.add_argument("--pi-ip", default=None)
     ap.add_argument("--predict-hz", type=float, default=2.5)
     ap.add_argument("--fov", type=float, default=90.0)
@@ -561,6 +586,7 @@ def main():
     print("[INFO] loading models...")
     pipe = DinoNavDPPipeline(PipelineConfig(
         device=args.device,
+        policy_type=args.policy_type,
         horizontal_fov_deg=args.fov,
         max_linear=args.max_linear,
         max_angular=args.max_angular,
@@ -580,6 +606,7 @@ def main():
     print("[INFO] zenoh session opened")
 
     st = SharedState(args.target)
+    st.avoid = args.avoid
     st.max_linear = args.max_linear
     st.max_angular = args.max_angular
     odom = OdometryLogger(args.odometry_log_dir)

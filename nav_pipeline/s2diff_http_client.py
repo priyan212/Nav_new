@@ -36,6 +36,47 @@ from PIL import Image
 from .goal_utils import intrinsics_from_fov
 from .obstacle_guard import GuardConfig
 
+_PINK = "\033[95m"
+_RESET = "\033[0m"
+
+
+def _print_guidance_debug(payload: dict) -> None:
+    """How much this tick's S2Diff particle-guidance (CBF-style barrier +
+    circulation energy layered on the DDPM score, see tube_planner/
+    s2diff_guidance.py) changed the outcome vs. plain critic-argmax NavDP --
+    i.e. what candidate a "pure-navdp" run (no guidance) would have picked.
+    Both all_trajectory/all_values (pre-guidance-selection candidates+critic)
+    and the s2diff diagnostics are already in every /pointgoal_step response
+    (navdp_s2diff_server.py) -- this was simply never read/printed client-side."""
+
+    s2 = payload.get("s2diff")
+    if s2 is None:
+        return
+    all_values = np.asarray(payload["all_values"], dtype=np.float32)[0]
+    all_traj = np.asarray(payload["all_trajectory"], dtype=np.float32)[0]
+    critic_best_idx = int(np.argmax(all_values))
+    guided_idx = int(s2["selected_index"][0])
+
+    if guided_idx < 0 or guided_idx >= all_traj.shape[0]:
+        endpoint_delta = float("nan")
+    else:
+        endpoint_delta = float(
+            np.linalg.norm(all_traj[guided_idx, -1, :2] - all_traj[critic_best_idx, -1, :2])
+        )
+
+    print(
+        f"{_PINK}[s2diff-guidance] picked #{guided_idx} vs critic-best #{critic_best_idx} "
+        f"(same={guided_idx == critic_best_idx}) | endpoint delta={endpoint_delta:.3f}m | "
+        f"noise_correction mean={s2['mean_guidance_noise_correction'][0]:.3f} "
+        f"final={s2['final_guidance_noise_correction'][0]:.3f} "
+        f"max={s2['maximum_guidance_noise_correction'][0]:.3f} | "
+        f"barrier_energy={s2['selected_barrier_energy'][0]:.3f} "
+        f"circulation_energy={s2['selected_circulation_energy'][0]:.3f} "
+        f"clearance={s2['selected_minimum_clearance'][0]:.3f} | "
+        f"valid_obstacle_pts={s2['valid_obstacle_points'][0]} | "
+        f"fallback_stop={s2['fallback_stop'][0]} escape_turn={s2['escape_turn'][0]}{_RESET}"
+    )
+
 
 def _obstacle_pixels_from_depth(
     depth_hw: np.ndarray, fx: float, fy: float, cx: float, cy: float, guard: GuardConfig
@@ -105,6 +146,14 @@ def make_http_sample_pointgoal(
 
         fx, fy, cx, cy = intrinsics_from_fov(w, h, fov_deg)
         obstacle_pixels = _obstacle_pixels_from_depth(dep, fx, fy, cx, cy, guard)
+        # Named-obstacle pixels for this tick, if pipeline.py's step() got an
+        # avoid_text: stashed as a plain attribute on this NavDPStandalone
+        # instance (self here) right before it called sample_pointgoal --
+        # see pipeline.py's _step_inner. Merged in raw; the server's
+        # PixelObstacleConfig still filters by depth validity/range.
+        avoid_pixels = getattr(self, "_pending_avoid_pixels", None)
+        if avoid_pixels is not None and len(avoid_pixels):
+            obstacle_pixels = obstacle_pixels + np.asarray(avoid_pixels, dtype=np.int64).tolist()
 
         goal = np.asarray(goal_point, dtype=np.float32).reshape(1, 3)
         # goal_point here is checkpoint-native [x fwd, y RIGHT, z]
@@ -141,6 +190,7 @@ def make_http_sample_pointgoal(
         )
         resp.raise_for_status()
         payload = resp.json()
+        _print_guidance_debug(payload)
         trajs = torch.as_tensor(np.asarray(payload["all_trajectory"], dtype=np.float32)[0])
         critic = torch.as_tensor(np.asarray(payload["all_values"], dtype=np.float32)[0])
         return trajs, critic
