@@ -68,7 +68,7 @@ should be mirrored here).
 
 These aren't per-goal navigation logs from `odometry_logger.py` — they're
 output from `scripts/odom_accuracy_gui.py` (launched via
-`./launch_odom_test.sh`), a standalone GUI that drives the real rover
+`./LAUNCH/launch_odom_test.sh`), a standalone GUI that drives the real rover
 through a known motion (e.g. a controlled in-place spin) and compares the
 same dead-reckoned odometry against hand-measured ground truth, to answer
 "how much do we trust this odometry?" `odom_accuracy_results.csv` holds the

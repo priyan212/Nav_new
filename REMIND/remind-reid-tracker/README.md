@@ -138,6 +138,7 @@ Endpoints:
 | `GET /health` | `{"status": "ok", "frame_count": int}` |
 | `POST /infer` | body: one JPEG frame (BGR/cv2) → `{"frame_id", "objects": [{"det_id", "object_id" (persistent, null until confirmed), "kind" (match\|new\|ambiguous\|provisional\|detection), "class_name" (InternVL/BLIP classification once confirmed, else null), "confidence", "bbox", "mask_bbox", "mask_png_b64"}, ...]}` |
 | `POST /reset` | clears the object catalogue + frame counter, without reloading SAM/InternVL/DINOv3 (fast) |
+| `POST /confirm_arrival?target=<url-encoded text>` | body: one JPEG frame, same convention as `/infer` → `{"arrived": true\|false\|null}` (`null` = the model's answer didn't parse as yes/no). Full-frame yes/no VQA against the already-loaded InternVL model (`features/internvl_classifier.py`'s `confirm_arrival`) — "has the robot reached `target`?" 501 if InternVL wasn't loaded (`--no-internvl`/`--use-blip`). Used by `nav_pipeline/remind_gui_vlm.py` (`../README.md`'s VLM-confirmed-arrival variant) as a confirmation layer on top of, never instead of, the metric depth-threshold STOP. |
 
 `mask_png_b64` is the mask **cropped to `mask_bbox`**, not full-frame — kept
 small since REMIND's own SAM backend already produced the mask as part of

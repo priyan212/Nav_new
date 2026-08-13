@@ -151,7 +151,7 @@ drops to `SEARCH`, overriding the older frame-count `lost_patience` cutoff
 while belief is enabled.
 
 The rotation-noise tuning came from real spin-accuracy trials
-(`scripts/odom_accuracy_gui.py`, launched via `./launch_odom_test.sh
+(`scripts/odom_accuracy_gui.py`, launched via `./LAUNCH/launch_odom_test.sh
 [PI_IP]` — a standalone GUI with no DINO/SAM/NavDP/depth models that just
 compares dead-reckoned odometry against hand-measured ground truth), logged
 to `odometry_log/odom_accuracy_results.csv`: heading error stays within a
@@ -165,7 +165,7 @@ exercises the belief wiring inside a real `DinoNavDPPipeline` end to end.
 
 ## Object-persistent targeting (REMIND)
 
-`nav_pipeline/remind_gui.py` (launched via `./launch_rover_remind.sh
+`nav_pipeline/remind_gui.py` (launched via `./LAUNCH/launch_rover_remind.sh
 [PI_IP]`, which brings up the real rover exactly like `launch_rover.sh`
 *and* starts REMIND's own live-tracking server as a background process in
 its own conda env — see [REMIND/remind-reid-tracker/README.md](REMIND/remind-reid-tracker/README.md))
@@ -225,12 +225,27 @@ into the stop decision).
   of the rover flickering into `GOTO`/`SEARCH` on every brief drop-out.
 
 ```bash
-./launch_rover_remind.sh [PI_IP]
+./LAUNCH/launch_rover_remind.sh [PI_IP]
 ```
+
+**VLM-confirmed arrival variant:** `./launch_rover_remind_vlm.sh [PI_IP]`
+(repo root, not `LAUNCH/`) is identical bring-up but runs
+`nav_pipeline/remind_gui_vlm.py` instead of `remind_gui.py` — the same 1.5 m
+depth-based `stop_distance` trigger still zeroes velocity every tick, but it
+no longer *declares* arrival by itself: once it fires, the GUI asks REMIND's
+already-loaded InternVL model (over the live server's `/confirm_arrival`
+endpoint) whether the current camera frame actually shows the target
+reached, and only reports **GOAL REACHED** once the VLM agrees
+(`VLMArrivalGate`). Falls back to the plain metric-only behavior
+automatically if that endpoint is unavailable; `--no-vlm-confirm` forces
+that fallback deliberately, for an A/B comparison against
+`launch_rover_remind.sh`.
 
 ## Manual control + Go Home
 
-`nav_pipeline/home_gui.py` (launched via `./launch_rover_home.sh [PI_IP]`) is
+`nav_pipeline/home_gui.py` (launched via `./LAUNCH/launch_rover_home.sh
+[PI_IP]`, or `./LAUNCH/launch_bot.sh [PI_IP]` directly — `launch_rover_home.sh`
+is a thin backward-compatible wrapper around it) is
 a separate, lightweight control panel for the real rover: arrow-key/hold-button
 manual driving, plus a **GO HOME** button that drives back to wherever the
 rover was when the GUI launched (or wherever **Set Home Here** was last
@@ -272,48 +287,107 @@ vision-free ROTATE/DRIVE/FACE/ARRIVED servo above for the precise final
 approach and heading match. Manual drive is never gated by any of this,
 flag on or off.
 
-## The four worlds it runs in
+## The five bodies it runs on
 
-The same `nav_pipeline` code drives all four — only the transport peer and
+The same `nav_pipeline` code drives all five — only the transport peer and
 the speed caps change:
 
 | Target | Launcher | Camera/depth source | Notes |
 |---|---|---|---|
-| **Real rover** (6WD, ESP32 + micro-ROS) | `./launch_rover.sh` | Pi camera (compressed JPEG only — raw RGB saturates the rover's Wi-Fi) | Brings the Pi's systemd services up, waits for camera + ESP32 heartbeat, then starts the GUI at real-world speed caps |
-| **Isaac Sim** digital twin | `./launch_gui.sh` | Isaac's simulated camera + depth over Zenoh | Needs the Isaac scene playing and its ROS 2 bridge scripts running first (see script header) |
+| **Real rover** (6WD, ESP32 + micro-ROS) | `./LAUNCH/launch_rover.sh` | Pi camera (compressed JPEG only — raw RGB saturates the rover's Wi-Fi) | Brings the Pi's systemd services up, waits for camera + ESP32 heartbeat, then starts the GUI at real-world speed caps |
+| **Hiwonder LanderPi** (Mecanum chassis) | `./LAUNCH/launch_rover.sh --hiwonder` | LanderPi's `usb_cam` (compressed JPEG) | Same GUI/pipeline, different Pi bring-up (`landerpi/deploy_bridge.sh` instead of systemd services) and lower speed caps — see [The `--rover` / `--hiwonder` backend flag](#the---rover----hiwonder-backend-flag) and [landerpi/README.md](landerpi/README.md) |
+| **Isaac Sim** digital twin | `./LAUNCH/launch_gui.sh` | Isaac's simulated camera + depth over Zenoh | Needs the Isaac scene playing and its ROS 2 bridge scripts running first (see script header) |
 | **Mars habitat sim** (Habitat-Sim, ERC Marsyard terrain) | `./MARS/launch_mars.sh --rocks` | Habitat's simulated camera + perfect depth | Separate `mars_habitat` conda env for the sim node; see [MARS/README.md](MARS/README.md) |
 | **Earth habitat sim** (Habitat-Sim, real-world photogrammetry scan) | `./EARTH/launch_earth.sh` | Habitat's simulated camera + perfect depth | Same `mars_habitat` conda env, a Sketchfab scan instead of generated terrain; see [EARTH/README.md](EARTH/README.md) |
 
-All four publish/subscribe the identical Zenoh topics, so a policy change in
+All five publish/subscribe the identical Zenoh topics, so a policy change in
 `nav_pipeline/` is tested once offline, once in Isaac/Mars/Earth, then run on
-the real rover with nothing else touched.
+the real rover (or the LanderPi) with nothing else touched.
+
+## The `--rover` / `--hiwonder` backend flag
+
+Every script in `LAUNCH/` (except `launch_dino_navdp.sh`, `launch_gui.sh`)
+sources `LAUNCH/_backend.sh`, which accepts `--rover` (default) or
+`--hiwonder` as their first flag and fills in the right Pi-bringup method,
+default Pi IP/SSH password, camera FOV, footprint, and steering-shape
+constants (`max-angular`, `search-angular`, `angular-slew-max`) for whichever
+body you're pointing at — `pipeline.py` / `obstacle_guard.py` /
+`odometry_logger.py` are completely unchanged either way, only what runs on
+the Pi differs:
+
+- **`--rover`** (default) — the old 6WD rover: ESP32 micro-ROS +
+  `zenoh-bridge-ros2dds`, brought up via systemd services
+  (`rover-camera`/`rover-agent`/`rover-zenoh`). Every steering-shape constant
+  here is real, live-measured tuning for this exact chassis/firmware (see
+  `LAUNCH/_backend.sh`'s comments for the derivations).
+- **`--hiwonder`** — the newer Hiwonder LanderPi (Mecanum): stock ROS1
+  Noetic stack in Hiwonder's own `armpi_pro` Docker container (untouched),
+  brought up via `landerpi/deploy_bridge.sh` running `landerpi/bridge.py`
+  inside that container. Its own real encoder+IMU odometry, but its
+  steering-shape constants are carried over from the rover **unvalidated**
+  for this chassis (`backend_bringup` prints an explicit warning) — see
+  [landerpi/README.md](landerpi/README.md) for the full integration story
+  and known caveats.
+
+```bash
+./LAUNCH/launch_rover.sh --hiwonder --target "trash bin"
+./LAUNCH/launch_rover.sh --hiwonder 10.47.234.228 --target "trash bin"
+```
 
 ## Repo layout
 
 ```
 Nav_new/
 ├── nav_pipeline/         the package: perception + policy + transport
+├── LAUNCH/               one-command entry points for the real rover / LanderPi (own section below)
 ├── checkpoints/          model weights (see below)
 ├── scripts/              offline tests, diagnostics, Pi provisioning
 ├── configs/               yaml configs (isaac / real rover)
 ├── data/                 saved test frames + pipeline output snapshots
 ├── odometry_log/         dead-reckoned pose CSVs, one per goal (own README)
+├── scene_log/            passive open-vocabulary object-inventory JSONL, one file per process run (own README)
 ├── object_map/           persistent id -> world-location JSON (object_map.py, see REMIND targeting)
 ├── belief_eval_*/        dated write-ups of the belief-vs-frozen occlusion eval (see Goal belief)
-├── reference/            prior OmniVLA/InternVLA-N1 nodes, kept for reference
+├── reference/            prior OmniVLA/InternVLA-N1 nodes, plus InternVLA-N1's native DualVLN
+│                        dual-system node (internvla_dualvln_zenoh_node.py, see LAUNCH/launch_hiwonder_dualvln.sh)
 ├── third_party/InternNav/  vendored InternNav source (checkpoints symlinked in)
 ├── esp32/                rover firmware + Pi-side serial/handshake helpers (see esp32/FLASHING.md
 │                        for how to compile + flash it — the ESP32 is wired to the Pi, not the
 │                        GPU machine, so this is a compile-locally/scp/flash-via-SSH workflow)
+├── landerpi/             Hiwonder LanderPi bridge (bridge.py + deploy_bridge.sh) -- the second
+│                        robot backend selected via --hiwonder, see the backend-flag section above (own README)
 ├── MARS/                 Habitat-Sim Mars sub-project (own README)
 ├── EARTH/                Habitat-Sim real-world photogrammetry sub-project (own README)
 ├── REMIND/remind-reid-tracker/  persistent per-object re-ID tracker, live-served for
 │                        object-persistent targeting (own README, separate conda env)
-└── launch_*.sh           one-command entry points for each of the 4 worlds,
-                         plus launch_odom_test.sh (real-rover odometry-accuracy GUI, no perception models),
-                         launch_rover_home.sh (manual control + Go Home, no perception models by default),
-                         and launch_rover_remind.sh (REMIND object-persistent targeting, real rover only)
+├── tryout/               S2Diff in-loop obstacle guidance for NavDP's DDPM sampler -- experimental,
+│                        opt-in alternative trajectory sampler (see tryout/S2DIFF_GUIDANCE.md and
+│                        LAUNCH/launch_rover_s2diff*.sh below)
+└── launch_rover_remind_vlm.sh  REMIND targeting + VLM-confirmed arrival (repo root, not LAUNCH/ --
+                         see Object-persistent targeting below)
 ```
+
+### `LAUNCH/` — real-rover / LanderPi one-command entry points
+
+Every script here (except `launch_dino_navdp.sh`) sources `LAUNCH/_backend.sh`
+for the shared `--rover`/`--hiwonder` bring-up described above. Full flag
+combinations for every one of these live in [priyan.md](priyan.md).
+
+| Script | What it starts |
+|---|---|
+| `launch_rover.sh` | Pi bring-up + `isaac_gui.py` (DINO+SAM+NavDP), real-world speed caps — the default real-body launcher |
+| `launch_rover_vitb.sh` | `launch_rover.sh` + `--depth-encoder vitb` (more accurate monocular depth, ~2x slower) |
+| `launch_rover_s2diff.sh` | `launch_rover.sh`'s same GUI/bring-up, but `nav_pipeline.s2diff_runner` — NavDP sampling routed through in-process S2Diff obstacle guidance instead of `isaac_gui.py`'s plain DDPM sampler |
+| `launch_rover_s2diff_http.sh` | Same GUI again, but NavDP sampling routed over HTTP to a separately-started `tryout/navdp_s2diff_server.py` instead of running in-process — needs that server already running |
+| `launch_rover_vitb_s2diff.sh` | `launch_rover_s2diff.sh` + `--depth-encoder vitb` (both experimental changes at once) |
+| `launch_rover_remind.sh` | Pi bring-up + REMIND live server (own conda env) + `remind_gui.py` — persistent per-object ID targeting instead of a bare DINO phrase |
+| `launch_rover_home.sh` | Thin wrapper around `launch_bot.sh` — manual control + Go Home, kept for backward-compatible muscle memory |
+| `launch_bot.sh` | Manual control + Go Home (`home_gui.py`) on either backend; `--enable-obstacle-avoidance` opts into full NavDP-guided homing |
+| `launch_odom_test.sh` | Pi bring-up (no camera) + `scripts/odom_accuracy_gui.py` — dead-reckoned odometry vs. hand-measured ground truth, no perception/policy models loaded |
+| `launch_dino_navdp.sh` | Headless `zenoh_node.py` only — does **not** bring the Pi up itself, use this when the Pi/Isaac/LanderPi side is already running separately |
+| `launch_gui.sh` | Isaac Sim GUI (`isaac_gui.py`, sim speed caps) — no Pi bring-up, needs the Isaac scene + its own ROS 2 bridge already running |
+| `launch_hiwonder_dualvln.sh` | LanderPi bring-up + InternVLA-N1's native DualVLN dual-system (`reference/internvla_dualvln_zenoh_node.py`) instead of the DINO+NavDP stack — suited to long, compound, multi-landmark instructions; see its own header comment |
+| `_backend.sh` | Not a launcher — sourced by all of the above for `--rover`/`--hiwonder` parsing and Pi bring-up |
 
 ### `nav_pipeline/` — the package
 
@@ -331,9 +405,14 @@ Nav_new/
 - `object_query.py` — resolves free-text ("go to the chair near the window") to a specific `object_id` via cached CLIP image embeddings + `relational_target.py`'s parsers, ranked by remembered world position (see [Object-persistent targeting](#object-persistent-targeting-remind))
 - `pipeline.py` — the full perception→policy step, state machine, trajectory selection (the diagram above, as code); also owns the `GOTO` blind-navigate-back state (`external_goal` argument to `step()`)
 - `isaac_gui.py` — the control panel: camera + mask/bbox overlay, top-down trajectories + obstacles, live target entry
-- `remind_gui.py` — REMIND-backed variant of `isaac_gui.py`: ID-only persistent-object targeting instead of a bare DINO phrase, launched via `./launch_rover_remind.sh` (see [Object-persistent targeting](#object-persistent-targeting-remind))
+- `remind_gui.py` — REMIND-backed variant of `isaac_gui.py`: ID-only persistent-object targeting instead of a bare DINO phrase, launched via `./LAUNCH/launch_rover_remind.sh` (see [Object-persistent targeting](#object-persistent-targeting-remind))
+- `remind_gui_vlm.py` — `remind_gui.py` plus a VLM (InternVL) arrival confirmation gate on top of the metric `stop_distance` trigger (`VLMArrivalGate`), launched via `./launch_rover_remind_vlm.sh` (repo root)
 - `remind_client.py` / `remind_target.py` — HTTP client for the REMIND live server (`REMIND/remind-reid-tracker/scripts/live_server.py`) and its "ID <n>" target-text parser
-- `home_gui.py` — manual control + Go Home panel; camera-free/no-GPU by default (fused encoder+IMU pose only), or opt into NavDP obstacle avoidance for the homing leg via `--enable-obstacle-avoidance`, launched via `./launch_rover_home.sh` (see [Manual control + Go Home](#manual-control--go-home))
+- `home_gui.py` — manual control + Go Home panel; camera-free/no-GPU by default (fused encoder+IMU pose only), or opt into NavDP obstacle avoidance for the homing leg via `--enable-obstacle-avoidance`, launched via `./LAUNCH/launch_bot.sh` / `./LAUNCH/launch_rover_home.sh` (see [Manual control + Go Home](#manual-control--go-home))
+- `s2diff_navdp.py`, `s2diff_runner.py` — in-process S2Diff obstacle-guided NavDP sampling and its `isaac_gui.py`-equivalent runner, launched via `LAUNCH/launch_rover_s2diff.sh` (see `tryout/S2DIFF_GUIDANCE.md`)
+- `s2diff_http_client.py`, `s2diff_http_runner.py` — same S2Diff guidance, but sampling delegated over HTTP to `tryout/navdp_s2diff_server.py` instead of running in-process, launched via `LAUNCH/launch_rover_s2diff_http.sh`
+- `scene_tagger.py` — passive open-vocabulary object-inventory tagging (broad Grounding DINO vocabulary, ~1 Hz, independent of the current goal), called from `pipeline.py`, logged to `scene_log/` (own README)
+- `dinov2_embedder.py` — DINOv2 appearance descriptors used by REMIND-adjacent re-identification/appearance-similarity checks
 - `zenoh_node.py` — headless transport node, same Zenoh/CDR contract as the old OmniVLA node
 
 ### `checkpoints/`
@@ -357,7 +436,7 @@ where noted:
 - `test_footprint_guard.py` — unit test for the footprint-swept clearance math
 - `test_belief_vs_frozen.py` — synthetic comparison of belief vs. frozen-goal occlusion handling (see [Goal belief](#goal-belief-surviving-occlusion))
 - `test_belief_integration.py` — exercises the belief wiring inside a real `DinoNavDPPipeline`
-- `odom_accuracy_gui.py` — standalone GUI (no perception/policy models) for measuring real-rover dead-reckoned odometry drift against hand-measured ground truth; launched via `./launch_odom_test.sh`
+- `odom_accuracy_gui.py` — standalone GUI (no perception/policy models) for measuring real-rover dead-reckoned odometry drift against hand-measured ground truth; launched via `./LAUNCH/launch_odom_test.sh`
 - `demo_odom_accuracy_gui.py` — offline/no-hardware demo of the odometry-accuracy GUI's plotting
 - `extract_navdp_weights.py` — pulls the 198 MB NavDP head out of the 16 GB InternVLA-N1 checkpoint
 - `pi_install_services.sh` / `pi_auto_handshake.sh` — run **on the Pi**: install the camera/agent/zenoh systemd services and recover a wedged ESP32 micro-ROS session without a physical reset button
@@ -406,16 +485,46 @@ navigation (object-location memory, navigate-back, free-text targeting —
 also summarized in [Object-persistent targeting](#object-persistent-targeting-remind)
 above), and [REMIND/remind-reid-tracker/README.md](REMIND/remind-reid-tracker/README.md)
 for the tracker itself (SAM detection backend, BLIP/InternVL captioning,
-the live server's API).
+the live server's API, and the `/confirm_arrival` VLM endpoint used by
+`remind_gui_vlm.py`).
+
+### `landerpi/`
+
+The Hiwonder LanderPi integration: `bridge.py` (the only file added to the
+robot, running inside Hiwonder's own untouched `armpi_pro` Docker container)
+and `deploy_bridge.sh` (copies it over and starts it). Selected via
+`--hiwonder` on any `LAUNCH/*.sh` script (see
+[The `--rover`/`--hiwonder` backend flag](#the---rover----hiwonder-backend-flag)
+above). Full detail — including the real per-wheel-encoder + BNO055 odometry
+story and known caveats around the carried-over steering constants and the
+spec-sheet (not tape-measured) footprint — in
+[landerpi/README.md](landerpi/README.md).
+
+### `tryout/`
+
+Experimental, opt-in S2Diff in-loop obstacle guidance for NavDP's diffusion
+sampler: instead of sampling 32 unguided DDPM trajectories and picking one
+via the clearance-veto + critic gate (the default path, see the top diagram),
+the caller supplies obstacle pixels and every one of NavDP's 10 DDPM
+denoising steps is nudged by a safety/stability/cost energy computed from
+them. `pipeline.py`'s own obstacle veto/hard-stop/anti-oscillation logic is
+unchanged and still has final say either way. Two ways to run it —
+in-process (`nav_pipeline/s2diff_navdp.py`, via `LAUNCH/launch_rover_s2diff.sh`)
+or over HTTP against a standalone `tryout/navdp_s2diff_server.py`
+(via `LAUNCH/launch_rover_s2diff_http.sh`) — neither touches the plain
+`launch_rover.sh` path. Full mechanics in `tryout/S2DIFF_GUIDANCE.md`.
 
 ## Running it
 
 ```bash
 # Real rover (Pi bringup + GUI, real-world speed caps)
-./launch_rover.sh
+./LAUNCH/launch_rover.sh
+
+# Hiwonder LanderPi -- same GUI/pipeline, different Pi bring-up + speed caps
+./LAUNCH/launch_rover.sh --hiwonder
 
 # Isaac Sim digital twin (needs the Isaac scene + ROS 2 bridge already running)
-./launch_gui.sh --target "cardboard box"
+./LAUNCH/launch_gui.sh --target "cardboard box"
 
 # Mars habitat sim (spins up both the sim node and the GUI for you)
 ./MARS/launch_mars.sh --rocks
@@ -424,27 +533,40 @@ the live server's API).
 ./EARTH/launch_earth.sh --target "target sign"
 
 # Headless node only (no GUI), auto-discovers the rover/Isaac peer
-./launch_dino_navdp.sh --target "trash bin"
-./launch_dino_navdp.sh --pi-ip <PI_IP> --target "door"
+./LAUNCH/launch_dino_navdp.sh --target "trash bin"
+./LAUNCH/launch_dino_navdp.sh --pi-ip <PI_IP> --target "door"
 
 # Real-rover odometry accuracy check (no camera/DINO/SAM/NavDP -- see
 # "Goal belief" below for why this matters)
-./launch_odom_test.sh <PI_IP>
+./LAUNCH/launch_odom_test.sh <PI_IP>
 
 # Real-rover manual control + Go Home (no camera/DINO/SAM/NavDP by default -- see
 # "Manual control + Go Home" below; add --enable-obstacle-avoidance to opt in)
-./launch_rover_home.sh <PI_IP>
+./LAUNCH/launch_rover_home.sh <PI_IP>
 
 # Real-rover object-persistent targeting via REMIND (brings up its own live
 # server too -- see "Object-persistent targeting (REMIND)" below)
-./launch_rover_remind.sh <PI_IP>
+./LAUNCH/launch_rover_remind.sh <PI_IP>
+
+# Same, but with a VLM (InternVL) confirming arrival on top of the metric trigger
+./launch_rover_remind_vlm.sh <PI_IP>
+
+# S2Diff obstacle-guided NavDP sampling (experimental, see tryout/ above)
+./LAUNCH/launch_rover_s2diff.sh <PI_IP>
+
+# LanderPi + InternVLA-N1's native DualVLN dual-system, long compound instructions
+./LAUNCH/launch_hiwonder_dualvln.sh --instruction "go through the doorway and stop by the closet"
 ```
+
+Full flag-by-flag combinations for every `LAUNCH/*.sh` script are in
+[priyan.md](priyan.md).
 
 Change the target at runtime by publishing `std_msgs/String` on
 `omnivla/goal_text` — no restart needed.
 
 Only ever run **one** controller against a given peer at a time
-(`isaac_gui.py`, `mars_gui.py`, `zenoh_node.py`, `home_gui.py`, `remind_gui.py`
+(`isaac_gui.py`, `mars_gui.py`, `earth_gui.py`, `zenoh_node.py`, `home_gui.py`,
+`remind_gui.py`, `remind_gui_vlm.py`, `s2diff_runner.py`, `s2diff_http_runner.py`
 all publish `cmd_vel` and will fight each other for it).
 
 ### Zenoh transport contract (mostly unchanged from the OmniVLA project this was distilled from)

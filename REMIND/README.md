@@ -40,17 +40,30 @@ nav_pipeline.remind_gui  --(JPEG frame, HTTP POST /infer)-->  remind-reid-tracke
                           <--(object_id, bbox, mask, class_name)--
 ```
 
-`launch_rover_remind.sh` brings both up together: Pi camera/ESP32/Zenoh
-bring-up identical to `launch_rover.sh`, then the REMIND live server as a
-background process in `REMIND/remind-reid-tracker/.venv`, then
-`nav_pipeline.remind_gui`.
+`LAUNCH/launch_rover_remind.sh` brings both up together: Pi camera/ESP32/Zenoh
+bring-up identical to `LAUNCH/launch_rover.sh` (real rover or, via
+`--hiwonder`, the Hiwonder LanderPi — see the root README's
+[backend-flag section](../README.md#the---rover----hiwonder-backend-flag)),
+then the REMIND live server as a background process in
+`REMIND/remind-reid-tracker/.venv`, then `nav_pipeline.remind_gui`.
 
 ```bash
-./launch_rover_remind.sh [PI_IP]
+./LAUNCH/launch_rover_remind.sh [PI_IP]
 ```
 
-Real rover only (needs the Pi camera stream) — there's no Isaac/MARS/EARTH
-equivalent of this launcher.
+Real rover / LanderPi only (needs a live camera stream) — there's no
+Isaac/MARS/EARTH equivalent of this launcher.
+
+**VLM-confirmed arrival variant:** `./launch_rover_remind_vlm.sh` (repo
+root) is identical bring-up but launches `nav_pipeline.remind_gui_vlm`
+instead of `remind_gui`: the same 1.5 m depth-based `stop_distance` still
+zeroes velocity every tick, but "arrived" is only declared once REMIND's
+already-loaded InternVL model confirms it from the live camera frame, via
+the live server's `/confirm_arrival` endpoint (see
+[remind-reid-tracker/README.md](remind-reid-tracker/README.md)). Falls back
+to the plain metric-only behavior if that endpoint is unavailable;
+`--no-vlm-confirm` forces the same fallback deliberately, for an A/B
+comparison against `launch_rover_remind.sh`.
 
 ## `nav_pipeline/remind_client.py` / `remind_target.py`
 
