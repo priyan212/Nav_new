@@ -7,7 +7,10 @@ so the Pi rover / Isaac Sim side is unchanged:
 Subscribes (Zenoh, CDR ROS 2 msgs):
   image_raw, rt/image_raw, rover_camera, rt/rover_camera     - sensor_msgs/Image
   image_raw/compressed, rt/image_raw/compressed              - sensor_msgs/CompressedImage
-  depth_raw, rt/depth_raw                                    - sensor_msgs/Image (32FC1 m) [optional]
+  depth_raw, rt/depth_raw                                    - sensor_msgs/Image (32FC1 m, 16UC1 mm,
+                                                                 or custom "png16" PNG-compressed 16UC1
+                                                                 mm -- see scripts/realsense_direct_
+                                                                 publisher.py) [optional]
   image_raw/camera_info, rt/image_raw/camera_info            - sensor_msgs/CameraInfo [optional]
   omnivla/goal_text                                          - std_msgs/String (target phrase)
 Publishes (Zenoh, CDR):
@@ -164,6 +167,31 @@ def parse_image(cdr_data: bytes) -> Optional[np.ndarray]:
             return (img.reshape(height, width).astype(np.float32) / 1000.0)
         except ValueError:
             return None
+    if enc == "png16":
+        # PNG-compressed uint16 depth (mm) -- custom encoding used by
+        # scripts/realsense_direct_publisher.py (the raw-SDK Pi-side
+        # publisher, see its module docstring for why it exists). Published
+        # at HALF color's pixel dimensions (measured 2026-08-13: full-res
+        # PNG averaged ~210KB/msg vs color JPEG's ~24KB/msg and lost most
+        # messages over Wi-Fi even rate-capped; halving the pixel count
+        # cuts PNG size ~4x). height/width read above are the ENCODED
+        # (halved) dims here, not the final ones -- upsample back to
+        # color's resolution with nearest-neighbor (no invented values
+        # across real depth edges) so isaac_gui.py's/zenoh_node.py's
+        # depth.shape==rgb.shape freshness gate still passes. Hardcodes
+        # 640x480 as the target since that's this rig's fixed color
+        # profile (rgb_camera.color_profile in realsense_only_bringup.
+        # launch.py / realsense_direct_publisher.py) -- update both sides
+        # together if that resolution ever changes.
+        if cv2 is None:
+            return None
+        arr = np.frombuffer(pixel_data, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            return None
+        if img.shape != (480, 640):
+            img = cv2.resize(img, (640, 480), interpolation=cv2.INTER_NEAREST)
+        return (img.astype(np.float32) / 1000.0)
 
     img = np.frombuffer(pixel_data, dtype=np.uint8)
     try:
