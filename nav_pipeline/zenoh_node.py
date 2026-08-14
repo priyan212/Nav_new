@@ -319,8 +319,11 @@ class DinoNavDPZenohNode:
     # alone would have tripped it in 70 separate 15s windows, peak 493deg
     # turned for 0.36m net travel -- real-rover runs currently have NO
     # protection against this at all.
-    SPIN_WINDOW_S = 15.0
-    SPIN_ROT_THRESH_RAD = 2.0 * np.pi
+    # Loosened 2026-08-14 in lockstep with isaac_gui.py's copy (15s/1 turn ->
+    # 20s/1.5 turns) at user request -- see isaac_gui.py's comment for why
+    # this still catches the documented incident.
+    SPIN_WINDOW_S = 20.0
+    SPIN_ROT_THRESH_RAD = 3.0 * np.pi
     SPIN_DIST_THRESH_M = 0.3
 
     def __init__(self, session: zenoh.Session, pipeline: DinoNavDPPipeline, target: str, predict_hz: float,

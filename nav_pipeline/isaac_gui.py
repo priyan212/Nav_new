@@ -24,6 +24,7 @@ import os
 import signal
 import sys
 import time
+import traceback
 from threading import Lock, Thread
 from typing import Optional
 
@@ -69,11 +70,15 @@ INTRINSICS_STALE_S = 5.0  # camera_info is static per session, no need for depth
 # physical object each time the tracked one scrolls out of frame, so the
 # rover keeps turning the same way chasing "whichever chair is now in view"
 # without ever closing distance on one -- a real 145s/17-turn incident this
-# caught via odometry_log. If it racks up more than a full turn within this
-# window while translating less than SPIN_DIST_THRESH_M, force a stop instead
-# of spinning indefinitely; latched until a new target is sent.
-SPIN_WINDOW_S = 15.0
-SPIN_ROT_THRESH_RAD = 2.0 * np.pi
+# caught via odometry_log. If it racks up more than SPIN_ROT_THRESH_RAD within
+# this window while translating less than SPIN_DIST_THRESH_M, force a stop
+# instead of spinning indefinitely; latched until a new target is sent.
+# Loosened 2026-08-14 (15s/1 turn -> 20s/1.5 turns) at user request -- more
+# slack for a single legitimate reacquire swing to complete before being
+# judged a stall. Still reliably catches the documented incident: 17 turns
+# in 145s is ~2.3 turns per any 20s window, well past the new 1.5-turn bar.
+SPIN_WINDOW_S = 20.0
+SPIN_ROT_THRESH_RAD = 3.0 * np.pi
 SPIN_DIST_THRESH_M = 0.3
 
 
@@ -462,6 +467,22 @@ class App:
     def refresh(self):
         if self.closed:
             return
+        try:
+            self._refresh_body()
+        except Exception:
+            # A single bad frame/detection/mask must never permanently kill
+            # this self-rescheduling redraw loop -- before this guard, any
+            # uncaught exception below silently froze the GUI (camera image
+            # AND status text both stop updating) while the inference/
+            # movement loop kept running fine in its own thread, with no
+            # visible error beyond a traceback in the launching terminal.
+            # Symptom this fixes: "GUI pauses on one frame mid run."
+            traceback.print_exc()
+        finally:
+            if not self.closed:
+                self.root.after(66, self.refresh)
+
+    def _refresh_body(self):
         with self.st.lock:
             # Show the freshest camera frame (updated on every Zenoh image,
             # i.e. the camera's native rate), not display_rgb (only updated
@@ -532,7 +553,6 @@ class App:
         fwd = f"   fwd-clear {min_fwd:.2f}m" if np.isfinite(min_fwd) else ""
         self.status.configure(text=f"[{mode_txt}]  target: {target_txt}   {vel_text}{fwd}")
         self.info.configure(text=f"frames {frames}   inferences {infers}   {lat}")
-        self.root.after(66, self.refresh)
 
 
 def main():

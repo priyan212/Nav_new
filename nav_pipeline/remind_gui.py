@@ -43,6 +43,7 @@ import os
 import signal
 import sys
 import time
+import traceback
 from threading import Lock, Thread
 from typing import List, Optional
 
@@ -669,6 +670,21 @@ class App:
     def refresh(self):
         if self.closed:
             return
+        try:
+            self._refresh_body()
+        except Exception:
+            # See isaac_gui.py's refresh() for why this guard exists: without
+            # it, a single uncaught exception here permanently kills this
+            # self-rescheduling redraw loop -- the GUI freezes on whatever
+            # was last drawn while the inference/movement loop keeps running
+            # fine in its own thread. Symptom this fixes: "GUI pauses on one
+            # frame mid run."
+            traceback.print_exc()
+        finally:
+            if not self.closed:
+                self.root.after(66, self.refresh)
+
+    def _refresh_body(self):
         with self.st.lock:
             rgb = self.st.latest_rgb if self.st.latest_rgb is not None else self.st.display_rgb
             det = self.st.detection
@@ -778,8 +794,6 @@ class App:
                 self.imu_status.configure(
                     text=f"⚠ IMU: NOT calibrated [{calib_txt}] -- tilt/rotate the rover until MAG >= "
                          f"{self.odom.imu_min_mag_calib} (currently driving theta from wheel encoders only)")
-
-        self.root.after(66, self.refresh)
 
 
 def main():

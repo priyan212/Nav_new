@@ -91,6 +91,26 @@ def _bbox_to_pixel_grid(
     return pixels
 
 
+def _bbox_exclude_mask(box: np.ndarray, height: int, width: int) -> np.ndarray:
+    """Coarse (H,W) boolean mask, True inside a DINO box -- fallback obstacle-
+    exclusion region for depth_to_obstacle_points when no SAM mask is
+    available this tick (use_sam=False, SAM not due yet, cache IoU dropped,
+    or CLIP rejected the crop). Cheaper and less precise than a real SAM
+    mask (includes background inside the box), but strictly better than the
+    prior behavior of excluding nothing at all, which let the goal object's
+    own depth surface get read as an obstacle and trigger AVOID/trajectory
+    vetoes against the rover's own target -- see the exclude_mask call site's
+    comment in _step_inner."""
+    mask = np.zeros((height, width), dtype=bool)
+    x0 = max(0, int(np.floor(box[0])))
+    y0 = max(0, int(np.floor(box[1])))
+    x1 = min(width, int(np.ceil(box[2])))
+    y1 = min(height, int(np.ceil(box[3])))
+    if x1 > x0 and y1 > y0:
+        mask[y0:y1, x0:x1] = True
+    return mask
+
+
 @dataclass
 class PipelineConfig:
     device: str = "cuda:0"
@@ -1028,8 +1048,16 @@ class DinoNavDPPipeline:
         obstacle_pts = None
         if self.cfg.avoid_enabled:
             t0 = time.time()
+            # Prefer the real SAM mask; fall back to a coarse bbox exclusion
+            # so the goal object's own depth is still kept out of obstacle
+            # points when SAM is off/not-yet-run/stale/CLIP-rejected this
+            # tick, instead of excluding nothing at all (see
+            # _bbox_exclude_mask's docstring).
+            exclude_mask = res.mask
+            if exclude_mask is None and res.detection is not None:
+                exclude_mask = _bbox_exclude_mask(res.detection.box, H, W)
             obstacle_pts = depth_to_obstacle_points(
-                depth, fx, fy, cx, cy, self.cfg.guard, exclude_mask=res.mask
+                depth, fx, fy, cx, cy, self.cfg.guard, exclude_mask=exclude_mask
             )
             res.obstacle_points = obstacle_pts
             min_fwd, escape = forward_guard(obstacle_pts, self.cfg.guard)

@@ -74,20 +74,21 @@ backend_parse_args() {
         # launch_rover.sh's comment) -- real, measured tuning for this bot.
         BACKEND_MAX_ANGULAR=1.2
         BACKEND_ANGULAR_SLEW_MAX=0.10   # pipeline.py's own default, unchanged
-        # Set to 0.15 on 2026-08-14 at explicit user request, KNOWING this
-        # value was already tested and found to fail (2026-08-12): the ESP32
-        # firmware (esp32/rover_6wd_complete.ino) hard-zeros any per-wheel
-        # target below VEL_DEADBAND_MS=0.03 m/s, and SEARCH's pure rotation
-        # converts to a per-wheel target of angular_z * TRACK_WIDTH_M/2
-        # (0.345m track width) -- 0.15 lands at 0.026 m/s, under the
-        # deadband, so the firmware silently commands zero PWM and the rover
-        # does not spin during SEARCH. The hard minimum to clear the
-        # deadband is ~0.174 rad/s (0.03 * 2 / 0.345); 0.18 was the
-        # previously-validated working value. If SEARCH stops moving again,
-        # this is the first thing to suspect -- revert to 0.18 (or try
-        # 0.20 for more margin). See LAUNCH/launch_rover.sh's comment for
-        # the full derivation.
-        BACKEND_SEARCH_ANGULAR=0.15
+        # Set to 0.174 on 2026-08-14 at explicit user request -- this is the
+        # theoretical minimum, not a safety-margined value. The ESP32
+        # firmware (esp32/rover_6wd_complete.ino) hard-zeros (strict `<`,
+        # line 437) any per-wheel target below VEL_DEADBAND_MS=0.03 m/s, and
+        # SEARCH's pure rotation converts to a per-wheel target of
+        # angular_z * TRACK_WIDTH_M/2 (0.345m track width). 0.174 * 0.1725 =
+        # 0.030015 m/s -- clears the deadband by only ~0.000015 m/s
+        # (~0.05%), i.e. essentially zero margin against float rounding,
+        # encoder noise, or friction variance. If SEARCH doesn't move (or
+        # moves inconsistently) on this rover, this near-zero margin is the
+        # first thing to suspect -- 0.18 (0.031 m/s/wheel, ~3.5% margin) is
+        # the last value actually validated as reliably working; 0.15/0.13/
+        # 0.14 are all confirmed NOT to work (2026-08-12). See
+        # LAUNCH/launch_rover.sh's comment for the full derivation.
+        BACKEND_SEARCH_ANGULAR=0.174
     else
         BACKEND_DEFAULT_IP=10.47.234.228
         BACKEND_PI_PASS_DEFAULT=raspberrypi

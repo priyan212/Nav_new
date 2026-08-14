@@ -108,6 +108,7 @@ import signal
 import struct
 import sys
 import time
+import traceback
 from collections import deque
 from threading import Lock, Thread
 from typing import List, Optional, Tuple
@@ -324,8 +325,11 @@ RPM_STALE_S = 1.5
 # same import-weight reason as everything else in this file's module
 # docstring -- isaac_gui.py pulls in DinoNavDPPipeline unconditionally at
 # module level.
-NAVDP_SPIN_WINDOW_S = 15.0
-NAVDP_SPIN_ROT_THRESH_RAD = 2.0 * math.pi
+# Loosened 2026-08-14 in lockstep with isaac_gui.py's copy (15s/1 turn ->
+# 20s/1.5 turns) at user request -- see isaac_gui.py's comment for why this
+# still catches the documented incident.
+NAVDP_SPIN_WINDOW_S = 20.0
+NAVDP_SPIN_ROT_THRESH_RAD = 3.0 * math.pi
 NAVDP_SPIN_DIST_THRESH_M = 0.3
 
 
@@ -805,6 +809,21 @@ class App:
     def refresh(self):
         if self.closed:
             return
+        try:
+            self._refresh_body()
+        except Exception:
+            # See isaac_gui.py's refresh() for why this guard exists: without
+            # it, a single uncaught exception here permanently kills this
+            # self-rescheduling redraw loop -- the GUI freezes on whatever
+            # was last drawn while the homing loop keeps running fine in its
+            # own thread. Symptom this fixes: "GUI pauses on one frame mid
+            # run."
+            traceback.print_exc()
+        finally:
+            if not self.closed:
+                self.root.after(66, self.refresh)
+
+    def _refresh_body(self):
         with self.st.lock:
             x, y, theta = self.st.x, self.st.y, self.st.theta
             home = self.st.home
@@ -882,8 +901,6 @@ class App:
                      f"tilt/rotate the rover until magnetometer calib >={self.imu_min_mag_calib})")
         else:
             self.warn.configure(text=f"rpm samples: {rpm_count}   camera frames: {frame_count}")
-
-        self.root.after(66, self.refresh)
 
     def _dashed_line(self, x0, y0, x1, y1, fill, dash_len=8):
         length = math.hypot(x1 - x0, y1 - y0)
