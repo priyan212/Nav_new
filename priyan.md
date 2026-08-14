@@ -98,6 +98,7 @@ argparse (full flag list — these also apply to `launch_rover_vitb.sh`,
 | `--depth-encoder {vits,vitb}` | `vits` | monocular Depth-Anything-V2 size; `vitb` = more accurate, ~2x slower |
 | `--compressed-only` | off | forced on by the script (real Pi Wi-Fi can't take raw RGB) |
 | `--odometry-log-dir DIR` | `odometry_log` | where per-goal CSVs land |
+| `--imu-min-mag-calib INT` | `3` | IMU calibration digit (0-3) gating theta onto the IMU heading vs. wheel-diff dead reckoning (added 2026-08-14 — previously only `launch_bot.sh`/`home_gui.py` exposed this; every `OdometryLogger` caller does now) |
 | `--footprint-length M` | `0.482` | obstacle-guard footprint length |
 | `--footprint-width M` | `0.380` | obstacle-guard footprint width |
 
@@ -241,6 +242,7 @@ $BACKEND_ANGULAR_SLEW_MAX`, `--compressed-only`,
 | `--depth-encoder {vits,vitb}` | **`vitb`** (differs from `isaac_gui.py`'s `vits` default — accuracy feeds directly into STOP distance) | monocular depth size |
 | `--compressed-only` | off | forced on by the script |
 | `--odometry-log-dir DIR` | `odometry_log` | — |
+| `--imu-min-mag-calib INT` | `3` | IMU calibration digit (0-3) gating theta onto the IMU heading (added 2026-08-14, see launcher #1's row) — matters more here than most: `object_map.py`'s world-frame recall depends directly on theta accuracy across turns |
 | `--object-map-path PATH` | `object_map/object_map.json` | persistent world-location store |
 | `--goto-arrival-radius M` | `1.0` | blind `GOTO` giving-up radius |
 | `--match-grace-period S` | `1.2` | REMIND per-tick match-drop coasting window |
@@ -317,7 +319,7 @@ which is a thin wrapper around this script):
 | `--home-angular-slew-max` | `0.6` | rad/s² cap, 10 Hz loop |
 | `--home-dist-tol M` | `0.10` | stop-within distance for "at home" |
 | `--home-heading-tol DEG` | `5.0` | heading match tolerance for FACE→ARRIVED |
-| `--imu-min-mag-calib INT` | `3` | BNO055 magnetometer calibration gate (0-3) |
+| `--imu-min-mag-calib INT` | `3` | IMU calibration gate (0-3) — BNO055 magnetometer sub-score on `--hiwonder`, BNO085/BNO08x combined accuracy status on `--rover` (chip changed 2026-08-14, same 0-3 scale/gate) |
 | `--odometry-log-dir DIR` | `odometry_log` | — |
 | `--enable-obstacle-avoidance` | off | load full DINO+NavDP for the long homing leg (see README) |
 | `--compressed-only` | off | — |
@@ -376,6 +378,7 @@ DINO/SAM/NavDP/depth models loaded at all.
 | `--max-linear M/S` | `0.15` | overridden by the script |
 | `--max-angular RAD/S` | `1.2` | overridden by the script (`$BACKEND_MAX_ANGULAR`) |
 | `--odometry-log-dir DIR` | `odometry_log` | — |
+| `--imu-min-mag-calib INT` | `3` | IMU calibration digit (0-3) gating theta onto the IMU heading (added 2026-08-14, see launcher #1's row) — this tool exists specifically to measure odometry accuracy, so it's a natural place to A/B the gate itself |
 
 ```bash
 ./LAUNCH/launch_odom_test.sh                          # default rover, default Pi IP
@@ -410,6 +413,7 @@ behavior: no `--pi-ip` at all → Zenoh multicast discovery.
 | `--no-belief-goal` | off | — |
 | `--device STR` | `cuda:0` | — |
 | `--odometry-log-dir DIR` | `odometry_log` | — |
+| `--imu-min-mag-calib INT` | `3` | IMU calibration digit (0-3) gating theta onto the IMU heading (added 2026-08-14, see launcher #1's row) |
 | `--footprint-length M` | `0.482` | — |
 | `--footprint-width M` | `0.380` | — |
 
@@ -578,3 +582,5 @@ chair, couch, dining table, bed, potted plant, tv, laptop, mouse, keyboard,
 remote, cell phone, book, clock, vase, scissors, teddy bear, backpack,
 handbag, suitcase, umbrella, bottle, wine glass, cup, bowl, microwave, oven,
 toaster, sink, refrigerator, toilet, bench, person.
+
+Good bye.

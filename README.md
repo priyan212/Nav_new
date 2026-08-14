@@ -9,7 +9,7 @@ If you need any help contact through GitHub: priyan212
 Point a 6-wheeled rover at anything you can name — "trash bin", "red chair",
 "boulder" — and it drives there on its own, swerving around whatever's in the
 way. No LiDAR, a single RGB camera for perception — the only other sensing
-is the ESP32's signed wheel-encoder RPM feed plus a BNO055 IMU's fused
+is the ESP32's signed wheel-encoder RPM feed plus an IMU's fused
 heading (`/rover/rpm`), which the GPU side dead-reckons into a logged pose
 for diagnostics/safety (see [Odometry logging](#odometry-logging)) and for
 the standalone [manual control + Go Home](#manual-control--go-home) GUI, not
@@ -74,40 +74,47 @@ stop + escape turn) → `STOP` (goal close enough, or its mask fills the view).
 The real rover has no LiDAR and no dedicated odometry node, but the ESP32
 firmware (`esp32/rover_6wd_complete.ino`) does have real quadrature encoders
 on the mid wheel of each side, publishing signed L/R RPM on `/rover/rpm` (10
-Hz, +ve = drives forward), plus a BNO055 IMU (I2C, raw register access, no
-Adafruit library) fused into the same message as `imu_heading_deg` (absolute
-compass heading, NaN if the sensor never acked at boot) and `imu_calib`
-(packed `SYS*1000+GYR*100+ACC*10+MAG` calibration digits, 0-3 each).
+Hz, +ve = drives forward), plus an IMU fused into the same message as
+`imu_heading_deg` (absolute compass heading, NaN if the sensor never acked
+at boot) and `imu_calib` (packed `SYS*1000+GYR*100+ACC*10+MAG` calibration
+digits, 0-3 each). As of 2026-08-14 that IMU is an Adafruit BNO085/BNO080
+(STEMMA QT), talked to over Adafruit's `Adafruit_BNO08x` library (SHTP
+protocol — no raw-register shortcut exists for this chip, unlike its
+predecessor); it reports ONE combined 0-3 orientation-accuracy status
+(not separate per-axis sub-scores), which the firmware broadcasts into all
+four `imu_calib` digits for wire compatibility with everything below.
 `nav_pipeline/odometry_logger.py` dead-reckons that into a differential-drive
 pose (x, y, θ) and appends a CSV row per sample — x/y always come from
 encoder speed, but θ is taken directly from the IMU heading once the
-magnetometer digit reaches `imu_min_mag_calib` (default 3), instead of being
+calibration digit reaches `imu_min_mag_calib` (default 3), instead of being
 integrated from the wheel differential. That switch matters because
 skid-steer wheel-diff heading drifts sharply past ~135-165° of rotation
 (measured, `odometry_log/odom_accuracy_results.csv`) — wheel slip during
-in-place turns is exactly what the encoders can't see, while the BNO055's
-onboard sensor fusion has no such accumulating drift once its magnetometer
-is calibrated. No GPS/SLAM involved either way, so it still drifts over long
-runs without a calibrated IMU, but it's good enough for per-attempt
-diagnostics.
+in-place turns is exactly what the encoders can't see, while the IMU's
+onboard sensor fusion has no such accumulating drift once it's calibrated.
+No GPS/SLAM involved either way, so it still drifts over long runs without a
+calibrated IMU, but it's good enough for per-attempt diagnostics.
 
-**"Calibrated" is not the same as accurate at low thresholds.** The
-BNO055's magnetometer sub-score only needs to reach 1 (out of 0-3) to be
-trusted by the BNO055's own internal fusion state machine, which is a low
-bar — with real magnetic interference nearby (motors, wiring, metal
-furniture), the reported heading can still swing 100+ degrees while sitting
-completely still at that level (reproduced 2026-08-06: a stationary rover's
-heading jumped ~176° at `mag=2`). `imu_min_mag_calib` therefore now
-**defaults to 3**, Bosch's own bar for a trustworthy absolute heading,
-rather than requiring the flag to be passed manually; if it never reaches 3
-in a given room, that's a real environment/mounting issue; the odometry
-falls back to wheel-diff dead reckoning (with its own, better-understood
-drift) until it does, rather than trusting a low-confidence heading. The
-firmware also now persists the calibration offset profile to flash the
-first time it reaches full calibration each boot (see the IMU note in
-`rover_6wd_complete.ino`'s header, confirmed surviving a real reset
-2026-08-06), so the manual wave-around calibration dance is only needed
-once per physical environment, not every power-cycle.
+**"Calibrated" is not the same as accurate at low thresholds.** The old
+BNO055's magnetometer sub-score only needed to reach 1 (out of 0-3) to be
+trusted by its own internal fusion state machine, which was a low bar — with
+real magnetic interference nearby (motors, wiring, metal furniture), the
+reported heading could still swing 100+ degrees while sitting completely
+still at that level (reproduced 2026-08-06: a stationary rover's heading
+jumped ~176° at `mag=2`). `imu_min_mag_calib` therefore **defaults to 3**
+rather than requiring the flag to be passed manually — the current BNO085's
+single accuracy status uses the same 0-3 scale (3 = its own bar for a
+trustworthy absolute heading), so the same default and the same reasoning
+still apply, though this hasn't been separately stress-tested against
+magnetic interference on the new chip yet. If it never reaches 3 in a given
+room, that's a real environment/mounting issue; the odometry falls back to
+wheel-diff dead reckoning (with its own, better-understood drift) until it
+does, rather than trusting a low-confidence heading. Calibration
+persistence also changed with the chip: the BNO085's own SH-2 firmware owns
+it in its own internal flash (`sh2_setDcdAutoSave(true)`) instead of the
+old BNO055 code's ESP32-side NVS blob — same end result (the manual
+wave-around calibration dance is only needed once per physical environment,
+not every power-cycle), simpler mechanism.
 
 - **One file per goal, not per run.** Every time the target text changes
   (GUI Send/preset button, or a new `omnivla/goal_text` message), the logger
@@ -400,7 +407,7 @@ combinations for every one of these live in [priyan.md](priyan.md).
 - `depth_estimator.py` — Depth Anything V2 metric monocular depth for the RGB-only real rover
 - `goal_utils.py` — preprocessing + bbox→3D-goal math
 - `goal_belief.py` — ego-motion propagation of the tracked goal point while it's out of view, instead of freezing it (see [Goal belief](#goal-belief-surviving-occlusion))
-- `odometry_logger.py` — dead-reckons `/rover/rpm` (real wheel-encoder RPM + BNO055 IMU heading) into a pose, continuous across goals (one CSV per goal under `odometry_log/`, but the pose itself doesn't re-zero); also backs the GUI's spin-stall watchdog (see [Odometry logging](#odometry-logging))
+- `odometry_logger.py` — dead-reckons `/rover/rpm` (real wheel-encoder RPM + IMU heading) into a pose, continuous across goals (one CSV per goal under `odometry_log/`, but the pose itself doesn't re-zero); also backs the GUI's spin-stall watchdog (see [Odometry logging](#odometry-logging))
 - `object_map.py` — persistent per-object-ID world-location memory (`local_to_world`/`world_to_local` against the continuous odometry pose), backing REMIND [navigate-back](#object-persistent-targeting-remind); persisted to `object_map/object_map.json`
 - `object_query.py` — resolves free-text ("go to the chair near the window") to a specific `object_id` via cached CLIP image embeddings + `relational_target.py`'s parsers, ranked by remembered world position (see [Object-persistent targeting](#object-persistent-targeting-remind))
 - `pipeline.py` — the full perception→policy step, state machine, trajectory selection (the diagram above, as code); also owns the `GOTO` blind-navigate-back state (`external_goal` argument to `step()`)
@@ -446,14 +453,17 @@ where noted:
 Micro-ROS firmware for the 6-wheel differential drive base
 (`rover_6wd_complete.ino`, subscribes `/cmd_vel`, publishes `/rover/rpm` —
 signed L/R wheel RPM from the real quadrature encoders on each side's mid
-wheel, plus BNO055 IMU fused heading (`imu_heading_deg`) and calibration
-status (`imu_calib`), 10 Hz, consumed by `nav_pipeline/odometry_logger.py`;
+wheel, plus IMU fused heading (`imu_heading_deg`) and calibration status
+(`imu_calib`), 10 Hz, consumed by `nav_pipeline/odometry_logger.py`;
 `WHEEL_RADIUS_M` / `TRACK_WIDTH_M` must stay in sync between the two), plus
 Pi-side helpers (`rover_handshake_manager.py`, `serial_bridge.py`) for
-talking to the ESP32 over `/dev/ttyUSB0`. The BNO055 talks raw I2C register
-access (GPIO21 SDA / GPIO22 SCL, no Adafruit library dependency) — `NaN` in
-`imu_heading_deg` means the sensor never acked its chip ID at boot (check
-wiring), not a runtime fault.
+talking to the ESP32 over `/dev/ttyUSB0`. The IMU is an Adafruit
+BNO085/BNO080 (STEMMA QT, GPIO21 SDA / GPIO22 SCL) as of 2026-08-14,
+talked to via the `Adafruit_BNO08x` library (SHTP protocol, replacing an
+earlier BNO055's raw-register access) — `NaN` in `imu_heading_deg` means
+the sensor never acked at boot (check wiring/power; see `FLASHING.md`'s
+library-dependency note and this firmware's own bench checklist), not a
+runtime fault.
 
 ### `MARS/`
 

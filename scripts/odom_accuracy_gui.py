@@ -315,9 +315,15 @@ def main():
     ap.add_argument("--max-linear", type=float, default=0.15)
     ap.add_argument("--max-angular", type=float, default=1.2)
     ap.add_argument("--odometry-log-dir", type=str, default="odometry_log")
+    ap.add_argument("--imu-min-mag-calib", type=int, default=3,
+                    help="IMU calibration digit (0-3) required before theta rides the IMU "
+                         "heading instead of wheel-diff dead reckoning -- see OdometryLogger. "
+                         "This tool exists specifically to measure odometry accuracy, so "
+                         "lowering it here is one way to see how much the IMU gate itself "
+                         "is costing/buying accuracy vs. wheel-diff-only.")
     args = ap.parse_args()
 
-    odom = OdometryLogger(args.odometry_log_dir)
+    odom = OdometryLogger(args.odometry_log_dir, imu_min_mag_calib=args.imu_min_mag_calib)
 
     config = zenoh.Config()
     if args.pi_ip:

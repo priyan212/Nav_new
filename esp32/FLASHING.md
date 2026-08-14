@@ -3,7 +3,8 @@
 The ESP32 is wired to the **Raspberry Pi's** `/dev/ttyUSB0`, not to the GPU
 machine, so flashing is a compile-locally → copy-to-Pi → flash-via-SSH
 workflow, not a direct USB upload. Confirmed working end-to-end 2026-08-06
-(BNO055 calibration-persistence firmware update).
+(BNO055 calibration-persistence firmware update) and again 2026-08-14
+(BNO055 → BNO085 IMU rewrite, see step 1's library note below).
 
 ## 1. Compile locally on the GPU machine
 
@@ -34,6 +35,24 @@ This produces `rover_6wd_complete.ino.bin` / `.bootloader.bin` /
 `.partitions.bin` in `build.path`. `boot_app0.bin` is a fixed OTA-selector
 stub that doesn't change between builds — reuse the one already on the Pi
 (see step 2) instead of hunting for it locally.
+
+**Library dependency (added 2026-08-14, BNO085 rewrite):** the sketch now
+`#include <Adafruit_BNO08x.h>`, which is NOT bundled with the ESP32 core or
+`micro_ros_arduino` — unlike everything else this sketch uses. If
+`~/Arduino/libraries/` on the GPU machine doesn't already have
+`Adafruit_BNO08x`, `Adafruit_BusIO`, and `Adafruit_Sensor`, the compile
+fails with a missing-header error. Install once with:
+
+```bash
+cd ~/Arduino/libraries
+git clone --depth 1 https://github.com/adafruit/Adafruit_BNO08x.git
+git clone --depth 1 https://github.com/adafruit/Adafruit_BusIO.git
+git clone --depth 1 https://github.com/adafruit/Adafruit_Sensor.git
+```
+
+No version pin exists for these yet (unlike `micro_ros_arduino`'s pinned
+install) — if a future recompile behaves differently, check what commit is
+actually checked out in each of these three directories first.
 
 ## 2. Copy the 3 new artifacts to the Pi
 
@@ -90,10 +109,9 @@ Should show live `[left_rpm, right_rpm, imu_heading_deg, imu_calib]` data.
 
 ## Resetting the ESP32 without reflashing
 
-To force a clean reboot (e.g. to test NVS-persisted state like the BNO055
-calibration offsets) without writing new firmware, stop the agent and run
-esptool with a no-op command — `chip_id` just connects (which resets into
-the bootloader) and then hard-resets back into the app via
+To force a clean reboot without writing new firmware, stop the agent and
+run esptool with a no-op command — `chip_id` just connects (which resets
+into the bootloader) and then hard-resets back into the app via
 `--after hard_reset`:
 
 ```bash
@@ -103,9 +121,13 @@ sudo esptool --chip esp32 --port /dev/ttyUSB0 \
 sudo systemctl restart rover-agent
 ```
 
-Confirmed working 2026-08-06: used this to verify BNO055 calibration
-offsets survive a reset — `acc` calibration jumped straight to 3 on reboot
-instead of requiring the full pose dance again.
+Confirmed working 2026-08-06: used this to verify the (then-current) BNO055
+calibration offsets survived a reset — `acc` calibration jumped straight to
+3 on reboot instead of requiring the full pose dance again. As of the
+2026-08-14 BNO085 rewrite, calibration persistence works differently (the
+sensor's own SH-2 firmware owns it in its own flash via
+`sh2_setDcdAutoSave(true)`, not ESP32-side NVS) — this reset trick still
+works to force a clean reboot, just via a different underlying mechanism.
 
 ## Known flakiness
 

@@ -115,6 +115,13 @@ class SharedState:
         self.obstacles = None
         self.min_forward = float("inf")
         self.infer_count = 0
+        # IMU status (see zenoh_node.py's on_rpm) -- surfaced in the info bar
+        # so an operator can see whether pose/goal-belief tracking is
+        # currently riding the IMU heading or has fallen back to wheel-diff,
+        # same fields home_gui.py/remind_gui.py already show.
+        self.imu_heading_deg = float("nan")
+        self.imu_calib = 0.0
+        self.theta_source = "enc"
 
 
 def zenoh_setup(session: zenoh.Session, st: SharedState, compressed_only: bool = False,
@@ -170,12 +177,18 @@ def zenoh_setup(session: zenoh.Session, st: SharedState, compressed_only: bool =
                 # Dropping data[2:] here (as this used to) meant IMU calib
                 # never reached OdometryLogger, so callers of zenoh_setup()
                 # (remind_gui.py, this file) always showed "no data received
-                # yet" regardless of actual BNO055 calibration state.
+                # yet" regardless of actual IMU calibration state.
                 imu_heading = data[2] if len(data) >= 4 else None
                 imu_calib = data[3] if len(data) >= 4 else None
                 lateral = data[4] if len(data) >= 5 else None
                 odom.update(data[0], data[1], imu_heading_deg=imu_heading,
                             imu_calib=imu_calib, lateral_m_s=lateral)
+                with st.lock:
+                    st.theta_source = odom.theta_source
+                    if imu_heading is not None:
+                        st.imu_heading_deg = imu_heading
+                    if imu_calib is not None:
+                        st.imu_calib = imu_calib
         except Exception as e:
             print(f"[WARN] rpm parse failed: {e}")
 
@@ -502,6 +515,7 @@ class App:
             frames, infers, target = self.st.frame_count, self.st.infer_count, self.st.target
             drive_mode = self.st.mode
             stopped = self.st.stopped
+            imu_heading, imu_calib, theta_source = self.st.imu_heading_deg, self.st.imu_calib, self.st.theta_source
 
         if rgb is not None:
             frame = rgb
@@ -552,7 +566,10 @@ class App:
         target_txt = "manual drive" if drive_mode == "manual" else f"'{target}'"
         fwd = f"   fwd-clear {min_fwd:.2f}m" if np.isfinite(min_fwd) else ""
         self.status.configure(text=f"[{mode_txt}]  target: {target_txt}   {vel_text}{fwd}")
-        self.info.configure(text=f"frames {frames}   inferences {infers}   {lat}")
+        heading_txt = f"{imu_heading:.1f}°" if np.isfinite(imu_heading) else "n/a"
+        imu_txt = (f"theta src: {theta_source}   imu heading {heading_txt}"
+                   f"  calib [{OdometryLogger.decode_calib(imu_calib)}]")
+        self.info.configure(text=f"frames {frames}   inferences {infers}   {lat}   {imu_txt}")
 
 
 def main():
@@ -615,6 +632,10 @@ def main():
                     help="subscribe only the JPEG camera stream (REQUIRED over rover Wi-Fi)")
     ap.add_argument("--odometry-log-dir", type=str, default="odometry_log",
                     help="dead-reckoned pose CSV log dir (from /rover/rpm)")
+    ap.add_argument("--imu-min-mag-calib", type=int, default=3,
+                    help="IMU calibration digit (0-3) required before theta rides the IMU "
+                         "heading instead of wheel-diff dead reckoning -- see OdometryLogger. "
+                         "Was only exposed on home_gui.py before; same default/semantics here.")
     ap.add_argument("--footprint-length", type=float, default=GuardConfig().footprint_length,
                     help="robot length (m) for obstacle_guard's swept-footprint clearance -- "
                          "defaults to the ESP32 rover's real size, override for a different robot "
@@ -649,7 +670,7 @@ def main():
     st.avoid = args.avoid
     st.max_linear = args.max_linear
     st.max_angular = args.max_angular
-    odom = OdometryLogger(args.odometry_log_dir)
+    odom = OdometryLogger(args.odometry_log_dir, imu_min_mag_calib=args.imu_min_mag_calib)
     _subs, pubs = zenoh_setup(session, st, compressed_only=args.compressed_only, odom=odom)
     running = {"on": True}
 

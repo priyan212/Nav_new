@@ -377,6 +377,11 @@ def main():
                          "metric_hypersim_vitb.pth (scripts/download_models.py --depth-encoder vitb)")
     ap.add_argument("--compressed-only", action="store_true")
     ap.add_argument("--odometry-log-dir", type=str, default="odometry_log")
+    ap.add_argument("--imu-min-mag-calib", type=int, default=3,
+                    help="IMU calibration digit (0-3) required before theta rides the IMU "
+                         "heading instead of wheel-diff dead reckoning -- see OdometryLogger. "
+                         "Matters more here than most callers: object_map.py's world-frame "
+                         "recall directly depends on theta accuracy across turns.")
     ap.add_argument("--object-map-path", type=str, default="object_map/object_map.json",
                     help="persistent id->world-location store (object_map.py); survives GUI "
                          "restarts within the same room/building, but is NOT safe to trust "
@@ -454,7 +459,7 @@ def main():
     st = SharedState(args.target)
     st.max_linear = args.max_linear
     st.max_angular = args.max_angular
-    odom = OdometryLogger(args.odometry_log_dir)
+    odom = OdometryLogger(args.odometry_log_dir, imu_min_mag_calib=args.imu_min_mag_calib)
     object_map = ObjectMap(args.object_map_path)
     _subs, pubs = zenoh_setup(session, st, compressed_only=args.compressed_only, odom=odom)
     running = {"on": True}

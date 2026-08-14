@@ -106,9 +106,15 @@ class OdometryLogger:
 
     @staticmethod
     def decode_calib(imu_calib: Optional[float]) -> str:
-        """Unpack the BNO055 calib byte (sys*1000 + gyr*100 + acc*10 + mag,
-        see esp32/rover_6wd_complete.ino) into a readable "SYS.. GYR.. ACC..
-        MAG.." string, each sub-score 0-3."""
+        """Unpack the packed calib byte (sys*1000 + gyr*100 + acc*10 + mag,
+        see esp32/rover_6wd_complete.ino / landerpi/bridge.py) into a
+        readable "SYS.. GYR.. ACC.. MAG.." string, each sub-score 0-3. On
+        the LanderPi's BNO055 these are genuinely independent per-axis
+        scores; on the rover's BNO085/BNO08x (since 2026-08-14, see
+        rover_6wd_complete.ino's IMU header note) the chip only reports ONE
+        combined accuracy status, broadcast into all four digits, so they
+        read identically there -- decode_calib() doesn't need to know which
+        chip it's looking at, it just unpacks the four digits either way."""
         if imu_calib is None:
             return "no IMU data"
         v = int(round(imu_calib))
@@ -130,10 +136,13 @@ class OdometryLogger:
 
     def _imu_theta(self, imu_heading_deg: Optional[float], imu_calib: Optional[float],
                     moving: bool) -> Optional[float]:
-        """Convert a raw BNO055 Euler heading (deg, compass CW+, see
-        esp32/rover_6wd_complete.ino) into this run's theta convention (rad,
-        CCW+, zeroed at start_new_goal()) -- or None if it isn't trustworthy
-        yet, in which case the caller falls back to wheel-diff dead reckoning.
+        """Convert a raw firmware IMU heading (deg, compass CW+ -- both the
+        LanderPi's BNO055 and the rover's BNO085/BNO08x report this same
+        convention, see esp32/rover_6wd_complete.ino's IMU header note on
+        why the BNO08x's firmware code deliberately negates its otherwise
+        CCW+ yaw to match) into this run's theta convention (rad, CCW+,
+        zeroed at start_new_goal()) -- or None if it isn't trustworthy yet,
+        in which case the caller falls back to wheel-diff dead reckoning.
 
         Gated on the MAG sub-score of the packed imu_calib byte (sys*1000 +
         gyr*100 + acc*10 + mag): magnetometer calibration is what anchors the

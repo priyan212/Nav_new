@@ -61,21 +61,23 @@ touches.
 Pose estimate
 -------------
 Position (x, y) is dead-reckoned from wheel-encoder speed (encoders measure
-translation distance well). Heading (theta) comes from the BNO055 IMU's
-fused Euler heading whenever it's calibrated (esp32/rover_6wd_complete.ino
-rpm_data[2]/[3]) instead of being integrated from the wheel differential --
-skid-steer wheel-diff heading drifts hard (wheel slip during in-place turns
-is exactly where it's worst), while the IMU's onboard NDOF fusion has no
-accumulating drift once its magnetometer is calibrated. See
-OdometryLogger._imu_theta() in odometry_logger.py for the gating/conversion.
-No separate Kalman filter is layered on top of that: the BNO055 already runs
-its own internal sensor fusion (accel+gyro+mag) to produce that heading, and
-the encoder speed reading is not itself noisy enough to need state
-estimation -- a second filter here would add tuning risk without a clear
-accuracy win. If wheel slip during straight-line driving (not just turns)
-ever turns out to corrupt the encoder *distance* estimate too, a real EKF
-fusing encoder+IMU with a slip covariance term would be the right upgrade;
-nothing here precludes bolting that onto OdometryLogger later.
+translation distance well). Heading (theta) comes from the IMU's fused
+heading whenever it's calibrated (esp32/rover_6wd_complete.ino
+rpm_data[2]/[3] on the rover, landerpi/bridge.py on the LanderPi) instead
+of being integrated from the wheel differential -- skid-steer wheel-diff
+heading drifts hard (wheel slip during in-place turns is exactly where
+it's worst), while the IMU's onboard sensor fusion has no accumulating
+drift once it's calibrated. See OdometryLogger._imu_theta() in
+odometry_logger.py for the gating/conversion. No separate Kalman filter is
+layered on top of that: the IMU already runs its own internal sensor
+fusion (accel+gyro+mag -- BNO055's NDOF mode on the LanderPi, BNO08x's
+Rotation Vector report on the rover as of 2026-08-14) to produce that
+heading, and the encoder speed reading is not itself noisy enough to need
+state estimation -- a second filter here would add tuning risk without a
+clear accuracy win. If wheel slip during straight-line driving (not just
+turns) ever turns out to corrupt the encoder *distance* estimate too, a
+real EKF fusing encoder+IMU with a slip covariance term would be the right
+upgrade; nothing here precludes bolting that onto OdometryLogger later.
 
 Go Home
 -------

@@ -4,8 +4,9 @@ Dead-reckoned rover pose, logged by `nav_pipeline/odometry_logger.py`. The
 real rover has no LiDAR or dedicated odometry node, but the ESP32 firmware
 (`esp32/rover_6wd_complete.ino`) does have real quadrature encoders on each
 side's mid wheel, publishing signed L/R RPM on `/rover/rpm` (10 Hz), plus a
-BNO055 IMU's fused absolute heading (`imu_heading_deg`) and calibration
-status (`imu_calib`) in the same message. This directory holds the
+IMU's fused absolute heading (`imu_heading_deg`) and calibration status
+(`imu_calib`) in the same message — an Adafruit BNO085/BNO08x as of
+2026-08-14, previously a BNO055. This directory holds the
 integration of that feed into a differential-drive pose — useful for
 diagnostics (did the rover actually move, or just spin?), not a substitute
 for real localization: `x`/`y` still drift with no external correction.
@@ -16,9 +17,9 @@ navigate-back (see the top-level [README's REMIND section](../README.md#object-p
 to mean anything across goals/rooms. Call `OdometryLogger.reset_pose()` (or
 `start_new_goal(..., reset_pose=True)`) for a genuine fresh origin.
 
-`theta` is taken directly from the IMU heading once the magnetometer
-calibration digit reaches `imu_min_mag_calib` (default 3) — the BNO055's
-onboard sensor fusion has no accumulating drift, unlike wheel-differential
+`theta` is taken directly from the IMU heading once the calibration digit
+reaches `imu_min_mag_calib` (default 3) — the IMU's onboard sensor fusion
+has no accumulating drift, unlike wheel-differential
 heading, which drifts sharply past ~135-165° of rotation on this skid-steer
 chassis (wheel slip during in-place turns, invisible to the encoders; see
 `odom_accuracy_results.csv` below). Until the IMU is calibrated (or if it
@@ -56,7 +57,7 @@ isn't goal-text-driven.
 | `v` | robot linear velocity (m/s), `(v_left + v_right) / 2` |
 | `w` | robot angular velocity (rad/s), `(v_right - v_left) / TRACK_WIDTH_M` |
 | `x`, `y`, `theta` | integrated pose in the goal's local frame (metres, radians) |
-| `imu_heading_deg` | raw BNO055 fused compass heading for this row, or blank if the firmware reported NaN (IMU absent/unread) |
+| `imu_heading_deg` | raw IMU fused compass heading for this row, or blank if the firmware reported NaN (IMU absent/unread) |
 | `theta_src` | `"imu"` if `theta` this row came from the calibrated IMU heading, `"enc"` if it fell back to integrating the wheel differential |
 
 `v`/`x`/`y` use `WHEEL_RADIUS_M = 0.056`, `w`/`x`/`y` use
@@ -76,7 +77,7 @@ summary (one row per trial); `odom_spin_<angle>deg_<timestamp>.csv` holds
 the raw per-sample trace for each individual spin trial. This is the
 empirical basis for `nav_pipeline/goal_belief.py`'s rotation-noise tuning —
 see the top-level [README's "Goal belief" section](../README.md#goal-belief-surviving-occlusion)
-— and it's also what motivated fusing in the BNO055 IMU heading described
+— and it's also what motivated fusing in the IMU heading described
 above: the sharp wheel-diff drift past ~135-165° visible in these trials is
 exactly the failure mode the IMU heading doesn't have. Note these files
 predate the IMU fields and only have the original wheel-diff-only columns.

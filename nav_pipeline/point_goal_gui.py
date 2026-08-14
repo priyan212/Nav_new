@@ -113,6 +113,12 @@ class SharedState:
         self.obstacles = None
         self.min_forward = float("inf")
         self.infer_count = 0
+        # IMU status -- stashed by isaac_gui.py's zenoh_setup()/on_rpm (this
+        # GUI reuses it, see the import above), surfaced in the info bar
+        # same as isaac_gui.py/home_gui.py/remind_gui.py.
+        self.imu_heading_deg = float("nan")
+        self.imu_calib = 0.0
+        self.theta_source = "enc"
 
 
 def inference_loop(pipe: DinoNavDPPipeline, st: SharedState, pubs, running,
@@ -423,6 +429,7 @@ class App:
             stopped = self.st.stopped
             world_goal = self.st.world_goal
             goal_distance = self.st.goal_distance
+            imu_heading, imu_calib, theta_source = self.st.imu_heading_deg, self.st.imu_calib, self.st.theta_source
 
         if rgb is not None:
             img = Image.fromarray(rgb).convert("RGB")
@@ -465,7 +472,10 @@ class App:
             f"point goal ({goal_distance:.1f}m straight-line)" if world_goal is not None else "no goal set")
         fwd = f"   fwd-clear {min_fwd:.2f}m" if np.isfinite(min_fwd) else ""
         self.status.configure(text=f"[{mode_txt}]  {goal_txt}   {vel_text}{fwd}")
-        self.info.configure(text=f"frames {frames}   inferences {infers}   {lat}")
+        heading_txt = f"{imu_heading:.1f}°" if np.isfinite(imu_heading) else "n/a"
+        imu_txt = (f"theta src: {theta_source}   imu heading {heading_txt}"
+                   f"  calib [{OdometryLogger.decode_calib(imu_calib)}]")
+        self.info.configure(text=f"frames {frames}   inferences {infers}   {lat}   {imu_txt}")
 
 
 def main():
@@ -510,6 +520,11 @@ def main():
     ap.add_argument("--odometry-log-dir", type=str, default="odometry_log",
                     help="dead-reckoned pose CSV log dir (from /rover/rpm) -- also anchors "
                          "the point goal's world frame")
+    ap.add_argument("--imu-min-mag-calib", type=int, default=3,
+                    help="IMU calibration digit (0-3) required before theta rides the IMU "
+                         "heading instead of wheel-diff dead reckoning -- see OdometryLogger. "
+                         "This tool's whole point is isolating goal-reaching accuracy, which "
+                         "the world-frame heading feeds directly, so it's worth tuning here too.")
     ap.add_argument("--footprint-length", type=float, default=GuardConfig().footprint_length,
                     help="robot length (m) for obstacle_guard's swept-footprint clearance")
     ap.add_argument("--footprint-width", type=float, default=GuardConfig().footprint_width,
@@ -550,7 +565,7 @@ def main():
     st.goal_distance = args.goal_distance
     st.max_linear = args.max_linear
     st.max_angular = args.max_angular
-    odom = OdometryLogger(args.odometry_log_dir)
+    odom = OdometryLogger(args.odometry_log_dir, imu_min_mag_calib=args.imu_min_mag_calib)
     _subs, pubs = zenoh_setup(session, st, compressed_only=args.compressed_only, odom=odom)
     running = {"on": True}
 

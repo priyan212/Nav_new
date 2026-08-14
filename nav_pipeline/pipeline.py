@@ -1165,22 +1165,37 @@ class DinoNavDPPipeline:
         res.all_trajectories = trajs
         res.critic = critic
 
-        if res.min_forward < self.cfg.guard.slow_dist:
-            # obstacle zone: follow the clearance-vetoed NavDP trajectory
-            res.linear, res.angular = self._command_from_trajectory(chosen, res.min_forward)
-            res.linear *= max(0.25, res.min_forward / self.cfg.guard.slow_dist)
-        else:
-            # open space: deterministic visual servo on the goal bearing —
-            # stable tick to tick (the diffusion heading resamples every tick,
-            # which read as random wandering on the real rover)
-            bearing = float(np.arctan2(goal[1], goal[0]))  # +left, ROS convention
-            res.angular = bearing_to_angular(
-                bearing, self.cfg.max_angular, self.cfg.ang_min_cmd,
-                self.cfg.servo_deadband, np.radians(self.cfg.servo_ramp_deg),
-            )
-            res.linear = self.cfg.max_linear * max(
-                0.2, 1.0 - 0.8 * abs(res.angular) / self.cfg.max_angular
-            )
+        # Final command: continuously blend open-space goal-bearing servo with
+        # clearance-vetoed trajectory-following, instead of switching outright
+        # between the two control laws at slow_dist. The two don't generally
+        # agree on heading even when clearances are still generous (NavDP's
+        # critic-scored sample vs. a plain bearing-to-goal), so a hard switch
+        # there could snap the commanded heading the instant an obstacle
+        # entered the corridor even with no real collision risk yet -- this
+        # is what read as "atomic" avoidance. weight ramps 0 (pure
+        # open-space) at slow_dist to 1 (pure obstacle-following) at
+        # hard_stop_dist, so the two commands cross-fade smoothly and
+        # avoidance visibly starts influencing steering from slow_dist out.
+        # AVOID's own hard trigger above is untouched by this -- once truly
+        # close, decisive escape still fires outright exactly as before.
+        bearing = float(np.arctan2(goal[1], goal[0]))  # +left, ROS convention
+        ang_open = bearing_to_angular(
+            bearing, self.cfg.max_angular, self.cfg.ang_min_cmd,
+            self.cfg.servo_deadband, np.radians(self.cfg.servo_ramp_deg),
+        )
+        lin_open = self.cfg.max_linear * max(0.2, 1.0 - 0.8 * abs(ang_open) / self.cfg.max_angular)
+
+        lin_obs, ang_obs = self._command_from_trajectory(chosen, res.min_forward)
+        # was an unconditional < slow_dist scale-down before blending existed
+        # (min_forward was always < slow_dist at this call site then); now
+        # called at every distance, so clip the upper end too -- otherwise a
+        # far-clear min_forward (even inf) would inflate this past 1.0.
+        lin_obs *= float(np.clip(res.min_forward / self.cfg.guard.slow_dist, 0.25, 1.0))
+
+        span = max(self.cfg.guard.slow_dist - self.cfg.guard.hard_stop_dist, 1e-6)
+        weight = float(np.clip((self.cfg.guard.slow_dist - res.min_forward) / span, 0.0, 1.0))
+        res.linear = (1.0 - weight) * lin_open + weight * lin_obs
+        res.angular = (1.0 - weight) * ang_open + weight * ang_obs
         res.angular, self._avoid_cooldown = apply_avoid_cooldown(
             res.angular, res.state, self._avoid_side, self._avoid_cooldown,
             self.cfg.avoid_bias_gain, self.cfg.max_angular,

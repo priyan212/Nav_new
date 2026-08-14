@@ -67,13 +67,20 @@ class GuardConfig:
     margin: float = 0.10            # required gap beyond the swept hull (m)
     hard_stop_dist: float = 0.60    # forward obstacle closer than this -> stop (m)
     reverse_dist: float = 0.35      # too close to rotate -> back up first (m)
-    slow_dist: float = 2.5          # start slowing + curving below this forward distance (m) --
-                                     # this is also the switch-over point between pure open-space
-                                     # goal-bearing servo (ignores obstacles) and NavDP's
-                                     # clearance-vetoed trajectory selection (see pipeline.py's
-                                     # step()), so it's the main knob for how far out avoidance
-                                     # visibly starts. Kept comfortably under max_range (4.0m) since
-                                     # depth reliability degrades near the far edge of range.
+    slow_dist: float = 3.2          # outer edge of the avoidance blend zone (m) -- below this,
+                                     # pipeline.py's final command continuously cross-fades from
+                                     # pure open-space goal-bearing servo (weight 0, at slow_dist)
+                                     # to NavDP's clearance-vetoed trajectory-following (weight 1,
+                                     # at hard_stop_dist), rather than switching control laws
+                                     # outright at a single threshold (see pipeline.py's _step_inner
+                                     # final command block) -- avoidance visibly starts influencing
+                                     # steering from here out, not just once already deep inside it.
+                                     # Widened 2026-08-14 from 2.5 (was also the old hard
+                                     # switch-over point) at user request ("gradual not atomic,
+                                     # start avoiding from a distance"); kept comfortably under
+                                     # max_range (4.0m) since depth reliability degrades near the
+                                     # far edge of range -- don't push this past ~3.5 without also
+                                     # revisiting max_range.
     corridor_half_width: float = 0.35  # forward corridor half-width ≥ half-width+margin (m)
     stride: int = 4                 # depth subsampling stride (speed)
     # Robot footprint for swept_clearance()'s two-circle cover -- defaults to

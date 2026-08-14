@@ -28,6 +28,7 @@ Run (from Nav_new root, internnav conda env):
 """
 
 import argparse
+import math
 import os
 import struct
 import sys
@@ -327,13 +328,14 @@ class DinoNavDPZenohNode:
     SPIN_DIST_THRESH_M = 0.3
 
     def __init__(self, session: zenoh.Session, pipeline: DinoNavDPPipeline, target: str, predict_hz: float,
-                 stop_confirm_count: int = 3, odometry_log_dir: str = "odometry_log"):
+                 stop_confirm_count: int = 3, odometry_log_dir: str = "odometry_log",
+                 imu_min_mag_calib: int = 3):
         self.session = session
         self.pipe = pipeline
         self.target = target
         self.predict_hz = predict_hz
         self.stop_confirm_count = stop_confirm_count
-        self.odom = OdometryLogger(odometry_log_dir)
+        self.odom = OdometryLogger(odometry_log_dir, imu_min_mag_calib=imu_min_mag_calib)
         self.odom.start_new_goal(target)
 
         self.lock = Lock()
@@ -455,8 +457,13 @@ class DinoNavDPZenohNode:
                 t0 = time.time()
                 self._tick()
                 if time.time() - last_status > 10.0:
+                    heading_txt = (f"{self.odom.last_imu_heading_deg:.1f}°"
+                                   if self.odom.last_imu_heading_deg is not None
+                                   and math.isfinite(self.odom.last_imu_heading_deg) else "n/a")
                     print(f"[STATUS] frames_rx={self._frame_count} inferences={self._infer_count} "
-                          f"goal={'REACHED' if self._goal_reached else 'tracking'}")
+                          f"goal={'REACHED' if self._goal_reached else 'tracking'} "
+                          f"theta_src={self.odom.theta_source} imu_heading={heading_txt} "
+                          f"calib=[{OdometryLogger.decode_calib(self.odom.last_imu_calib)}]")
                     last_status = time.time()
                 dt = period - (time.time() - t0)
                 if dt > 0:
@@ -559,6 +566,10 @@ def main():
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--odometry-log-dir", type=str, default="odometry_log",
                    help="dead-reckoned pose CSV log dir (from /rover/rpm)")
+    p.add_argument("--imu-min-mag-calib", type=int, default=3,
+                   help="IMU calibration digit (0-3) required before theta rides the IMU "
+                        "heading instead of wheel-diff dead reckoning -- see OdometryLogger. "
+                        "Was only exposed on home_gui.py before; same default/semantics here.")
     p.add_argument("--footprint-length", type=float, default=GuardConfig().footprint_length,
                    help="robot length (m) for obstacle_guard's swept-footprint clearance -- "
                         "defaults to the ESP32 rover's real size, override for a different robot "
@@ -590,7 +601,8 @@ def main():
     print("[INFO] Zenoh session opened.")
 
     node = DinoNavDPZenohNode(session, pipeline, args.target, args.predict_hz,
-                              odometry_log_dir=args.odometry_log_dir)
+                              odometry_log_dir=args.odometry_log_dir,
+                              imu_min_mag_calib=args.imu_min_mag_calib)
     node.spin()
     session.close()
 

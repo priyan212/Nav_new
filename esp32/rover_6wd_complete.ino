@@ -20,39 +20,103 @@
  *   Publishes  : /rover/rpm  (std_msgs/Float32MultiArray
  *                             [left_rpm, right_rpm, imu_heading_deg, imu_calib],
  *                             signed RPM: +ve = wheel drives robot FORWARD;
- *                             imu_heading_deg: BNO055 fused absolute heading
- *                             in degrees [0,360), or NaN if the IMU didn't
- *                             ack at startup; imu_calib: human-readable
- *                             SYS*1000 + GYR*100 + ACC*10 + MAG, each digit
- *                             0(uncalibrated)-3(fully calibrated), e.g. 3320
- *                             = SYS 3, GYR 3, ACC 2, MAG 0 -- existing
- *                             consumers that only read data[0]/data[1]
- *                             (len(data) >= 2 checks) are unaffected by the
- *                             array growing to 4.
+ *                             imu_heading_deg: BNO08x fused heading (yaw
+ *                             from the GAME Rotation Vector report -- see
+ *                             2026-08-14 addendum below for why not the
+ *                             plain Rotation Vector) in degrees [0,360), or
+ *                             NaN if the IMU never produced a report;
+ *                             imu_calib: the GYROSCOPE's own 0-3 accuracy
+ *                             status (see addendum) broadcast into ALL FOUR
+ *                             digits (SYS=GYR=ACC=MAG=status, e.g. status 3
+ *                             -> 3333) so existing consumers that gate on
+ *                             the MAG/ones digit (odometry_logger.py et al,
+ *                             unchanged, see --imu-min-mag-calib) keep
+ *                             working unmodified -- unlike the BNO055 this
+ *                             replaces, the BNO08x's SH-2 firmware reports
+ *                             per-REPORT accuracy, not simultaneous
+ *                             independent SYS/GYR/ACC/MAG sub-scores from
+ *                             one report, so those four digits are no
+ *                             longer independent, just replicated for wire
+ *                             compatibility.
  *
- * IMU (NEW): BNO055 on I2C (GPIO21 SDA / GPIO22 SCL, ESP32 defaults -- free
- * on this board, no conflict with the motor/encoder pins above). Wheel-
- * differential heading (theta) drifts sharply past ~135-165deg of rotation
- * on this skid-steer chassis (measured, see odometry_log/
- * odom_accuracy_results.csv) because turning scrubs the wheels against the
- * ground -- the encoders can't see that slip. BNO055 does its own onboard
- * sensor fusion (accel+gyro+mag) and reports an absolute heading that
- * doesn't depend on wheel odometry at all, so it's immune to that specific
- * failure mode. Raw I2C register access (no Adafruit_BNO055/Adafruit_Sensor
- * library dependency) -- see bno055_init()/bno055_read_heading_deg() below.
- * Calibration offsets persist across power cycles (NVS via Preferences,
- * still no new external library): the first time this boot's calibration
- * reaches SYS/GYR/ACC/MAG all == 3, bno055_save_calibration() stores the
- * offset block to flash; every future boot's bno055_init() restores it via
- * bno055_load_calibration(), skipping the physical wave-around calibration
- * dance. Getting CALIBRATED (Pi-side theta_src == "imu") does NOT mean the
- * heading is actually ACCURATE, though: --imu-min-mag-calib on the Pi side
- * (home_gui.py et al) gates on the MAG sub-score alone, and level 1 there
+ * IMU (2026-08-14, replaces an earlier BNO055): Adafruit BNO085/BNO080
+ * ("9-DOF Orientation IMU Fusion Breakout", STEMMA QT) on I2C (GPIO21 SDA /
+ * GPIO22 SCL, ESP32 defaults -- same pins the BNO055 used, free on this
+ * board). Wheel-differential heading (theta) drifts sharply past
+ * ~135-165deg of rotation on this skid-steer chassis (measured, see
+ * odometry_log/odom_accuracy_results.csv) because turning scrubs the
+ * wheels against the ground -- the encoders can't see that slip. The
+ * BNO08x does its own onboard sensor fusion (accel+gyro+mag, CEVA SH-2
+ * firmware) and reports an absolute heading that doesn't depend on wheel
+ * odometry at all, so it's immune to that specific failure mode -- same
+ * motivation as the BNO055 before it.
+ *
+ * UNLIKE the BNO055 (simple flat I2C registers), the BNO08x speaks SHTP, a
+ * packetized sensor-hub protocol -- there's no raw-register shortcut, so
+ * this firmware uses Adafruit's official Adafruit_BNO08x library (+ its
+ * Adafruit_BusIO / Adafruit_Sensor deps, + the bundled CEVA `sh2` C driver)
+ * instead of hand-rolled I2C like the BNO055 code did. See
+ * bno08x_init()/bno08x_poll() below. Calibration persistence works
+ * differently too and is actually SIMPLER: the BNO08x's own SH-2 firmware
+ * owns Dynamic Calibration Data (DCD) in its own internal flash --
+ * sh2_setDcdAutoSave(true) in bno08x_init() is a one-line fire-and-forget
+ * equivalent of the BNO055 code's entire NVS save/restore dance (no
+ * ESP32-side Preferences blob, no host-side load-at-boot step). Getting
+ * CALIBRATED (Pi-side theta_src == "imu") does NOT mean the heading is
+ * actually ACCURATE, though: --imu-min-mag-calib on the Pi side
+ * (home_gui.py et al) gates on the imu_calib ones digit, and level 1 there
  * (the default) is a low bar -- real magnetic disturbance near the sensor
  * (motor current, nearby metal/wiring) can still swing the reported heading
- * tens of degrees at MAG==1. Level 3 is Bosch's own bar for a trustworthy
- * absolute heading; if MAG can't reach 3 in a given room, that's a real
- * environment/mounting issue this persistence feature doesn't paper over.
+ * meaningfully even at status==1. Status 3 is this chip's own bar for a
+ * trustworthy absolute heading; if it can't reach 3 in a given room, that's
+ * a real environment/mounting issue, not a firmware gap.
+ *
+ * BENCH-VALIDATED 2026-08-14, TWO PASSES: first pass commanded
+ * angular_z=+0.25 rad/s (ROS CCW convention) for 2s over live cmd_vel and
+ * found a smooth, monotonic heading INCREASE (98.4deg -> 136.6deg) -- correct
+ * direction relative to this firmware's own encoder sign convention, but
+ * that's ROS CCW+, NOT the "compass CW+" odometry_logger.py's _imu_theta()
+ * actually assumes (see bno08x_heading_from_quat()'s comment) -- caught
+ * during a later doc-consistency pass, not the original bench test. Fixed
+ * by negating the yaw there; reflashed and repeated the spin (angular_z=
+ * +0.5 for 3s, left_rpm ~-31 / right_rpm ~+30 confirming a real CCW
+ * rotation) -- heading now DECREASED smoothly and monotonically
+ * (271.8deg -> 175.4deg, ~96deg, no jumps) for the same +angular_z (CCW)
+ * command, i.e. now behaves like the old BNO055 the Pi side was written
+ * against. Zero-offset (what heading reads while facing any particular
+ * real-world direction) was
+ * never calibrated against a compass/landmark -- only sign/direction.
+ *
+ * ADDENDUM 2026-08-14 -- switched Rotation Vector -> GAME Rotation Vector.
+ * The plain (9-DOF, magnetometer-referenced) Rotation Vector's accuracy
+ * status was found STUCK AT 0 ("Unreliable") through 700+ degrees of real
+ * commanded rotation (both directions) AND a 20s stationary window --
+ * confirmed via a standalone diagnostic sketch that GYR reached status 3
+ * and ACC reached status 2 in the same session (so the calibration engine
+ * itself works), while MAG's raw field readings were physically plausible
+ * (~24-25uT, real Earth-field magnitude, not zero/garbage) but its
+ * calibration CONFIDENCE never rose regardless -- pointing at magnetic
+ * interference near the mount (motors/wiring/chassis metal) rather than a
+ * broken sensor or a failed sh2_setCalConfig() call. This matches
+ * independent reports from BNO08x users elsewhere: the 9-DOF Rotation
+ * Vector's magnetometer fusion is widely described as fragile/opaque near
+ * motors, and Game Rotation Vector (accel+gyro only, NO magnetometer) is
+ * the documented workaround specifically for robots with nearby motors
+ * (CEVA/Adafruit report-type docs; see also forum.arduino.cc's BNO085
+ * calibration thread). Tradeoff: Game RV has no absolute magnetic-north
+ * reference, so it WILL drift slowly over very long sessions, unlike a
+ * genuinely-calibrated Rotation Vector -- but that's the honest choice
+ * here, since the magnetometer-referenced path was never actually reaching
+ * calibrated on this rover, meaning it was contributing NOTHING (odometry
+ * always fell back to wheel-diff) while still carrying the interference
+ * risk. Gyro drift over a typical single-goal session (minutes, not hours)
+ * should be far smaller than the wheel-diff drift it replaces (see the
+ * ~135-165deg wheel-diff failure mode described above) -- not yet
+ * long-session bench-validated, though. imu_calib's gating digit now comes
+ * from the GYROSCOPE's own status (SH2_GYROSCOPE_CALIBRATED report,
+ * confirmed reaching 3 reliably and fast in the same diagnostic session)
+ * instead of the magnetometer's, since gyro (not mag) is what Game RV's
+ * quality actually depends on.
  *
  * SIGN CONVENTION
  *   The firmware owns the encoder sign so that a forward command yields
@@ -71,9 +135,10 @@
 #include <geometry_msgs/msg/twist.h>
 #include <std_msgs/msg/float32_multi_array.h>
 #include <Wire.h>
-#include <Preferences.h>  // ESP32 core NVS wrapper (bundled with the core, same tier as
-                          // Wire.h -- not a new external library, see BNO055 calibration
-                          // persistence note below)
+#include <Adafruit_BNO08x.h>  // BNO08x SHTP driver (+ Adafruit_BusIO / Adafruit_Sensor
+                               // deps, + bundled CEVA sh2 C driver) -- see IMU note above
+                               // for why this needed a real library, unlike the BNO055
+                               // it replaces.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MOTOR PINS (6-wheel rover: 3 motors per side)
@@ -223,180 +288,129 @@ long   pub_last_left  = 0;
 long   pub_last_right = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BNO055 IMU (I2C, absolute-heading fusion) — see the file header note above.
-// Raw register access, no external library: keeps this sketch's dependency
-// footprint at just Wire.h (already part of the ESP32 core), so it can't
-// introduce a NEW library-version mismatch on top of the existing
-// micro_ros_arduino/esp32-core pinning (see esp32-flashing-procedure memo).
+// BNO08x IMU (I2C, absolute-heading fusion via SHTP/SH-2) — see the file
+// header note above for why this needs the Adafruit_BNO08x library instead
+// of the BNO055's hand-rolled raw registers.
 // ─────────────────────────────────────────────────────────────────────────────
-#define BNO055_I2C_ADDR             0x28   // default (ADR pin low/unconnected)
-#define BNO055_SDA_PIN              21
-#define BNO055_SCL_PIN              22
+#define BNO08X_I2C_ADDR       BNO08x_I2CADDR_DEFAULT  // 0x4A (ADR jumper solders to 0x4B --
+                                                       // bno08x_init() tries both, see below)
+#define BNO08X_I2C_ADDR_ALT   0x4B
+#define BNO08X_SDA_PIN        21
+#define BNO08X_SCL_PIN        22
+#define BNO08X_REPORT_US      20000  // ask the sensor for Game Rotation Vector / Gyroscope
+                                      // reports every 20ms (50Hz) each -- polled by
+                                      // bno08x_poll() every loop() iteration (well under
+                                      // 50Hz) and only READ (not requested) by the 10Hz
+                                      // publisher, so this just needs to stay comfortably
+                                      // faster than RPM_PUBLISH_MS.
 
-#define BNO055_REG_CHIP_ID          0x00
-#define BNO055_CHIP_ID_VALUE        0xA0
-#define BNO055_REG_PAGE_ID          0x07
-#define BNO055_REG_EUL_HEADING_LSB  0x1A
-#define BNO055_REG_CALIB_STAT       0x35
-#define BNO055_REG_OPR_MODE         0x3D
-#define BNO055_REG_PWR_MODE         0x3E
+Adafruit_BNO08x bno08x;
+sh2_SensorValue_t bno08x_value;
 
-// Sensor offset/radius block (accel offset x/y/z, mag offset x/y/z, gyro
-// offset x/y/z, accel radius, mag radius -- BNO055 datasheet table 3-42),
-// 22 contiguous bytes. Only readable/writable in CONFIG mode. This is the
-// standard save/restore-calibration mechanism (Bosch datasheet section
-// 3.6.4): read it out once fully calibrated, persist it, and write it back
-// on every future boot instead of re-doing the physical wave-around
-// calibration dance each time -- see bno055_save_calibration()/
-// bno055_load_calibration() below.
-#define BNO055_REG_CALIB_START      0x55
-#define BNO055_CALIB_LEN            22
+bool  imu_present            = false;
+float imu_heading_deg_cached = NAN;   // updated by bno08x_poll(), read at publish time
+uint8_t imu_accuracy_cached  = 0;     // 0(unreliable)-3(high), the GAME Rotation Vector
+                                       // report's own accuracy status (accel+gyro derived,
+                                       // no magnetometer -- see file header's 2026-08-14
+                                       // addendum for the full story of why this changed from
+                                       // the plain Rotation Vector). Also broadcast into all
+                                       // four rpm_data[3] digits -- see gyro_accuracy_cached
+                                       // below for what specifically gates theta trust.
+uint8_t gyro_accuracy_cached = 0;     // 0-3, the GYROSCOPE'S OWN status from a separate
+                                       // SH2_GYROSCOPE_CALIBRATED report -- THIS is what maps
+                                       // to rpm_data[3]'s ones/MAG digit and what
+                                       // --imu-min-mag-calib actually gates on Pi-side (name
+                                       // unchanged Pi-side; it now really means "IMU min
+                                       // gyro calib" but the flag/wire contract stayed put on
+                                       // purpose -- see file header addendum). Confirmed via a
+                                       // standalone diagnostic sketch to reach 3 reliably and
+                                       // fast, unlike the magnetometer's status this replaced,
+                                       // which never left 0 on this rover.
 
-// Bosch's NDOF fusion algorithm reports the MAG sub-score conservatively:
-// even with a known-good offset profile just restored from flash, it won't
-// report mag calibrated (score 3) until it has seen live, consistent
-// magnetometer readings post-boot -- unlike accel/gyro, whose calibration
-// is sensor-intrinsic (bias/temperature) and validates almost instantly,
-// mag calibration compensates for LOCAL magnetic interference, which the
-// chip has no way to know hasn't changed since the offsets were saved. Set
-// this to 1 to bridge JUST that initial post-boot gap: report mag as
-// trusted (score 3) immediately after a saved profile loads, but ONLY
-// until the live status genuinely reaches 3 on its own for the first time
-// this boot (bno_mag_live_confirmed) -- from that point on the override is
-// inert and the live reading is fully authoritative again, so a real
-// disturbance encountered later during actual use (motor EMI while
-// driving, reproduced 2026-08-06: heading drifted 24 deg in ~300ms while
-// stationary right after a drive burst) still correctly falls back to
-// wheel-diff instead of being permanently masked. Safe ONLY if the rover
-// stays in the same magnetic environment (same room, same nearby
-// metal/motors/wiring) it was calibrated in -- if it's moved somewhere
-// very different, the bridged window right after boot could mask a bad
-// heading, same risk as before, just narrowed to that one window instead
-// of the whole session (see nav_pipeline/odometry_logger.py's
-// imu_min_mag_calib gate, Pi-side).
-#define TRUST_LOADED_MAG_CALIB      1
-
-#define BNO055_MODE_CONFIG          0x00
-#define BNO055_MODE_NDOF            0x0C
-#define BNO055_PWR_NORMAL           0x00
-
-bool imu_present = false;
-Preferences bno_prefs;
-bool bno_calib_saved_this_boot = false;  // avoid hammering flash every publish tick
-                                          // once full calibration is reached -- see loop()
-bool bno_calib_loaded_this_boot = false; // a saved offset block was found + applied at boot
-                                          // -- see bno055_load_calibration()/TRUST_LOADED_MAG_CALIB
-bool bno_mag_live_confirmed = false;     // raw MAG sub-score has genuinely reached 3 at least
-                                          // once THIS boot -- once true, TRUST_LOADED_MAG_CALIB
-                                          // stops bridging and the live status is fully
-                                          // authoritative again, so a real disturbance after that
-                                          // point (e.g. motor EMI while driving) still correctly
-                                          // falls back to wheel-diff instead of being masked.
-
-bool bno055_write8(uint8_t reg, uint8_t val) {
-  Wire.beginTransmission(BNO055_I2C_ADDR);
-  Wire.write(reg);
-  Wire.write(val);
-  return Wire.endTransmission() == 0;
+// Quaternion (i,j,k,real) -> yaw heading, degrees [0,360), COMPASS
+// CONVENTION (CW+, i.e. increases while turning clockwise viewed from
+// above) -- NOT the ROS-standard CCW+ a bare atan2 yaw extraction gives.
+// This matters: odometry_logger.py's _imu_theta() explicitly assumes
+// "compass CW+" input (see its own comment, `delta_deg = ref - current
+// # compass CW+ -> theta CCW+") because that's what the BNO055 this
+// firmware replaced reported via its Euler-heading register (Bosch's
+// datasheet convention, matches a real magnetic compass). Bench-tested
+// 2026-08-14 (see file header): the RAW aerospace atan2(2*(w*z+x*y),
+// 1-2*(y^2+z^2)) formula, WITHOUT the negation below, increases with CCW
+// rotation (verified: +angular_z spin increased it) -- i.e. it's the
+// opposite convention from what the Pi side expects. Negated here so
+// imu_heading_deg keeps behaving exactly like the old BNO055's did and
+// odometry_logger.py needs ZERO changes.
+float bno08x_heading_from_quat(float i, float j, float k, float real) {
+  float siny_cosp = 2.0f * (real * k + i * j);
+  float cosy_cosp = 1.0f - 2.0f * (j * j + k * k);
+  float yaw_deg = -atan2f(siny_cosp, cosy_cosp) * (180.0f / PI);  // negate: CCW+ -> CW+
+  if (yaw_deg < 0.0f) yaw_deg += 360.0f;
+  return yaw_deg;
 }
 
-bool bno055_read(uint8_t reg, uint8_t *buf, uint8_t len) {
-  Wire.beginTransmission(BNO055_I2C_ADDR);
-  Wire.write(reg);
-  if (Wire.endTransmission(false) != 0) return false;  // repeated START, keep bus held
-  if (Wire.requestFrom((int)BNO055_I2C_ADDR, (int)len) != (int)len) return false;
-  for (uint8_t i = 0; i < len; i++) buf[i] = Wire.read();
-  return true;
-}
+// Returns false if the BNO08x never identifies/ack's correctly at EITHER
+// candidate address, or the Game Rotation Vector report can't be enabled --
+// this IS the wiring check, same role bno055_init()'s old CHIP_ID read
+// played. Tries the default address first, then the ADR-jumper-soldered
+// alternate (STEMMA QT breakouts commonly ship with this jumper in either
+// state) -- if BOTH fail, that's a real wiring/power problem, not an
+// address guess.
+bool bno08x_init() {
+  Wire.begin(BNO08X_SDA_PIN, BNO08X_SCL_PIN);
 
-// Restore a previously-saved calibration offset block (see
-// bno055_save_calibration() below) -- MUST be called while already in
-// CONFIG mode (offset registers aren't accessible in NDOF). No-op if
-// nothing was ever saved: a fresh board, or one that's never yet completed
-// a full physical calibration, just keeps the sensor's power-on defaults
-// and calibrates from scratch as before. Sets bno_calib_loaded_this_boot
-// on success -- see TRUST_LOADED_MAG_CALIB below for what that unlocks.
-void bno055_load_calibration() {
-  bno_prefs.begin("bno055", true);  // read-only
-  if (bno_prefs.getBytesLength("offsets") == BNO055_CALIB_LEN) {
-    uint8_t buf[BNO055_CALIB_LEN];
-    bno_prefs.getBytes("offsets", buf, BNO055_CALIB_LEN);
-    for (uint8_t i = 0; i < BNO055_CALIB_LEN; i++) {
-      bno055_write8(BNO055_REG_CALIB_START + i, buf[i]);
-    }
-    bno_calib_loaded_this_boot = true;
-  }
-  bno_prefs.end();
-}
-
-// Persist the current calibration offset block to flash (NVS via
-// Preferences) so a future boot can skip the physical wave-around
-// calibration dance entirely -- see bno055_load_calibration() and loop()'s
-// RPM-publish block, which calls this once per boot the first time
-// bno055_read_calib_status() reports full calibration (0xFF). Briefly
-// switches to CONFIG mode to read the offset registers (only accessible
-// there, datasheet section 3.6.4) -- a one-time ~50ms fusion-output pause
-// the very first time full calibration is reached each boot, never again
-// after that (guarded by bno_calib_saved_this_boot), so it doesn't
-// meaningfully compete with the control loop's cadence.
-void bno055_save_calibration() {
-  bno055_write8(BNO055_REG_PAGE_ID, 0x00);
-  bno055_write8(BNO055_REG_OPR_MODE, BNO055_MODE_CONFIG);
-  delay(25);
-
-  uint8_t buf[BNO055_CALIB_LEN];
-  if (bno055_read(BNO055_REG_CALIB_START, buf, BNO055_CALIB_LEN)) {
-    bno_prefs.begin("bno055", false);  // read/write
-    bno_prefs.putBytes("offsets", buf, BNO055_CALIB_LEN);
-    bno_prefs.end();
-  }
-
-  bno055_write8(BNO055_REG_OPR_MODE, BNO055_MODE_NDOF);
-  delay(25);
-}
-
-// Returns false if the BNO055 never acks/identifies correctly -- this IS the
-// wiring check: CHIP_ID only reads back 0xA0 if VIN/GND/SDA/SCL are all
-// actually connected and the sensor is powered.
-bool bno055_init() {
-  Wire.begin(BNO055_SDA_PIN, BNO055_SCL_PIN);
-  Wire.setClock(100000);  // 100kHz standard-mode I2C -- safe default, no need
-                           // to risk 400kHz fast-mode on an unverified bus
-
-  uint8_t chip_id = 0;
-  if (!bno055_read(BNO055_REG_CHIP_ID, &chip_id, 1) || chip_id != BNO055_CHIP_ID_VALUE) {
+  if (!bno08x.begin_I2C(BNO08X_I2C_ADDR, &Wire) &&
+      !bno08x.begin_I2C(BNO08X_I2C_ADDR_ALT, &Wire)) {
     return false;
   }
 
-  bno055_write8(BNO055_REG_PAGE_ID, 0x00);
-  bno055_write8(BNO055_REG_OPR_MODE, BNO055_MODE_CONFIG);
-  delay(25);                                    // mode-switch settle (datasheet: 19ms to CONFIG)
-  bno055_write8(BNO055_REG_PWR_MODE, BNO055_PWR_NORMAL);
-  bno055_write8(BNO055_REG_PAGE_ID, 0x00);
-  bno055_load_calibration();  // restore a saved offset block, if any (must run in CONFIG mode)
-  bno055_write8(BNO055_REG_OPR_MODE, BNO055_MODE_NDOF);  // full 9-DOF fusion, absolute heading
-  delay(25);                                    // mode-switch settle (datasheet: 7ms, +margin)
+  // Let the chip's own SH-2 firmware own calibration persistence in ITS
+  // flash, not the ESP32's -- replaces the BNO055 code's entire NVS
+  // save/restore dance with two fire-and-forget calls (see file header).
+  // SH2_CAL_MAG left enabled even though Game Rotation Vector doesn't use
+  // the magnetometer -- harmless, and keeps the door open if a future
+  // remount away from motor interference makes the plain Rotation Vector
+  // viable again (see 2026-08-14 addendum).
+  sh2_setCalConfig(SH2_CAL_ACCEL | SH2_CAL_GYRO | SH2_CAL_MAG);
+  sh2_setDcdAutoSave(true);
+
+  if (!bno08x.enableReport(SH2_GAME_ROTATION_VECTOR, BNO08X_REPORT_US)) return false;
+  // Best-effort: if the gyro-specific report can't be enabled for some
+  // reason, gyro_accuracy_cached just stays 0 (same as "never calibrated")
+  // rather than failing bno08x_init() entirely -- heading still works fine
+  // off the Game Rotation Vector report alone either way.
+  bno08x.enableReport(SH2_GYROSCOPE_CALIBRATED, BNO08X_REPORT_US);
   return true;
 }
 
-// Fused absolute heading, degrees [0,360). NaN if the IMU never initialized
-// or a read fails (transient I2C glitch) -- callers must NaN-check, never
-// assume this is always valid.
-float bno055_read_heading_deg() {
-  if (!imu_present) return NAN;
-  uint8_t buf[2];
-  if (!bno055_read(BNO055_REG_EUL_HEADING_LSB, buf, 2)) return NAN;
-  int16_t raw = (int16_t)((uint16_t)buf[1] << 8 | buf[0]);
-  return raw / 16.0f;  // 1 LSB = 1/16 degree (BNO055 datasheet Table 3-22)
-}
+// Drain any pending SHTP report(s) and cache the latest heading/accuracy --
+// call every loop() iteration (cheap; non-blocking if nothing is pending).
+// Also handles a BNO08x-side reset (e.g. a brownout on flexed wiring) by
+// re-enabling the report -- unlike the BNO055, which needed a full ESP32
+// reboot to recover from that (see esp32-flashing-procedure memo), the
+// BNO08x can self-heal mid-session here without one.
+void bno08x_poll() {
+  if (!imu_present) return;
 
-// SYS/GYRO/ACCEL/MAG calibration, each 0 (uncalibrated) - 3 (fully
-// calibrated). Not currently published -- available for future use (e.g.
-// gating theta-snap corrections on the Pi side until SYS reaches 3).
-uint8_t bno055_read_calib_status() {
-  uint8_t v = 0;
-  if (!imu_present || !bno055_read(BNO055_REG_CALIB_STAT, &v, 1)) return 0;
-  return v;
+  if (bno08x.wasReset()) {
+    bno08x.enableReport(SH2_GAME_ROTATION_VECTOR, BNO08X_REPORT_US);
+    bno08x.enableReport(SH2_GYROSCOPE_CALIBRATED, BNO08X_REPORT_US);
+  }
+
+  // getSensorEvent() returns (up to) one report per call, whichever's next
+  // in the SHTP queue -- checking sensorId routes it to the right cache.
+  // Called every loop() iteration, comfortably faster than either report's
+  // 20ms interval, so neither queue backs up.
+  if (bno08x.getSensorEvent(&bno08x_value)) {
+    if (bno08x_value.sensorId == SH2_GAME_ROTATION_VECTOR) {
+      imu_heading_deg_cached = bno08x_heading_from_quat(
+          bno08x_value.un.gameRotationVector.i, bno08x_value.un.gameRotationVector.j,
+          bno08x_value.un.gameRotationVector.k, bno08x_value.un.gameRotationVector.real);
+      imu_accuracy_cached = bno08x_value.status & 0x03;  // bits 1-0: accuracy, see sh2_SensorValue.h
+    } else if (bno08x_value.sensorId == SH2_GYROSCOPE_CALIBRATED) {
+      gyro_accuracy_cached = bno08x_value.status & 0x03;
+    }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -598,12 +612,12 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ENC_L_A), enc_left_isr,  RISING);
   attachInterrupt(digitalPinToInterrupt(ENC_R_A), enc_right_isr, RISING);
 
-  // BNO055 IMU (I2C, separate bus from Serial -- safe to init before or
+  // BNO08x IMU (I2C, separate bus from Serial -- safe to init before or
   // after set_microros_transports() below; done here so imu_present is
   // known before the first RPM publish). No effect on wheel control if the
   // sensor isn't wired/found: imu_present just stays false and
-  // bno055_read_heading_deg() reports NaN forever, same as no IMU at all.
-  imu_present = bno055_init();
+  // imu_heading_deg_cached stays NaN forever, same as no IMU at all.
+  imu_present = bno08x_init();
 
   // After this, Serial belongs to the micro-ROS transport. No Serial.print().
   set_microros_transports();
@@ -631,6 +645,11 @@ void loop() {
 
     case AGENT_CONNECTED: {
       rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1));
+
+      // Drain any pending BNO08x report every iteration (cheap) so
+      // imu_heading_deg_cached/imu_accuracy_cached are fresh whenever the
+      // 10 Hz publisher below reads them.
+      bno08x_poll();
 
       // Low-frequency agent liveness check (every 2 s)
       static unsigned long last_ping_time = 0;
@@ -672,32 +691,16 @@ void loop() {
         // signed RPM at the wheel (+ve = drives robot forward)
         rpm_data[0] = ENC_L_SIGN * (dl / ENCODER_CPR) / dt_min;
         rpm_data[1] = ENC_R_SIGN * (dr / ENCODER_CPR) / dt_min;
-        rpm_data[2] = bno055_read_heading_deg();  // NaN if IMU absent/unread
-        {
-          uint8_t c = bno055_read_calib_status();
-          float sys_c = (c >> 6) & 0x03, gyr_c = (c >> 4) & 0x03,
-                acc_c = (c >> 2) & 0x03, mag_c = c & 0x03;
-#if TRUST_LOADED_MAG_CALIB
-          // See TRUST_LOADED_MAG_CALIB's comment above: bridge only up to
-          // the first genuine live confirmation this boot, then get out of
-          // the way permanently so a later real disturbance isn't masked.
-          if (mag_c >= 3.0f) bno_mag_live_confirmed = true;
-          if (bno_calib_loaded_this_boot && !bno_mag_live_confirmed && mag_c < 3.0f) {
-            mag_c = 3.0f;
-          }
-#endif
-          rpm_data[3] = sys_c * 1000.0f + gyr_c * 100.0f + acc_c * 10.0f + mag_c;
-          // Auto-persist the calibration offsets the FIRST time full
-          // calibration (all four sub-scores == 3, i.e. c == 0xFF) is seen
-          // this boot -- see bno055_save_calibration()'s docstring. After
-          // this, a power cycle restores it via bno055_load_calibration()
-          // in bno055_init() instead of needing the manual wave-around
-          // dance again.
-          if (!bno_calib_saved_this_boot && c == 0xFF) {
-            bno055_save_calibration();
-            bno_calib_saved_this_boot = true;
-          }
-        }
+        rpm_data[2] = imu_heading_deg_cached;  // NaN if IMU absent/never reported
+        // SYS/GYR/ACC digits (thousands/hundreds/tens) all carry the Game
+        // Rotation Vector's own accel+gyro-derived accuracy status --
+        // informational only, nothing currently gates on them. The
+        // ones/MAG digit carries the GYROSCOPE'S OWN independent status
+        // instead (see gyro_accuracy_cached's comment above for why --
+        // switched from magnetometer 2026-08-14, see file header) -- that's
+        // the digit --imu-min-mag-calib actually gates theta-trust on,
+        // Pi-side.
+        rpm_data[3] = imu_accuracy_cached * 1110.0f + gyro_accuracy_cached;
         rcl_publish(&rpm_pub, &rpm_msg, NULL);
 
         // NOTE: Serial is the XRCE-DDS transport — do NOT Serial.print() here.
@@ -720,7 +723,12 @@ void loop() {
  * FLASHING  (new ESP32 — first flash)
  * ───────────────────────────────────
  * Board  : ESP32 Dev Module          Speed : 115200          Port : /dev/ttyUSB0 (Pi)
- * Library: micro_ros_arduino (Humble)
+ * Library: micro_ros_arduino (Humble), Adafruit_BNO08x + Adafruit_BusIO +
+ *          Adafruit_Sensor (cloned straight from github.com/adafruit into
+ *          ~/Arduino/libraries/ on the GPU host, 2026-08-14 — no offline
+ *          package/version pin exists for these yet, unlike micro_ros_arduino;
+ *          if a future recompile behaves differently, check these libraries'
+ *          installed commit first).
  *
  * Compile on the GPU host (offline toolchain), flash from the Pi with esptool.
  * Kill the micro-ROS respawn wrappers first (see esp32-flashing-procedure memo).
@@ -736,8 +744,19 @@ void loop() {
  *   3. Command a slow forward and confirm both wheels hold speed (closed loop).
  *      Set CLOSED_LOOP 0 to fall back to open-loop feedforward if needed.
  *   4. ros2 topic echo /rover/rpm — a 3rd array element should now appear.
- *      A real number (not NaN) confirms the BNO055 wiring (VIN/GND/SDA/SCL)
- *      is correct and the sensor acked its CHIP_ID at boot; NaN means
- *      bno055_init() never saw the sensor -- check wiring before trusting
- *      any heading-based feature built on this field.
+ *      A real number (not NaN) confirms the BNO08x wiring (VIN/GND/SDA/SCL)
+ *      is correct and begin_I2C()/enableReport() succeeded at boot; NaN means
+ *      bno08x_init() never saw the sensor, OR it's wired/addressed correctly
+ *      but the ADR jumper is soldered (chip is actually answering at 0x4B,
+ *      not the BNO08X_I2C_ADDR default of 0x4A) -- check wiring AND the
+ *      jumper before trusting any heading-based feature built on this field.
+ *   5. DONE 2026-08-14 — heading sign validated live over cmd_vel/rover/rpm,
+ *      two passes (first pass caught a real CCW-vs-CW convention mismatch
+ *      against the Pi side, fixed with a negation — see
+ *      bno08x_heading_from_quat()'s comment and the file header for the
+ *      full story). Final confirmed behavior: commanded angular_z=+0.5 for
+ *      3s (left_rpm ~-31 / right_rpm ~+30, a real CCW rotation) produced a
+ *      smooth, monotonic heading DECREASE (271.8deg -> 175.4deg) with no
+ *      jumps/reversal — matches the old BNO055's compass CW+ convention.
+ *      Absolute zero-offset (vs. a compass/landmark) was NOT checked.
  */

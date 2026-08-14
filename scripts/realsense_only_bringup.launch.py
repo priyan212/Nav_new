@@ -92,8 +92,9 @@ def generate_launch_description():
             "enable_infra2": False,
             # Also implicated in the same hang (see module docstring) --
             # left False until the underlying USB issue is fixed. Not used
-            # for heading/odometry even once re-enabled (BNO055 stays the
-            # heading source -- the D435i's IMU is a raw BMI055, no
+            # for heading/odometry even once re-enabled (the ESP32's own
+            # IMU -- BNO085/BNO08x as of 2026-08-14, was BNO055 -- stays
+            # the heading source; the D435i's IMU is a raw BMI055, no
             # magnetometer/fusion, so it's only intended as a per-frame
             # camera-tilt input to obstacle_guard's ground-plane estimate,
             # not anything integrated over time).
