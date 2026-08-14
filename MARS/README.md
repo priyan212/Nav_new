@@ -79,7 +79,15 @@ Two processes over Zenoh (same contract as the Isaac Sim setup):
   `cmd_vel` (ROS Twist, +angular = left) with a rover-style 0.5 s watchdog,
   and `mars/reset`. Ground height via bullet raycast; kinematic agent.
   Verified: fwd/turn signs match ROS, 10 Hz feed, DINO detects the rocks
-  (~0.5-0.6 score for "big stone"/"rock"/"boulder").
+  (~0.5-0.6 score for "big stone"/"rock"/"boulder"). `RoverAgent` also layers
+  small camera-only pitch/roll/bounce onto the published camera pose — a
+  low-pass terrain-slope tilt (from a 4-point raycast under the chassis) plus
+  a speed-scaled high-frequency vibration, mimicking the real rover's camera
+  shake over uneven ground. Cosmetic only: `mars/pose`'s x/z/yaw ground truth
+  is unaffected, it only perturbs what the simulated camera sees. `reset()`
+  seeds the shake state immediately instead of leaving it at its pre-reset
+  value, so a reset doesn't snap the very next published frame through a
+  stale tilt.
 - `scripts/mars_gui.py` (internnav env) — the Isaac GUI adapted for Mars:
   same camera + trajectory panels, Mars presets ("big stone", "boulder", ...),
   **Random goal** (random world point 4-8 m ahead, NavDP point-goal using

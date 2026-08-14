@@ -553,6 +553,106 @@ mound"`, `"excavator"`, `"bush"`.
 
 ---
 
+## 16. `LAUNCH/launch_point_goal_navdp.sh` — point-goal obstacle-avoidance benchmark, in-process NavDP
+
+Added after this cheatsheet's first pass (2026-08-14 afternoon), same
+`--rover`/`--hiwonder` backend flag as everything above. Instead of a
+DINO-detected target, `nav_pipeline.point_goal_gui` drives toward a FIXED,
+imaginary point goal a straight-line distance directly ahead of wherever the
+rover is currently facing, re-derived from odometry every tick (never
+visually lost/re-acquired) — so after avoiding an obstacle it always
+re-lines up on the original line. Built for benchmarking obstacle-avoidance
+quality in isolation from target-detection quality. NavDP sampling runs
+in-process with the official standalone crossmodal checkpoint, same as plain
+`launch_rover.sh` — no separate server needed.
+
+```
+./LAUNCH/launch_point_goal_navdp.sh [--rover|--hiwonder] [PI_IP] [point_goal_gui.py flags...]
+```
+
+Hardcoded by the script (not overridable via the flags below): `--max-linear
+0.15`, `--max-angular $BACKEND_MAX_ANGULAR`, `--fov $BACKEND_FOV`,
+`--servo-ramp-deg 70`, `--angular-slew-max $BACKEND_ANGULAR_SLEW_MAX`,
+`--compressed-only`, plus `--footprint-length/--footprint-width` when
+`--hiwonder`.
+
+`point_goal_gui.py`'s own flags (forwarded — also apply to `launch_point_goal.sh`,
+#17 below, which shares this same GUI/argparse underneath):
+
+| flag | default | meaning |
+|---|---|---|
+| `--goal-distance M` | `3.0` | straight-line distance to the fixed point goal, GUI-editable |
+| `--arrival-radius M` | `0.4` | odometry-only arrival radius for the point goal |
+| `--avoid TEXT` | `""` | named object for DINO to detect and show in-frame; only actually *steers* on the HTTP/S2Diff variant (#17) — see caveat below |
+| `--policy-type {crossmodal,extracted}` | `crossmodal` | overridden to `extracted` by #17's launcher only |
+| `--pi-ip IP` | `None` | overridden by the script |
+| `--predict-hz N` | `2.5` | — |
+| `--fov DEG` | `90.0` | overridden by the script (`$BACKEND_FOV`) |
+| `--device STR` | `cuda:0` | — |
+| `--max-linear M/S` | `0.5` | overridden by the script (`0.15`) |
+| `--max-angular RAD/S` | `0.4` | overridden by the script (`$BACKEND_MAX_ANGULAR`) |
+| `--servo-ramp-deg DEG` | `35.0` | overridden by the script (`70`) |
+| `--angular-slew-max RAD/S` | `0.10` | overridden by the script (`$BACKEND_ANGULAR_SLEW_MAX`) |
+| `--invert-angular` | off | flip turn direction |
+| `--depth-encoder {vits,vitb}` | `vits` | — |
+| `--compressed-only` | off | forced on by the script |
+| `--odometry-log-dir DIR` | `odometry_log` | — |
+| `--imu-min-mag-calib INT` | `3` | IMU calibration digit (0-3) gating theta onto the IMU heading |
+| `--footprint-length M` | `0.482` | — |
+| `--footprint-width M` | `0.380` | — |
+
+On this in-process variant, the named `--avoid` field's DINO detection runs
+and is shown in the camera view, but nothing consumes it as pixel-obstacle
+guidance (only #17's HTTP-patched S2Diff sampler reads it — see
+`pipeline.py`'s `step()` docstring). Obstacle avoidance here comes entirely
+from real/estimated depth (`obstacle_guard.py`'s AVOID state + swept-trajectory
+clearance veto), same as every other plain launcher.
+
+```bash
+./LAUNCH/launch_point_goal_navdp.sh                          # default rover, default Pi IP
+./LAUNCH/launch_point_goal_navdp.sh 192.168.21.125
+./LAUNCH/launch_point_goal_navdp.sh 192.168.21.125 --arrival-radius 0.3
+./LAUNCH/launch_point_goal_navdp.sh --hiwonder --goal-distance 5
+```
+
+---
+
+## 17. `LAUNCH/launch_point_goal.sh` — point-goal obstacle-avoidance benchmark, HTTP-served S2Diff NavDP
+
+Same point-goal GUI as #16, but NavDP sampling is delegated over HTTP to a
+separately-started `tryout/navdp_s2diff_server.py` — the exact same server
+`launch_rover_s2diff_http.sh` (#4) uses. Here the named `--avoid` field
+actually steers: it drives S2Diff's pixel-obstacle guidance on every DDPM
+denoising step, so this is the variant for benchmarking S2Diff guidance
+quality specifically, not just plain depth-based avoidance. Forces
+`--policy-type extracted` itself (the HTTP server only serves the extracted
+checkpoint) — runs `nav_pipeline.point_goal_http_runner`, which pre-parses
+`--server-url`/`--fov`/`--footprint-length`/`--footprint-width`/
+`--stop-threshold` for the guidance module's geometry (same
+`--server-url`/`--stop-threshold` as #4's table), then hands everything else
+straight to `point_goal_gui.main()` unchanged — same flag table as #16
+above otherwise.
+
+⚠ **Start the server first, in its own terminal** (identical to #4):
+
+```bash
+source /home/i3d/exit/etc/profile.d/conda.sh && conda activate internnav
+cd tryout && python navdp_s2diff_server.py --checkpoint ../checkpoints/navdp_extracted.pth --port 8888
+```
+
+```
+./LAUNCH/launch_point_goal.sh [--rover|--hiwonder] [PI_IP] [point_goal_gui.py flags...]
+```
+
+```bash
+./LAUNCH/launch_point_goal.sh                          # default rover, default Pi IP, server on localhost:8888
+./LAUNCH/launch_point_goal.sh 192.168.21.125
+./LAUNCH/launch_point_goal.sh 192.168.21.125 --arrival-radius 0.3
+./LAUNCH/launch_point_goal.sh --hiwonder --avoid "cardboard box"
+```
+
+---
+
 ## Not currently runnable
 
 `ISAAC/launch_isaac_topo_repeat.sh` (topological-repeat-navigation

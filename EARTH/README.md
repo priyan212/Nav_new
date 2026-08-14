@@ -94,7 +94,10 @@ forwarded to the GUI unchanged:
   sim depth), `earth/pose` (JSON `{"x","z","yaw","t"}` ground truth);
   subscribes `cmd_vel`/`rt/cmd_vel` (Twist, 0.5 s watchdog) and `earth/reset`
   (`"x,z,yaw"`, empty = default start). Topics are namespaced `earth/*` so
-  MARS and EARTH nodes could in principle run side by side.
+  MARS and EARTH nodes could in principle run side by side. Shares MARS's
+  `RoverAgent` (same file layout/logic, see [MARS/README.md](../MARS/README.md#running-the-nav-stack-on-mars)),
+  including the cosmetic terrain-slope pitch/roll/bounce camera shake —
+  `earth/pose`'s x/z/yaw ground truth is unaffected.
 - `scripts/earth_gui.py` (internnav env) — the DINO+NavDP GUI, presets
   `["yellow building", "target sign", "parked car", "sand mound",
   "excavator", "bush"]` chosen from the survey renders, plus an asymmetric
