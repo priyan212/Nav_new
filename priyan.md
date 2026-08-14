@@ -1,6 +1,7 @@
 ```
 Hello new user of this repo, I'm Priyan an intern at this lab.
 If you need any help contact through GitHub: priyan212
+Or LinkedIn - Priyan Malakar
 ****PLEASE KEEP THE READMES UPDATED****
 ```
 
@@ -36,9 +37,9 @@ sources `LAUNCH/_backend.sh`. Pass `--rover` or `--hiwonder` as any argument
 | Pi bring-up | systemd services (`rover-camera`/`rover-agent`/`rover-zenoh`) | `landerpi/deploy_bridge.sh` (docker exec into `armpi_pro`) |
 | Default Pi IP | `192.168.21.125` (churns — verify if unreachable) | `10.47.234.228` |
 | Default SSH password | `hri` | `raspberrypi` |
-| Camera FOV | `60°` (Logitech webcam) | `64.6°` (usb_cam intrinsics) |
+| Camera FOV | `55.5°` (RealSense D435i, color-only — swapped in for a 60° Logitech webcam 2026-08-11; depth+IMU disabled on the stock ROS 2 wrapper for now, see `scripts/realsense_direct_publisher.py`) | `64.6°` (usb_cam intrinsics) |
 | `--max-angular` | `1.2` rad/s (matches ESP32 firmware normalization) | `0.5` rad/s (conservative, carried over) |
-| `--search-angular` | `0.18` rad/s (tuned 2026-08-12, ESP32 `VEL_DEADBAND_MS` floor) | `0.13` rad/s (old rover's carried-over value, unvalidated on this chassis) |
+| `--search-angular` | `0.174` rad/s (theoretical-min floor, set 2026-08-14 at explicit user request — 0.18, tuned 2026-08-12, is the last reliably-working value if this needs backing off) | `0.13` rad/s (old rover's carried-over value, unvalidated on this chassis) |
 | `--angular-slew-max` | `0.10` rad/s/tick (pipeline.py default) | `0.05` rad/s/tick (halved 2026-08-10, re-ID continuity fix) |
 | `--footprint-length` / `--footprint-width` | not passed (uses `pipeline.py` default `0.482 x 0.380` m) | `0.298 x 0.256` m (ArmPi Pro spec sheet, **not tape-measured**) |
 

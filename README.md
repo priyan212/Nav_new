@@ -1,6 +1,7 @@
 ```
 Hello new user of this repo, I'm Priyan an intern at this lab.
 If you need any help contact through GitHub: priyan212
+Or LinkedIn - Priyan Malakar
 ****PLEASE KEEP THE READMES UPDATED****
 ```
 
@@ -134,13 +135,16 @@ not every power-cycle), simpler mechanism.
   re-acquire-on-loss hop between different physical objects each time the
   tracked one scrolls out of frame — the rover keeps turning the same way
   chasing "whichever one is in view now" without ever closing distance on
-  any of them. If the dead-reckoned pose racks up more than a full rotation
-  within 15 s (`SPIN_WINDOW_S`) while translating less than 0.3 m
-  (`SPIN_DIST_THRESH_M`), the GUI force-stops and shows `SPIN STALL` instead
-  of spinning indefinitely — latched until a new target is sent. Caught a
-  real ~145 s / 17-turn incident during testing; see the CSV history for how
-  to recognize the signature (θ monotonically running away while x, y barely
-  move).
+  any of them. If the dead-reckoned pose racks up more than 1.5 rotations
+  (`SPIN_ROT_THRESH_RAD`, `3π`) within 20 s (`SPIN_WINDOW_S`) while
+  translating less than 0.3 m (`SPIN_DIST_THRESH_M`), the GUI force-stops and
+  shows `SPIN STALL` instead of spinning indefinitely — latched until a new
+  target is sent. Loosened from the original 15 s / 1 turn on 2026-08-14 (at
+  user request) to give one legitimate reacquire swing more slack before
+  tripping; still comfortably catches the real ~145 s / 17-turn incident
+  during testing that motivated it (~2.3 turns per any 20 s window at that
+  pace). See the CSV history for how to recognize the signature (θ
+  monotonically running away while x, y barely move).
 
 ## Goal belief (surviving occlusion)
 
@@ -301,7 +305,7 @@ the speed caps change:
 
 | Target | Launcher | Camera/depth source | Notes |
 |---|---|---|---|
-| **Real rover** (6WD, ESP32 + micro-ROS) | `./LAUNCH/launch_rover.sh` | Pi camera (compressed JPEG only — raw RGB saturates the rover's Wi-Fi) | Brings the Pi's systemd services up, waits for camera + ESP32 heartbeat, then starts the GUI at real-world speed caps |
+| **Real rover** (6WD, ESP32 + micro-ROS) | `./LAUNCH/launch_rover.sh` | RealSense D435i, color stream only (compressed JPEG — raw RGB saturates the rover's Wi-Fi); swapped in for an older v4l2 webcam 2026-08-11. Depth+IMU are currently disabled on the stock ROS 2 wrapper (a USB hang bug on this Pi 4 when depth runs alongside color — see `scripts/realsense_direct_publisher.py`), so depth still comes from monocular Depth Anything V2 in practice | Brings the Pi's systemd services up, waits for camera + ESP32 heartbeat, then starts the GUI at real-world speed caps |
 | **Hiwonder LanderPi** (Mecanum chassis) | `./LAUNCH/launch_rover.sh --hiwonder` | LanderPi's `usb_cam` (compressed JPEG) | Same GUI/pipeline, different Pi bring-up (`landerpi/deploy_bridge.sh` instead of systemd services) and lower speed caps — see [The `--rover` / `--hiwonder` backend flag](#the---rover----hiwonder-backend-flag) and [landerpi/README.md](landerpi/README.md) |
 | **Isaac Sim** digital twin | `./LAUNCH/launch_gui.sh` | Isaac's simulated camera + depth over Zenoh | Needs the Isaac scene playing and its ROS 2 bridge scripts running first (see script header) |
 | **Mars habitat sim** (Habitat-Sim, ERC Marsyard terrain) | `./MARS/launch_mars.sh --rocks` | Habitat's simulated camera + perfect depth | Separate `mars_habitat` conda env for the sim node; see [MARS/README.md](MARS/README.md) |
@@ -387,6 +391,8 @@ combinations for every one of these live in [priyan.md](priyan.md).
 | `launch_rover_s2diff.sh` | `launch_rover.sh`'s same GUI/bring-up, but `nav_pipeline.s2diff_runner` — NavDP sampling routed through in-process S2Diff obstacle guidance instead of `isaac_gui.py`'s plain DDPM sampler |
 | `launch_rover_s2diff_http.sh` | Same GUI again, but NavDP sampling routed over HTTP to a separately-started `tryout/navdp_s2diff_server.py` instead of running in-process — needs that server already running |
 | `launch_rover_vitb_s2diff.sh` | `launch_rover_s2diff.sh` + `--depth-encoder vitb` (both experimental changes at once) |
+| `launch_point_goal_navdp.sh` | Same GUI skeleton as `launch_rover.sh`, but `nav_pipeline.point_goal_gui` — a fixed, odometry-derived straight-line world-frame point goal instead of a DINO-detected target, for benchmarking obstacle avoidance in isolation from detection quality; in-process crossmodal NavDP |
+| `launch_point_goal.sh` | Same point-goal benchmark GUI, routed through the HTTP-served S2Diff NavDP variant instead (needs `tryout/navdp_s2diff_server.py` already running) — lets a named "obstacle to avoid" field drive S2Diff's pixel-obstacle guidance |
 | `launch_rover_remind.sh` | Pi bring-up + REMIND live server (own conda env) + `remind_gui.py` — persistent per-object ID targeting instead of a bare DINO phrase |
 | `launch_rover_home.sh` | Thin wrapper around `launch_bot.sh` — manual control + Go Home, kept for backward-compatible muscle memory |
 | `launch_bot.sh` | Manual control + Go Home (`home_gui.py`) on either backend; `--enable-obstacle-avoidance` opts into full NavDP-guided homing |
@@ -418,6 +424,7 @@ combinations for every one of these live in [priyan.md](priyan.md).
 - `home_gui.py` — manual control + Go Home panel; camera-free/no-GPU by default (fused encoder+IMU pose only), or opt into NavDP obstacle avoidance for the homing leg via `--enable-obstacle-avoidance`, launched via `./LAUNCH/launch_bot.sh` / `./LAUNCH/launch_rover_home.sh` (see [Manual control + Go Home](#manual-control--go-home))
 - `s2diff_navdp.py`, `s2diff_runner.py` — in-process S2Diff obstacle-guided NavDP sampling and its `isaac_gui.py`-equivalent runner, launched via `LAUNCH/launch_rover_s2diff.sh` (see `tryout/S2DIFF_GUIDANCE.md`)
 - `s2diff_http_client.py`, `s2diff_http_runner.py` — same S2Diff guidance, but sampling delegated over HTTP to `tryout/navdp_s2diff_server.py` instead of running in-process, launched via `LAUNCH/launch_rover_s2diff_http.sh`
+- `point_goal_gui.py`, `point_goal_http_runner.py` — `isaac_gui.py`-equivalent GUIs with a fixed, odometry-derived straight-line point goal instead of a DINO-detected target, for benchmarking obstacle avoidance in isolation from detection quality; launched via `LAUNCH/launch_point_goal_navdp.sh` (in-process NavDP) / `LAUNCH/launch_point_goal.sh` (HTTP-served S2Diff NavDP)
 - `scene_tagger.py` — passive open-vocabulary object-inventory tagging (broad Grounding DINO vocabulary, ~1 Hz, independent of the current goal), called from `pipeline.py`, logged to `scene_log/` (own README)
 - `dinov2_embedder.py` — DINOv2 appearance descriptors used by REMIND-adjacent re-identification/appearance-similarity checks
 - `zenoh_node.py` — headless transport node, same Zenoh/CDR contract as the old OmniVLA node
@@ -447,6 +454,8 @@ where noted:
 - `demo_odom_accuracy_gui.py` — offline/no-hardware demo of the odometry-accuracy GUI's plotting
 - `extract_navdp_weights.py` — pulls the 198 MB NavDP head out of the 16 GB InternVLA-N1 checkpoint
 - `pi_install_services.sh` / `pi_auto_handshake.sh` — run **on the Pi**: install the camera/agent/zenoh systemd services and recover a wedged ESP32 micro-ROS session without a physical reset button
+- `realsense_only_bringup.launch.py` — ROS 2 launch file for the rover's RealSense D435i, run on the Pi by `rover-camera.service`; color stream only for now, depth+IMU disabled in it (see next bullet)
+- `realsense_direct_publisher.py` — standalone librealsense-based color+depth publisher for the same D435i, bypassing the ROS 2 wrapper's depth-enabled USB hang on this Pi 4 entirely (talks Zenoh directly, no ROS 2 involved); verified working where the wrapper isn't, but not yet wired into `rover-camera.service` as the default
 
 ### `esp32/`
 
