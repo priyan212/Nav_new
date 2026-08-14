@@ -163,7 +163,7 @@ class PipelineConfig:
     # Periodic open-vocabulary scene inventory (independent of the goal
     # target): "what's in the frame right now", counted per label and logged
     # for later route-finding. Reuses the DINO detector already loaded above.
-    use_scene_tagger: bool = True
+    use_scene_tagger: bool = False
     scene_tag_period_s: float = 1.0
     scene_vocab: List[str] = field(default_factory=lambda: list(DEFAULT_VOCAB))
     scene_log_dir: str = "scene_log"   # one JSONL file per run; set to None/"" to disable file logging
