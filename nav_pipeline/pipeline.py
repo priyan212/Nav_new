@@ -49,6 +49,7 @@ from .obstacle_guard import (
     forward_guard,
     swept_clearance,
 )
+from .qwen_pixel_goal import parse_direct_motion, parse_direct_motion_sequence
 from .scene_tagger import DEFAULT_VOCAB
 
 
@@ -111,11 +112,128 @@ def _bbox_exclude_mask(box: np.ndarray, height: int, width: int) -> np.ndarray:
     return mask
 
 
+def _disc_mask(u: float, v: float, height: int, width: int, radius: int = 14) -> np.ndarray:
+    """Small boolean disc mask around a pixel. Lets a Qwen instruction-
+    grounded pixel goal (qwen_pixel_goal.py) reuse mask_median_depth's
+    existing robust depth sampling instead of reading one noisy pixel, and
+    doubles as res.mask so the obstacle guard excludes the goal's own
+    surface the same way a DINO/SAM mask already does (see _step_inner's
+    exclude_mask handling) -- otherwise the goal point could veto its own
+    approach as an obstacle."""
+    mask = np.zeros((height, width), dtype=bool)
+    cu, cv = int(round(u)), int(round(v))
+    r = max(int(radius), 1)
+    y0, y1 = max(cv - r, 0), min(cv + r + 1, height)
+    x0, x1 = max(cu - r, 0), min(cu + r + 1, width)
+    if y0 >= y1 or x0 >= x1:
+        return mask
+    ys, xs = np.ogrid[y0:y1, x0:x1]
+    disc = (xs - cu) ** 2 + (ys - cv) ** 2 <= r * r
+    mask[y0:y1, x0:x1][disc] = True
+    return mask
+
+
+def score_instruction_candidates(
+    candidates: list, depth: np.ndarray, fx: float, fy: float, cx: float, cy: float,
+    belief_mu: Optional[np.ndarray], belief_locked: bool, obstacle_pts: Optional[np.ndarray],
+    guard_cfg: GuardConfig, semantic_weight: float, continuity_weight: float,
+    continuity_scale_m: float, collision_weight: float, collision_scale_m: float = 0.5,
+    far_lookahead_m: float = 0.0, depth_trust_horizon_m: float = 0.0,
+) -> Optional[tuple]:
+    """Score each qwen_pixel_goal.PixelGoal candidate's 3D goal (converted
+    via depth) against semantic confidence, continuity with the current
+    locked belief, and obstacle cost along a straight path to it; return
+    (xyz, winning_candidate, disc_mask, far_mode) for the best-scoring
+    candidate, or None if none scored. See PipelineConfig.qwen_max_
+    candidates for the full score formula and rationale (arxiv 2605.19420,
+    adapted from a dense heatmap to a handful of discrete VLM candidates).
+
+    Long-range handling (far_lookahead_m > 0): the monocular metric depth
+    model is unreliable past ~6-8m, so a grounded pixel whose depth reads
+    None (a hole) or > depth_trust_horizon_m is NOT trusted as a metric
+    range -- instead the goal is placed at far_lookahead_m along that
+    pixel's bearing ray and far_mode=True is returned, so the caller drives
+    the correct heading and re-grounds as it closes distance (rather than
+    dropping the candidate, which stranded the rover coasting a stale lock).
+
+    obstacle_pts, if given (even empty), are this tick's depth-derived
+    obstacle points in robot frame (obstacle_guard.depth_to_obstacle_points'
+    output) -- None skips the collision term entirely (cost 0 for every
+    candidate), matching cfg.avoid_enabled=False's existing meaning
+    elsewhere in this pipeline.
+    """
+    from .goal_utils import pixel_depth_to_point
+    from .sam_segmenter import mask_median_depth
+
+    H, W = depth.shape[:2]
+    best = None
+    best_score = -np.inf
+    for cand in candidates:
+        if not cand.in_view:
+            continue
+        disc = _disc_mask(cand.u, cand.v, H, W, radius=14)
+        d = mask_median_depth(depth, disc)
+        far_mode = False
+        if far_lookahead_m > 0.0 and (
+            d is None or (depth_trust_horizon_m > 0.0 and d > depth_trust_horizon_m)
+        ):
+            d = far_lookahead_m
+            far_mode = True
+        elif d is None:
+            continue
+        xyz = pixel_depth_to_point(cand.u, cand.v, d, fx, fy, cx, cy)
+
+        sem = semantic_weight * float(cand.confidence)
+        if belief_locked and belief_mu is not None:
+            dist = float(np.linalg.norm(xyz[:2] - belief_mu[:2]))
+            cont = continuity_weight * float(np.exp(-dist / max(continuity_scale_m, 1e-6)))
+        else:
+            cont = continuity_weight * 1.0   # nothing locked yet -- no penalty for a fresh acquisition
+
+        collision_cost = 0.0
+        if obstacle_pts is not None and obstacle_pts.shape[0] > 0:
+            yaw = float(np.arctan2(xyz[1], xyz[0]))
+            T = 10
+            traj = np.stack([
+                np.linspace(0.0, xyz[0], T, dtype=np.float32),
+                np.linspace(0.0, xyz[1], T, dtype=np.float32),
+                np.full(T, yaw, dtype=np.float32),
+            ], axis=1)[None]
+            clearance = float(swept_clearance(traj, obstacle_pts, guard_cfg)[0])
+            # Normalized against collision_scale_m (default 0.5m), NOT
+            # guard_cfg.slow_dist (3.2m, the far outer edge of the AVOID
+            # blend zone elsewhere in this pipeline) -- real swept-clearance
+            # values live in the 0-1m range (guard_cfg.margin=0.10m is
+            # already "safe enough" to select a trajectory elsewhere in
+            # _select_trajectory), so normalizing against slow_dist made
+            # nearly every realistic clearance register as high cost,
+            # swamping the semantic/continuity terms regardless of how
+            # clear a path actually was (caught by testing before this
+            # shipped -- a candidate with a genuinely clear 0.33m gap was
+            # scored as costly as one with a hull-overlapping obstacle).
+            if np.isfinite(clearance):
+                collision_cost = float(np.clip(1.0 - clearance / max(collision_scale_m, 1e-6), 0.0, 1.0))
+
+        score = sem + cont - collision_weight * collision_cost
+        if score > best_score:
+            best_score = score
+            best = (xyz, cand, disc, far_mode)
+    return best
+
+
 @dataclass
 class PipelineConfig:
     device: str = "cuda:0"
     horizontal_fov_deg: float = 90.0
     sample_num: int = 32
+    # Grounding DINO: loaded unconditionally by default (this class's
+    # original purpose). Set False only for a pure Qwen-instruction setup
+    # (use_qwen_instruction=True) with no plans to ever pass avoid_text or a
+    # plain text target to step() -- doing either with this off raises
+    # instead of silently doing nothing. Saves ~1GB+ VRAM and load time by
+    # not loading a model that mode never calls. use_scene_tagger requires
+    # this True (checked at construction, not per-tick).
+    use_dino: bool = True
     # policy backend:
     #   "crossmodal" - official standalone NavDP (navdp-cross-modal.ckpt),
     #                  strong trained point-goal conditioning, y-left convention
@@ -157,6 +275,12 @@ class PipelineConfig:
     #                                  change tick to tick, e.g. the snap when entering/leaving SEARCH
     #                                  or AVOID's full-authority turn. 0 = off. At predict_hz≈3, 0.10
     #                                  reaches max_angular (0.25 real-rover default) in ~3 ticks.
+    # ESP32 6WD rover only (see clear_wheel_deadband) -- False by default
+    # since PipelineConfig is also used by sim GUIs and the Hiwonder
+    # backend, where this hardware-specific correction doesn't apply.
+    wheel_deadband_correction: bool = False
+    track_width_m: float = 0.345          # must match esp32/rover_6wd_complete.ino's TRACK_WIDTH_M
+    wheel_vel_deadband_ms: float = 0.03   # must match esp32/rover_6wd_complete.ino's VEL_DEADBAND_MS
     avoid_confirm_ticks: int = 2     # consecutive guard hits before AVOID engages
     avoid_cooldown_ticks: int = 8    # keep biasing steering away from the escape side for this many
     #                                  more ticks after AVOID releases, so the rover actually clears the
@@ -198,6 +322,107 @@ class PipelineConfig:
     # target loss behavior
     search_angular: float = 0.15     # spin to re-acquire when target not seen
     lost_patience: int = 5           # frames to keep last goal before searching
+    # Qwen2.5-VL "ghost pixel" search guidance (see qwen_search_guide.py):
+    # while SEARCH is active (DINO can't currently see target_text), a frozen
+    # Qwen2.5-VL-7B-Instruct points at the pixel it thinks is the best
+    # direction to look/move next (a doorway, opening, hallway...), and that
+    # replaces the fixed spin-toward-last-known-side. DINO keeps detecting
+    # every tick regardless (_step_inner calls it unconditionally); the
+    # instant it reacquires the target this branch is no longer entered, so
+    # Qwen is dropped automatically rather than explicitly switched off.
+    use_qwen_search: bool = False
+    qwen_model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct"
+    # 4-bit (bitsandbytes) measured at ~6.2GB VRAM vs fp16's ~16.6GB, on top
+    # of the rest of this pipeline's ~2.5GB (DINO+SAM+depth+NavDP+CLIP+
+    # DINOv2) -- ~8.7GB total, comfortable headroom on a 24GB card. Load
+    # time (~21s) and per-call latency (~0.7-1.0s) are close to fp16's;
+    # the pointed pixel shifts slightly (still lands on-target, e.g. still
+    # inside the correct DINO box on a repeat test) -- normal quantization
+    # variance, not a miss. bitsandbytes is a hard requirement for this
+    # default; set False if it's unavailable in a given env.
+    qwen_load_in_4bit: bool = True
+    qwen_search_period_s: float = 2.0  # wall-clock throttle -- 7B inference
+    #                                    takes seconds, not one pipeline tick
+    # Qwen2.5-VL instruction-grounded PRIMARY goal source (see
+    # qwen_pixel_goal.py) -- distinct from use_qwen_search above, which only
+    # ever steers SEARCH while chasing a DINO *text target*. Pass a free-text
+    # instruction to step()'s `instruction` argument to use this instead of
+    # DINO target detection entirely: Qwen points at the next waypoint pixel,
+    # that becomes NavDP's goal via depth, same as a DINO detection would.
+    use_qwen_instruction: bool = False
+    qwen_instruction_period_s: float = 1.5  # wall-clock throttle between Qwen
+    #  calls; GoalBelief propagates the goal by ego-motion in between -- the
+    #  same belief-coasting a lost DINO detection already falls back to.
+    # Consistency gate: DINO's target has box-IoU + DINOv2 appearance-reid
+    # (see _select_detection) rejecting a same-class-but-different object
+    # BEFORE it ever reaches belief.observe(), which itself just snaps to
+    # whatever it's given (see GoalBelief.observe's docstring). Qwen's
+    # instruction grounding has no such box/embedding to check -- a fresh
+    # query has zero memory of the last one, so if a SECOND door enters
+    # frame (e.g. mid obstacle-avoidance turn), it can get grounded and the
+    # snap-to-measurement update drags the goal onto it outright. This caps
+    # how far (meters) a new grounding may sit from the current CONFIDENT
+    # belief (sigma <= belief_max_sigma) before being rejected as "probably
+    # a different door" and coasted through instead of accepted -- the same
+    # "reject unless genuinely reacquiring" shape as DINO's lost_patience +
+    # appearance gate, just using position instead of appearance as the
+    # continuity test. Once sigma actually exceeds belief_max_sigma (this
+    # pipeline would already give up and SEARCH), the gate stops applying --
+    # that's a legitimate fresh acquisition, not a distractor.
+    qwen_goal_consistency_m: float = 1.5
+    # Multi-candidate, obstacle-aware grounding (arxiv 2605.19420, "Beyond
+    # Waypoints: Dual-Heatmap Grounding" -- adapted here to a frozen VLM
+    # that can only be prompted for discrete points, not a dense heatmap
+    # network). Instead of trusting Qwen's single best guess outright, ask
+    # for up to qwen_max_candidates ranked points (see qwen_pixel_goal.py's
+    # MULTI_CANDIDATE_PROMPT) and score each as
+    #   semantic_weight * confidence
+    #   + continuity_weight * exp(-dist_from_locked_belief / continuity_scale_m)
+    #   - collision_weight  * clip(1 - swept_clearance/guard.slow_dist, 0, 1)
+    # picking the best-scoring candidate as this tick's grounding, which
+    # THEN still passes through the qwen_goal_consistency_m gate above as a
+    # final check. A distractor door doesn't need a hard reject anymore --
+    # it can lose on points to a candidate that's both closer to the
+    # current lock AND has a clearer path, the same joint semantic/
+    # navigability tradeoff the paper's score makes, just over a handful of
+    # discrete candidates instead of a continuous field. 1 candidate
+    # (max_candidates=1) degrades to the old single-point behavior with no
+    # scoring to do.
+    qwen_max_candidates: int = 3
+    qwen_candidate_semantic_weight: float = 1.0
+    qwen_candidate_continuity_weight: float = 1.0
+    qwen_candidate_continuity_scale_m: float = 1.0   # e^-1 at this many meters off-lock
+    qwen_candidate_collision_weight: float = 2.0     # weighted heavier -- safety, not preference
+    qwen_candidate_collision_scale_m: float = 0.5    # clearance=0 -> cost 1, clearance>=this -> cost 0
+    #   (deliberately NOT guard.slow_dist -- see score_instruction_candidates's comment on why)
+    # Long-range grounding: the monocular metric depth model is unreliable
+    # past ~6-8m, so a grounded pixel whose depth is missing (a hole) or
+    # reads farther than qwen_depth_trust_horizon_m is treated as a BEARING
+    # only -- the goal is placed qwen_far_lookahead_m along that ray and the
+    # consistency gate is skipped for it, so the rover drives the right
+    # heading and re-grounds as it closes in, instead of rejecting every
+    # jittery far reading and coasting a stale lock forever. 0 disables
+    # (revert to the old "drop the candidate if depth is missing" behavior).
+    qwen_far_lookahead_m: float = 3.5
+    qwen_depth_trust_horizon_m: float = 6.0
+    # Direct-motion "turn left"/"turn right" (see qwen_pixel_goal.
+    # parse_direct_motion) rotate exactly this many degrees, heading-
+    # tracked via odometry pose -- not an open-ended curve-toward-a-point
+    # (real user spec 2026-09-07). Rotation rate reuses search_angular
+    # (already the vetted safe in-place-rotation rate for this robot, same
+    # one SEARCH's blind reacquire-sweep uses) rather than a new untuned
+    # constant.
+    direct_turn_deg: float = 90.0
+    # Wall-clock safety cap on that turn, as a multiple of its own
+    # theoretical duration (direct_turn_deg / search_angular) -- odometry
+    # can go stale/dead without warning (observed live 2026-09-07: the RPM
+    # feed froze mid-turn, pose stopped updating entirely, so the heading
+    # check alone spun for minutes -- an unrelated separate spin-stall
+    # watchdog was the only thing that eventually caught it). A turn this
+    # pipeline itself commanded can't legitimately need more than a
+    # generous multiple of its own expected duration, regardless of what
+    # the odometry feed says.
+    direct_turn_timeout_mult: float = 4.0
     # Ego-motion goal belief (see goal_belief.py): while the target isn't
     # detected, propagate the goal by the rover's own dead-reckoned motion
     # instead of coasting on a frozen last-seen point. False reverts to the
@@ -361,6 +586,53 @@ def bearing_to_angular(bearing: float, max_angular: float, ang_min_cmd: float,
     return float(np.copysign(magnitude, bearing))
 
 
+def clear_wheel_deadband(linear: float, angular: float, track_width_m: float,
+                         deadband: float, margin: float = 1.15) -> tuple:
+    """Boost (linear, angular) just enough that BOTH differential-drive
+    wheel targets clear the ESP32 rover firmware's hard per-wheel PWM
+    deadband (esp32/rover_6wd_complete.ino's VEL_DEADBAND_MS -- closed_loop_
+    pwm() hard-zeros any |target| below it: "stop request -> no windup").
+
+    drive_rover() there mixes wheels as
+        left_target  = linear_x - angular_z * TRACK_WIDTH_M / 2
+        right_target = linear_x + angular_z * TRACK_WIDTH_M / 2
+    search_angular already has its own floor for PURE rotation (see
+    launch_rover.sh: 0.174 rad/s clears VEL_DEADBAND_MS=0.03 at
+    TRACK_WIDTH_M=0.345 with zero margin; 0.18 is what's actually used).
+    That alone doesn't cover a COMBINED small linear + small angular:
+    mixing can put BOTH wheel targets under the deadband even when neither
+    linear nor angular individually looks like zero -- e.g. linear=0.02,
+    angular=0.0 gives left=right=0.02 < 0.03, so the firmware silently
+    commands zero PWM on both sides while the pipeline reports it's
+    driving. That's the "given nonzero linear/angular, rover doesn't move"
+    symptom this fixes.
+
+    A wheel target already >= deadband is left untouched. A wheel target
+    that's exactly 0.0 is left untouched too -- a deliberate "this wheel
+    shouldn't move" case (a true pivot), not the stall this targets. Only a
+    NONZERO-but-below-deadband wheel target gets bumped up to
+    deadband*margin (same "close to the floor with a bit of headroom"
+    shape as search_angular's 0.174->0.18), keeping its sign; left/right
+    are then converted back to (linear, angular).
+
+    Hardware-specific to the ESP32 6WD rover -- do not apply for
+    --hiwonder (different chassis/firmware entirely, see launch_rover.sh's
+    comment on why search_angular's floor doesn't carry over either) or
+    any sim backend.
+    """
+    if linear == 0.0 and angular == 0.0:
+        return 0.0, 0.0   # genuine stop/hold -- never inject motion
+    k = angular * track_width_m / 2.0
+    left, right = linear - k, linear + k
+    floor = deadband * margin
+
+    def _bump(v: float) -> float:
+        return float(np.copysign(floor, v)) if 0.0 < abs(v) < deadband else v
+
+    left, right = _bump(left), _bump(right)
+    return (left + right) / 2.0, (right - left) / track_width_m
+
+
 @dataclass
 class StepResult:
     linear: float = 0.0
@@ -376,6 +648,8 @@ class StepResult:
     critic: Optional[np.ndarray] = None
     obstacle_points: Optional[np.ndarray] = None
     min_forward: float = float("inf")
+    qwen_bearing: Optional[float] = None  # radians, +left -- set only when SEARCH used Qwen guidance
+    qwen_pixel_goal: Optional[tuple] = None  # (u, v) -- set only on ticks Qwen's instruction-grounded goal fired
     avoid_detection: Optional[object] = None  # this tick's named-obstacle DINO box, if avoid_text set
     avoid_pixels: Optional[np.ndarray] = None  # [N,2] u,v pixels covering it -- see _bbox_to_pixel_grid
     timing: dict = field(default_factory=dict)
@@ -385,7 +659,11 @@ class DinoNavDPPipeline:
     def __init__(self, cfg: PipelineConfig = PipelineConfig(), use_depth_estimator: bool = True):
         self.cfg = cfg
         t0 = time.time()
-        self.detector = GroundingDinoDetector(device=cfg.device, box_threshold=cfg.detect_score_min)
+        self.detector = (GroundingDinoDetector(device=cfg.device, box_threshold=cfg.detect_score_min)
+                          if cfg.use_dino else None)
+        if cfg.use_scene_tagger and not cfg.use_dino:
+            raise ValueError("use_scene_tagger requires use_dino=True (SceneTagger wraps the "
+                              "Grounding DINO detector directly)")
         if cfg.policy_type == "crossmodal":
             from .navdp_crossmodal import NavDPCrossModal
 
@@ -410,6 +688,29 @@ class DinoNavDPPipeline:
             from .dinov2_embedder import Dinov2Embedder
 
             self.reid = Dinov2Embedder(model_id=cfg.dinov2_model_id, device=cfg.device)
+        self._qwen_scheduler = None
+        if cfg.use_qwen_search:
+            from .qwen_search_guide import QwenSearchScheduler, QwenVLSearchGuide
+
+            qwen_guide = QwenVLSearchGuide(
+                model_id=cfg.qwen_model_id, device=cfg.device,
+                load_in_4bit=cfg.qwen_load_in_4bit, horizontal_fov_deg=cfg.horizontal_fov_deg,
+            )
+            qwen_guide._ensure_loaded()  # eager, like every other model below --
+            # otherwise the ~19s weight load lands on the first real mid-drive
+            # SEARCH tick instead of here at startup (measured: internnav env,
+            # fp16, 3090 Ti).
+            self._qwen_scheduler = QwenSearchScheduler(qwen_guide, period_s=cfg.qwen_search_period_s)
+        self._qwen_pixel_guide = None
+        self._qwen_instruction_gate = None
+        if cfg.use_qwen_instruction:
+            from .qwen_pixel_goal import QwenInstructionGate, QwenVLPixelGoal
+
+            self._qwen_pixel_guide = QwenVLPixelGoal(
+                model_id=cfg.qwen_model_id, device=cfg.device, load_in_4bit=cfg.qwen_load_in_4bit,
+            )
+            self._qwen_pixel_guide._ensure_loaded()  # eager, same reasoning as use_qwen_search above
+            self._qwen_instruction_gate = QwenInstructionGate(period_s=cfg.qwen_instruction_period_s)
         self.scene_tagger = None
         if cfg.use_scene_tagger:
             from .scene_tagger import SceneTagger
@@ -440,6 +741,13 @@ class DinoNavDPPipeline:
         self._memory_d: list = []
         self._lost_count = 0
         self._last_goal: Optional[np.ndarray] = None
+        self._motion_seq: Optional[list] = None       # parsed MotionStep list for a compound instruction
+        self._motion_seq_instr: Optional[str] = None  # instruction text it was parsed from (cache key)
+        self._motion_seq_idx = 0
+        self._motion_seq_step_start_pose: Optional[tuple] = None  # world-frame pose when the current step began
+        self._turn_active_kind: Optional[str] = None   # "left" | "right" -- direct-motion turn in progress
+        self._turn_start_theta: Optional[float] = None  # pose[2] when that turn began
+        self._turn_start_time: Optional[float] = None    # wall-clock when that turn began (staleness cap)
         self._last_box: Optional[np.ndarray] = None
         self._box_miss_count = 0
         self._avoid_streak = 0
@@ -453,10 +761,22 @@ class DinoNavDPPipeline:
         self._last_candidate_count = 0
         self._ambiguity_warned = False
         self._locked_embed: Optional[np.ndarray] = None
+        self._avoid_no_dino_warned = False  # print once per pipeline lifetime, not per reset()
 
     def reset(self):
         self.belief.reset()
+        if self._qwen_scheduler is not None:
+            self._qwen_scheduler.reset()
+        if self._qwen_instruction_gate is not None:
+            self._qwen_instruction_gate.reset()
         self._prev_pose = None
+        self._motion_seq = None
+        self._motion_seq_instr = None
+        self._motion_seq_idx = 0
+        self._motion_seq_step_start_pose = None
+        self._turn_active_kind = None
+        self._turn_start_theta = None
+        self._turn_start_time = None
         self._memory, self._memory_d = [], []
         self._lost_count = 0
         self._last_goal = None
@@ -472,6 +792,111 @@ class DinoNavDPPipeline:
         self._last_candidate_count = 0
         self._ambiguity_warned = False
         self._locked_embed = None
+
+    def _turn_complete(self, kind: str, pose: Optional[tuple]) -> bool:
+        """Direct-motion "turn left"/"turn right" state machine (see
+        PipelineConfig.direct_turn_deg and qwen_pixel_goal.parse_direct_
+        motion). Arms self._turn_start_theta/_turn_start_time on the first
+        call for a given kind, then compares against them on every later
+        call for that same kind -- pose[2] (OdometryLogger.theta)
+        accumulates continuously rather than wrapping to [-pi, pi], so a
+        plain difference across calls is already the correct signed
+        rotation, no angle-wrap handling needed. Returns True (and clears
+        the armed state, ready for the next turn) once EITHER:
+          - the rover has rotated direct_turn_deg from where this turn
+            began (the normal case), or
+          - direct_turn_timeout_mult x as long as that should ever take
+            has elapsed on the wall clock, regardless of what pose says --
+            odometry can go stale/dead silently (live 2026-09-07: the RPM
+            feed froze mid-turn, pose stopped updating at all, and the
+            heading check alone would have spun forever trusting it) -- a
+            turn this pipeline itself commanded can't legitimately need
+            longer than a generous multiple of its own expected duration.
+        False while still in progress or just armed. pose=None (no
+        odometry) can't measure rotation at all -- the timeout above is
+        still checked (it's wall-clock only), so this still eventually
+        completes rather than spinning forever with literally no signal.
+        """
+        now = time.time()
+        if self._turn_active_kind != kind or self._turn_start_theta is None:
+            self._turn_active_kind = kind
+            self._turn_start_theta = pose[2] if pose is not None else None
+            self._turn_start_time = now
+            return False
+        max_s = (np.radians(self.cfg.direct_turn_deg) / max(self.cfg.search_angular, 1e-6)
+                 * self.cfg.direct_turn_timeout_mult)
+        timed_out = self._turn_start_time is not None and (now - self._turn_start_time) >= max_s
+        rotated = (pose is not None and self._turn_start_theta is not None
+                   and abs(pose[2] - self._turn_start_theta) >= np.radians(self.cfg.direct_turn_deg))
+        if timed_out or rotated:
+            self._turn_active_kind = None
+            self._turn_start_theta = None
+            self._turn_start_time = None
+            return True
+        return False
+
+    def _ground_landmark_bearing(self, text: str, rgb: np.ndarray, depth: np.ndarray,
+                                  fx: float, fy: float, cx: float, cy: float,
+                                  res: "StepResult", timing: dict) -> Optional[np.ndarray]:
+        """Qwen-ground `text` this tick (if the instruction gate is due) and
+        return the resulting 3D goal point, or None if not due / nothing
+        scored / rejected as an off-lock distractor.
+
+        Deliberately has NO stop_distance/arrival check of its own --
+        used only for a "landmark" step inside a distance-gated compound
+        sequence (see qwen_pixel_goal.parse_direct_motion_sequence), where
+        arrival is decided purely by travelled distance, not proximity, so
+        this never self-declares STOP. A standalone (non-sequenced)
+        landmark instruction still goes through its own original inline
+        block in _step_inner with the normal stop_distance check -- this
+        is a parallel, narrower path for the sequenced case, deliberately
+        NOT a shared refactor of that already-proven standalone logic
+        (some duplication vs. that block is intentional: this method skips
+        its arrival check and its final `goal = qgoal` assignment, which
+        the caller does itself against a distance trigger instead).
+        """
+        now = time.time()
+        if not self._qwen_instruction_gate.due(now):
+            return None
+        t0 = time.time()
+        candidates = self._qwen_pixel_guide.ground_candidates(
+            rgb, text, max_candidates=self.cfg.qwen_max_candidates)
+        timing["qwen_instruction"] = time.time() - t0
+        locked = (self.cfg.use_belief_goal and self.belief.initialized
+                  and self.belief.sigma <= self.cfg.belief_max_sigma)
+        cand_obstacle_pts = depth_to_obstacle_points(depth, fx, fy, cx, cy, self.cfg.guard)
+        winner = score_instruction_candidates(
+            candidates, depth, fx, fy, cx, cy,
+            belief_mu=self.belief.mu if locked else None, belief_locked=locked,
+            obstacle_pts=cand_obstacle_pts, guard_cfg=self.cfg.guard,
+            semantic_weight=self.cfg.qwen_candidate_semantic_weight,
+            continuity_weight=self.cfg.qwen_candidate_continuity_weight,
+            continuity_scale_m=self.cfg.qwen_candidate_continuity_scale_m,
+            collision_weight=self.cfg.qwen_candidate_collision_weight,
+            collision_scale_m=self.cfg.qwen_candidate_collision_scale_m,
+            far_lookahead_m=self.cfg.qwen_far_lookahead_m,
+            depth_trust_horizon_m=self.cfg.qwen_depth_trust_horizon_m,
+        )
+        if winner is None:
+            return None
+        qgoal, pg, disc, far_mode = winner
+        if locked and not far_mode:
+            dist = float(np.linalg.norm(qgoal[:2] - self.belief.mu[:2]))
+            if dist > self.cfg.qwen_goal_consistency_m:
+                print(f"[qwen-instruction-debug] REJECTED best-scoring candidate "
+                      f"{dist:.2f}m from locked goal (> {self.cfg.qwen_goal_consistency_m}m) "
+                      f"-- likely a different target; coasting on the existing leg")
+                return None
+        elif far_mode:
+            print(f"[qwen-instruction-debug] far target -- depth untrusted, driving bearing "
+                  f"to a {self.cfg.qwen_far_lookahead_m:.1f}m look-ahead goal and re-grounding "
+                  f"as it closes")
+        res.qwen_pixel_goal = (float(pg.u), float(pg.v))
+        res.mask = disc
+        self._last_goal, self._lost_count = qgoal, 0
+        if self.cfg.use_belief_goal:
+            self.belief.observe(qgoal, confidence=pg.confidence)
+        return qgoal
 
     # weight given to a newly matched box when updating the tracked-box
     # reference. With several same-class objects close together, adjacent
@@ -697,7 +1122,7 @@ class DinoNavDPPipeline:
     def step(self, rgb: np.ndarray, target_text: str, depth: Optional[np.ndarray] = None,
              pose: Optional[tuple] = None, external_dets: Optional[list] = None,
              external_goal: Optional[np.ndarray] = None, avoid_text: str = "",
-             intrinsics: Optional[tuple] = None) -> StepResult:
+             intrinsics: Optional[tuple] = None, instruction: str = "") -> StepResult:
         """pose, if given: (x, y, theta) odometry at capture time -- stamped onto
         this tick's scene_log entry (see PipelineConfig.use_scene_tagger), and
         required for external_goal below. As of the object-map feature,
@@ -741,9 +1166,18 @@ class DinoNavDPPipeline:
         goal-point/obstacle-guard projection; None (the default, or a
         stale/missing camera_info) falls back to the FOV approximation
         exactly as before -- never regresses to "no intrinsics".
+
+        instruction, if non-empty (requires cfg.use_qwen_instruction):
+        bypasses DINO target detection entirely -- a frozen Qwen2.5-VL
+        grounds this free-text instruction to a pixel goal every
+        qwen_instruction_period_s, which becomes NavDP's 3D goal via depth
+        exactly like a DINO detection would (see qwen_pixel_goal.py).
+        target_text is ignored when this is set. Only consulted when
+        external_dets/external_goal are both absent -- those take priority,
+        same precedence as target_text.
         """
         res = self._step_inner(rgb, target_text, depth, pose, external_dets, external_goal,
-                                avoid_text, intrinsics)
+                                avoid_text, intrinsics, instruction)
         # stiction floor is now baked into bearing_to_angular's smooth ramp
         # for TRACK; AVOID commands max_angular directly and SEARCH's
         # search_angular is already comfortably above ang_min_cmd, so
@@ -754,9 +1188,12 @@ class DinoNavDPPipeline:
         # Excluded for SEARCH too: search_angular is deliberately tuned low,
         # but blending it with a leftover fast TRACK turn (up to max_angular)
         # dragged the effective search speed up for several ticks after the
-        # target was lost.
+        # target was lost. TURN (direct-motion "turn left"/"turn right",
+        # see _turn_complete) excluded for the same reason -- it also
+        # commands search_angular deliberately and shouldn't inherit
+        # momentum from whatever preceded it.
         a = self.cfg.smoothing
-        if a > 0 and res.state not in ("STOP", "SEARCH"):
+        if a > 0 and res.state not in ("STOP", "SEARCH", "TURN"):
             pl, pa = self._prev_cmd
             res.linear = (1 - a) * res.linear + a * pl
             res.angular = (1 - a) * res.angular + a * pa
@@ -767,13 +1204,20 @@ class DinoNavDPPipeline:
         if slew > 0:
             prev_a = self._prev_cmd[1]
             res.angular = max(prev_a - slew, min(prev_a + slew, res.angular))
+        # Last step, after every other shaping above: boost a command that
+        # would otherwise differential-mix down to a stalled wheel on the
+        # real ESP32 rover -- see clear_wheel_deadband's docstring. Applied
+        # to the FINAL command so it sees exactly what's about to be sent.
+        if self.cfg.wheel_deadband_correction:
+            res.linear, res.angular = clear_wheel_deadband(
+                res.linear, res.angular, self.cfg.track_width_m, self.cfg.wheel_vel_deadband_ms)
         self._prev_cmd = (res.linear, res.angular)
         return res
 
     def _step_inner(self, rgb: np.ndarray, target_text: str, depth: Optional[np.ndarray] = None,
                      pose: Optional[tuple] = None, external_dets: Optional[list] = None,
                      external_goal: Optional[np.ndarray] = None, avoid_text: str = "",
-                     intrinsics: Optional[tuple] = None) -> StepResult:
+                     intrinsics: Optional[tuple] = None, instruction: str = "") -> StepResult:
         res = StepResult()
         H, W = rgb.shape[:2]
         timing = {}
@@ -800,7 +1244,20 @@ class DinoNavDPPipeline:
             # live detection to resolve at all this tick.
             det = None
             self._last_candidate_count = 0
+        elif instruction and self._qwen_pixel_guide is not None:
+            # Qwen instruction-grounded goal (see qwen_pixel_goal.py) --
+            # no DINO target to resolve; the goal itself is derived further
+            # down, once depth is available (mirrors the goal-from-det
+            # section right below it).
+            det = None
+            self._last_candidate_count = 0
         else:
+            if self.detector is None:
+                raise RuntimeError(
+                    "step() needs a text-target DINO detection this tick (no instruction/"
+                    "external_dets/external_goal given), but this pipeline was built with "
+                    "use_dino=False. Pass an instruction instead, or rebuild with use_dino=True."
+                )
             relation = parse_relational_target(target_text)
             positional = None if relation is not None else parse_positional_target(target_text)
             if relation is not None:
@@ -831,7 +1288,13 @@ class DinoNavDPPipeline:
         else:
             self._ambiguity_warned = False
 
-        if avoid_text:
+        if avoid_text and self.detector is None:
+            if not self._avoid_no_dino_warned:
+                self._avoid_no_dino_warned = True
+                print(f"[WARN] avoid_text={avoid_text!r} given but this pipeline was built with "
+                      f"use_dino=False -- named-obstacle detection is skipped every tick until "
+                      f"a new avoid_text arrives (rebuild with use_dino=True to use this)")
+        elif avoid_text:
             t0 = time.time()
             avoid_det = self.detector.detect_best(rgb, avoid_text)
             if avoid_det is not None:
@@ -960,6 +1423,269 @@ class DinoNavDPPipeline:
                     res.goal_point = goal
                     res.timing = timing
                     return res
+        if goal is None and instruction and self._qwen_pixel_guide is not None:
+            # Compound directional instruction ("go straight up to 2.9
+            # meters and turn right"): not one bare phrase (parse_direct_
+            # motion below returns None for it) and not a landmark either --
+            # a SEQUENCE of directional steps with a distance/heading
+            # trigger between them, which one Qwen grounding call can't
+            # represent as a single pixel (real failure observed
+            # 2026-09-07: 30+ ticks of far-mode/rejected-candidate, "turn
+            # right" never once influenced the robot). Parsed+cached once
+            # per instruction text (see qwen_pixel_goal.parse_direct_
+            # motion_sequence), stepped through here -- never sent to
+            # Qwen. Returns None (leaving this whole block a no-op) for
+            # anything that isn't purely directional, including a single
+            # bare phrase (handled by parse_direct_motion just below
+            # instead) and a compound naming a real landmark anywhere ("go
+            # straight to the kitchen then turn right"), which falls
+            # through to Qwen grounding on the whole sentence exactly as
+            # before this existed.
+            if instruction != self._motion_seq_instr:
+                self._motion_seq = parse_direct_motion_sequence(instruction)
+                self._motion_seq_instr = instruction
+                self._motion_seq_idx = 0
+                self._motion_seq_step_start_pose = pose
+            if self._motion_seq is not None:
+                # Advance past every already-complete step (left/right:
+                # heading-bounded via _turn_complete; forward/stop: an
+                # explicit distance_m via odometry) -- a loop, not a single
+                # check, so a step that completes instantly (e.g. a fresh
+                # turn immediately followed by another) doesn't cost an
+                # extra idle tick.
+                while True:
+                    step = self._motion_seq[self._motion_seq_idx]
+                    if step.kind in ("left", "right"):
+                        done = self._turn_complete(step.kind, pose)
+                    elif (step.distance_m is not None and pose is not None
+                          and self._motion_seq_step_start_pose is not None):
+                        sx, sy, _ = self._motion_seq_step_start_pose
+                        px, py, _ = pose
+                        done = float(np.hypot(px - sx, py - sy)) >= step.distance_m
+                    else:
+                        done = False  # open-ended (no distance given) -- holds here
+                    if not done:
+                        break
+                    if self._motion_seq_idx + 1 >= len(self._motion_seq):
+                        # final step complete too -- the sequence is done;
+                        # self-declare arrival rather than repeating it.
+                        res.state = "STOP"
+                        res.timing = timing
+                        return res
+                    self._motion_seq_idx += 1
+                    self._motion_seq_step_start_pose = pose
+                    # Fresh slate for the new step -- belief.observe() is a
+                    # hard snap (see GoalBelief), and a "forward" step calls
+                    # it every tick with a fixed local-frame offset, so
+                    # without this, belief.mu/sigma left over from the PRIOR
+                    # step (e.g. "3.5m straight ahead" from a forward leg
+                    # that ended ticks or a whole turn ago) stays "locked"
+                    # (sigma stays low -- nothing grows it while forward/
+                    # turn/landmark dispatch keeps setting goal every tick,
+                    # so belief.propagate() is never reached) into the NEXT
+                    # step. A landmark step's consistency gate then compares
+                    # every genuine fresh grounding against that stale,
+                    # unrelated point and rejects it every time (real bug
+                    # observed live 2026-09-07: an "air cooler" leg after a
+                    # forward+turn never once accepted a grounding, so the
+                    # rover just kept holding the old pre-turn heading
+                    # forever) -- same category of fix as pipe.reset()
+                    # already clearing belief when a brand-new instruction
+                    # begins, just scoped to each step within one.
+                    if self.cfg.use_belief_goal:
+                        self.belief.reset()
+                    self._last_goal = None
+                    self._lost_count = 0
+                if step.kind == "stop":
+                    res.state = "STOP"
+                    res.timing = timing
+                    return res
+                if step.kind == "forward":
+                    dgoal = np.array([self.cfg.qwen_far_lookahead_m, 0.0, 0.0], dtype=np.float32)
+                    self._last_goal, self._lost_count = dgoal, 0
+                    if self.cfg.use_belief_goal:
+                        self.belief.observe(dgoal, confidence=1.0)
+                    goal = dgoal
+                elif step.kind == "landmark":
+                    # Landmark leg (see qwen_pixel_goal.parse_direct_
+                    # motion_sequence) -- Qwen grounds step.text for
+                    # BEARING every tick the instruction gate is due.
+                    # Two arrival modes:
+                    #   distance_m set: gated purely by the distance check
+                    #   in the advance-loop above, not by proximity --
+                    #   _ground_landmark_bearing never self-declares STOP,
+                    #   so this branch just feeds NavDP the bearing.
+                    #   distance_m is None: only possible on the FINAL
+                    #   step (parser-enforced -- see that function's
+                    #   docstring), so arrival here IS sequence
+                    #   completion: reuse the normal proximity-based
+                    #   stop_distance check, same as a standalone landmark
+                    #   instruction already uses, fully scoped to this one
+                    #   step rather than the shared belief-coast/SEARCH
+                    #   fallback below (that fallback's own stop_distance
+                    #   check is what a distance_m-gated leg must NOT hit,
+                    #   since it would end the whole sequence early on a
+                    #   leg that's only supposed to end by distance).
+                    qgoal = self._ground_landmark_bearing(step.text, rgb, depth, fx, fy, cx, cy, res, timing)
+                    if qgoal is None:
+                        # Not a fresh grounding this tick (gate not due, or
+                        # rejected) -- coast the LAST grounded point by the
+                        # robot's own ego-motion instead of reusing it as-is.
+                        # self._last_goal/self.belief.mu are both fixed in
+                        # whatever robot-local frame they were observed in;
+                        # left untouched across ticks where the robot keeps
+                        # turning to chase it, that frame is stale, so the
+                        # point silently drifts to the WRONG bearing --
+                        # NavDP then chases a moving target it created
+                        # itself, overshooting and re-correcting rather
+                        # than converging (live 2026-09-07: real oscillation
+                        # traced to exactly this). belief.propagate() is
+                        # the same ego-motion correction the shared
+                        # belief-coast fallback below already applies --
+                        # applying it here too keeps this leg's coasting
+                        # goal just as correct, without going through that
+                        # fallback's own stop_distance check (see this
+                        # branch's docstring above on why that must stay
+                        # scoped out for a distance_m-gated leg).
+                        if self.cfg.use_belief_goal and odom_delta is not None:
+                            self.belief.propagate(*odom_delta)
+                        qgoal = self.belief.mu if self.cfg.use_belief_goal else self._last_goal
+                    if step.distance_m is None and qgoal is not None:
+                        if np.linalg.norm(qgoal[:2]) < self.cfg.stop_distance:
+                            res.state = "STOP"
+                            res.goal_point = qgoal
+                            res.timing = timing
+                            return res
+                    if qgoal is None:
+                        # never grounded yet this leg (e.g. very first
+                        # tick, gate not due) -- hold straight ahead until
+                        # the first real grounding lands, rather than
+                        # leaving goal unset.
+                        qgoal = np.array([self.cfg.qwen_far_lookahead_m, 0.0, 0.0], dtype=np.float32)
+                    goal = qgoal
+                else:  # "left" / "right", not yet complete this tick
+                    res.state = "TURN"
+                    res.angular = (1.0 if step.kind == "left" else -1.0) * self.cfg.search_angular
+                    res.timing = timing
+                    return res
+        if goal is None and instruction and self._qwen_pixel_guide is not None:
+            # Bare directional/stop commands ("go straight", "turn left",
+            # "turn right") bypass Qwen grounding entirely -- see
+            # qwen_pixel_goal.parse_direct_motion's docstring for why
+            # (there's no pixel for a VLM to point at for a maneuver, only
+            # for a landmark). Falls through to the Qwen path below
+            # unchanged for anything that isn't an exact phrase match.
+            kind = parse_direct_motion(instruction)
+            if kind == "stop":
+                res.state = "STOP"
+                res.timing = timing
+                return res
+            if kind == "forward":
+                dgoal = np.array([self.cfg.qwen_far_lookahead_m, 0.0, 0.0], dtype=np.float32)
+                self._last_goal, self._lost_count = dgoal, 0
+                if self.cfg.use_belief_goal:
+                    self.belief.observe(dgoal, confidence=1.0)
+                goal = dgoal
+            elif kind in ("left", "right"):
+                if self._turn_complete(kind, pose):
+                    res.state = "STOP"
+                    res.timing = timing
+                    return res
+                res.state = "TURN"
+                res.angular = (1.0 if kind == "left" else -1.0) * self.cfg.search_angular
+                res.timing = timing
+                return res
+        if (goal is None and instruction and self._qwen_pixel_guide is not None
+                and parse_direct_motion(instruction) is None):
+            # Qwen instruction-grounded goal: throttled (qwen_instruction_
+            # period_s) same as SEARCH's Qwen guidance above -- on ticks
+            # it's not due, this deliberately leaves goal=None so the
+            # belief-coasting fallback below propagates the LAST Qwen goal
+            # by ego-motion instead of re-querying every tick or holding a
+            # stale pixel (see qwen_pixel_goal.py's module docstring).
+            now = time.time()
+            if self._qwen_instruction_gate.due(now):
+                t0 = time.time()
+                candidates = self._qwen_pixel_guide.ground_candidates(
+                    rgb, instruction, max_candidates=self.cfg.qwen_max_candidates)
+                timing["qwen_instruction"] = time.time() - t0
+                locked = (self.cfg.use_belief_goal and self.belief.initialized
+                          and self.belief.sigma <= self.cfg.belief_max_sigma)
+                # Obstacle points computed here too (redundant with the guard
+                # section below, cheap -- a few ms) so goal SELECTION itself
+                # is collision-aware, not just avoidance after the fact. See
+                # PipelineConfig.qwen_max_candidates for the full rationale.
+                cand_obstacle_pts = depth_to_obstacle_points(depth, fx, fy, cx, cy, self.cfg.guard)
+                winner = score_instruction_candidates(
+                    candidates, depth, fx, fy, cx, cy,
+                    belief_mu=self.belief.mu if locked else None, belief_locked=locked,
+                    obstacle_pts=cand_obstacle_pts, guard_cfg=self.cfg.guard,
+                    semantic_weight=self.cfg.qwen_candidate_semantic_weight,
+                    continuity_weight=self.cfg.qwen_candidate_continuity_weight,
+                    continuity_scale_m=self.cfg.qwen_candidate_continuity_scale_m,
+                    collision_weight=self.cfg.qwen_candidate_collision_weight,
+                    collision_scale_m=self.cfg.qwen_candidate_collision_scale_m,
+                    far_lookahead_m=self.cfg.qwen_far_lookahead_m,
+                    depth_trust_horizon_m=self.cfg.qwen_depth_trust_horizon_m,
+                )
+                if winner is not None:
+                    qgoal, pg, disc, far_mode = winner
+                    # consistency gate -- see PipelineConfig.qwen_goal_consistency_m.
+                    # Kept as a final check even with scoring above: scoring
+                    # picks the best of THIS tick's candidates, but if every
+                    # candidate this tick is actually a distractor (the real
+                    # door wasn't offered at all, e.g. out of frame mid-turn),
+                    # this still catches it rather than accepting the least-
+                    # bad wrong answer. Skipped in far_mode: a bearing-only
+                    # look-ahead goal is deliberately not near the stale lock
+                    # (that mismatch is exactly what stranded long-range
+                    # instructions -- see qwen_far_lookahead_m).
+                    if locked and not far_mode:
+                        dist = float(np.linalg.norm(qgoal[:2] - self.belief.mu[:2]))
+                        if dist > self.cfg.qwen_goal_consistency_m:
+                            print(f"[qwen-instruction-debug] REJECTED best-scoring candidate "
+                                  f"{dist:.2f}m from locked goal (> "
+                                  f"{self.cfg.qwen_goal_consistency_m}m) -- likely a "
+                                  f"different door/target; coasting on the existing lock")
+                            qgoal = None
+                    elif far_mode:
+                        print(f"[qwen-instruction-debug] far target -- depth untrusted, "
+                              f"driving bearing to a {self.cfg.qwen_far_lookahead_m:.1f}m "
+                              f"look-ahead goal and re-grounding as it closes")
+                    if qgoal is not None:
+                        res.qwen_pixel_goal = (float(pg.u), float(pg.v))
+                        res.mask = disc  # obstacle guard excludes the goal's own surface, same as a DINO/SAM mask
+                        self._last_goal, self._lost_count = qgoal, 0
+                        # far_mode: qgoal's RANGE is a placeholder (far_lookahead_m),
+                        # not a measurement -- only its bearing is real. GoalBelief.
+                        # observe() is a hard snap, so feeding that range in re-anchored
+                        # the goal ~far_lookahead_m ahead on every Qwen tick, which meant
+                        # belief-coasting could never converge and the self-declared STOP
+                        # never fired for a target whose grounded pixel stays a depth hole
+                        # or beyond the trust horizon (a doorway/opening, or any view with
+                        # no usable metric depth) -- the rover just drove through it.
+                        # Clamp the OBSERVED range so belief can only ratchet inward as
+                        # odometry accumulates, keeping the fresh bearing; NavDP still
+                        # aims at the full look-ahead point (goal = qgoal) for a smooth
+                        # heading. Non-far_mode and use_belief_goal=False are unchanged
+                        # (obs_goal is qgoal exactly).
+                        obs_goal = qgoal
+                        if (far_mode and self.cfg.use_belief_goal
+                                and self.belief.initialized and self.belief.mu is not None):
+                            cur_r = float(np.linalg.norm(self.belief.mu[:2]))
+                            new_r = float(np.linalg.norm(qgoal[:2]))
+                            if new_r > cur_r > 1e-3:
+                                sc = cur_r / new_r
+                                obs_goal = np.array(
+                                    [qgoal[0] * sc, qgoal[1] * sc, qgoal[2]], dtype=np.float32)
+                        if self.cfg.use_belief_goal:
+                            self.belief.observe(obs_goal, confidence=pg.confidence)
+                        if np.linalg.norm(obs_goal[:2]) < self.cfg.stop_distance:
+                            res.state = "STOP"
+                            res.goal_point = obs_goal
+                            res.timing = timing
+                            return res
+                        goal = qgoal
         if goal is None and external_goal is not None:
             # Blind navigate-back: no live detection this tick, but the
             # caller supplied a remembered local-frame point (see step()'s
@@ -1033,10 +1759,24 @@ class DinoNavDPPipeline:
                 # rover test 2026-07-31: theta swung +116deg then reversed
                 # to -77deg hunting for a chair, never finding it).
                 res.state = "SEARCH"
-                side = 1.0
-                if self._last_goal is not None and self._last_goal[1] < 0:
-                    side = -1.0
-                res.angular = side * self.cfg.search_angular
+                qwen_angular = None
+                if self._qwen_scheduler is not None:
+                    bearing = self._qwen_scheduler.step(time.time(), rgb, target_text)
+                    if bearing is not None:
+                        res.qwen_bearing = bearing
+                        # capped at search_angular (not max_angular): this is
+                        # still a searching turn, not a confident TRACK lock
+                        qwen_angular = bearing_to_angular(
+                            bearing, self.cfg.search_angular, self.cfg.ang_min_cmd,
+                            0.0, np.radians(self.cfg.servo_ramp_deg),
+                        )
+                if qwen_angular is not None:
+                    res.angular = qwen_angular
+                else:
+                    side = 1.0
+                    if self._last_goal is not None and self._last_goal[1] < 0:
+                        side = -1.0
+                    res.angular = side * self.cfg.search_angular
                 res.timing = timing
                 return res
 

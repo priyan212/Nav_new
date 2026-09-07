@@ -112,6 +112,7 @@ class SharedState:
         self.trajs = None
         self.chosen = None
         self.goal_pt = None
+        self.qwen_pixel_goal = None   # (u, v) -- set only on ticks --use-qwen-instruction fired
         self.obstacles = None
         self.min_forward = float("inf")
         self.infer_count = 0
@@ -276,7 +277,15 @@ def inference_loop(pipe: DinoNavDPPipeline, st: SharedState, pubs, running,
 
         try:
             pose = (odom.x, odom.y, odom.theta) if odom is not None else None
-            res = pipe.step(rgb, target, depth=depth, pose=pose, avoid_text=avoid, intrinsics=intrinsics)
+            if pipe.cfg.use_qwen_instruction:
+                # --use-qwen-instruction: the same text box/--target value
+                # is read as a free-text INSTRUCTION for Qwen to ground into
+                # NavDP's goal, not a DINO object phrase -- see
+                # qwen_pixel_goal.py and PipelineConfig.use_qwen_instruction.
+                res = pipe.step(rgb, "", depth=depth, pose=pose, avoid_text=avoid,
+                                 intrinsics=intrinsics, instruction=target)
+            else:
+                res = pipe.step(rgb, target, depth=depth, pose=pose, avoid_text=avoid, intrinsics=intrinsics)
         except Exception as e:
             print(f"[ERROR] pipeline step: {e}")
             with st.lock:
@@ -322,6 +331,7 @@ def inference_loop(pipe: DinoNavDPPipeline, st: SharedState, pubs, running,
             st.trajs = res.all_trajectories
             st.chosen = res.trajectory
             st.goal_pt = res.goal_point
+            st.qwen_pixel_goal = res.qwen_pixel_goal
             st.obstacles = res.obstacle_points
             st.min_forward = res.min_forward
             st.infer_count += 1
@@ -361,7 +371,7 @@ class App:
     def __init__(self, root: tk.Tk, st: SharedState):
         self.root = root
         self.st = st
-        root.title("Nav_new — DINO + NavDP")
+        root.title("Nav_new")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.closed = False
 
@@ -642,6 +652,67 @@ def main():
                          "(e.g. the LanderPi, see landerpi/README.md) before trusting obstacle avoidance")
     ap.add_argument("--footprint-width", type=float, default=GuardConfig().footprint_width,
                     help="robot width (m), see --footprint-length")
+    ap.add_argument("--no-dino", action="store_true",
+                    help="skip loading Grounding DINO entirely (saves VRAM/load time) -- only "
+                         "safe with --use-qwen-instruction AND no --avoid, ever, this run: "
+                         "plain-text --target detection and avoid_text both need DINO and will "
+                         "raise/warn respectively if this is set without --use-qwen-instruction")
+    ap.add_argument("--wheel-deadband-correction", action="store_true",
+                    help="ESP32 6WD rover ONLY (never --hiwonder, different firmware entirely) "
+                         "-- boosts a commanded (linear, angular) that would otherwise "
+                         "differential-mix down to a stalled wheel on the real hardware: "
+                         "esp32/rover_6wd_complete.ino hard-zeros any per-wheel PWM target "
+                         "below VEL_DEADBAND_MS=0.03 m/s, and a small linear + small angular "
+                         "can land BOTH wheel targets under that even when neither value alone "
+                         "looks like zero -- the pipeline reports it's driving, the rover "
+                         "doesn't move. See PipelineConfig.clear_wheel_deadband.")
+    ap.add_argument("--use-qwen-search", action="store_true",
+                    help="while DINO can't see --target, ask a frozen Qwen2.5-VL-7B-Instruct "
+                         "to point toward the best direction to search/move next (a doorway, "
+                         "opening, hallway) instead of the fixed spin toward the last-known "
+                         "side. DINO keeps scanning every tick regardless; the instant it "
+                         "reacquires the target this path is no longer taken, so Qwen is "
+                         "dropped automatically. Adds real per-call latency while searching "
+                         "(VLM inference, seconds) -- see --qwen-search-period-s. Requires "
+                         "transformers with Qwen2.5-VL support + qwen-vl-utils.")
+    ap.add_argument("--qwen-model-id", default="Qwen/Qwen2.5-VL-7B-Instruct",
+                    help="HF model id for --use-qwen-search")
+    ap.add_argument("--qwen-search-period-s", type=float, default=2.0,
+                    help="min seconds between Qwen search-guidance calls (throttle -- the "
+                         "last suggested direction is held between calls, same pattern as "
+                         "SAM/CLIP's sam_period_s)")
+    ap.add_argument("--qwen-fp16", action="store_true",
+                    help="load Qwen2.5-VL-7B in fp16 instead of the 4-bit default (needs "
+                         "~16.6GB VRAM vs 4-bit's ~6.2GB; use if bitsandbytes isn't installed "
+                         "or the pointed pixel needs to match the un-quantized model exactly)")
+    ap.add_argument("--use-qwen-instruction", action="store_true",
+                    help="DINO target detection is bypassed entirely: whatever's sent as "
+                         "--target / typed in the GUI's text box is read as a free-text "
+                         "INSTRUCTION instead (e.g. 'go through the doorway and stop near "
+                         "the desk') -- Qwen2.5-VL grounds it to a pixel every "
+                         "--qwen-instruction-period-s, which becomes NavDP's goal via depth "
+                         "exactly like a DINO detection would. See qwen_pixel_goal.py. "
+                         "Mutually exclusive in intent with --use-qwen-search (that one only "
+                         "steers SEARCH for a DINO text target); enabling both loads two "
+                         "separate Qwen instances.")
+    ap.add_argument("--qwen-instruction-period-s", type=float, default=1.5,
+                    help="min seconds between Qwen instruction-grounding calls; GoalBelief "
+                         "coasts the goal by ego-motion in between (see qwen_pixel_goal.py)")
+    ap.add_argument("--qwen-goal-consistency-m", type=float, default=1.5,
+                    help="reject a new Qwen instruction-grounding more than this many meters "
+                         "from the current confident goal (e.g. a second door coming into "
+                         "view mid-turn) instead of snapping to it -- coasts on the existing "
+                         "lock instead. Only applies while belief is still confident (sigma <= "
+                         "--belief-max-sigma); once genuinely lost, a fresh grounding is "
+                         "accepted as a real reacquisition. Raise this if it's rejecting a "
+                         "legitimately-updated view of the SAME door; lower it if it's still "
+                         "snapping onto distractors.")
+    ap.add_argument("--qwen-max-candidates", type=int, default=3,
+                    help="ask Qwen for up to this many ranked, confidence-scored waypoint "
+                         "candidates instead of one, then pick the best by combining semantic "
+                         "confidence + continuity with the current lock + obstacle-avoidance "
+                         "cost -- 1 disables scoring, back to plain single-point grounding. "
+                         "See PipelineConfig.qwen_max_candidates.")
     args = ap.parse_args()
 
     print("[INFO] loading models...")
@@ -658,6 +729,16 @@ def main():
         use_belief_goal=not args.no_belief_goal,
         depth_encoder=args.depth_encoder,
         guard=GuardConfig(footprint_length=args.footprint_length, footprint_width=args.footprint_width),
+        wheel_deadband_correction=args.wheel_deadband_correction,
+        use_dino=not args.no_dino,
+        use_qwen_search=args.use_qwen_search,
+        qwen_model_id=args.qwen_model_id,
+        qwen_search_period_s=args.qwen_search_period_s,
+        qwen_load_in_4bit=not args.qwen_fp16,
+        use_qwen_instruction=args.use_qwen_instruction,
+        qwen_instruction_period_s=args.qwen_instruction_period_s,
+        qwen_goal_consistency_m=args.qwen_goal_consistency_m,
+        qwen_max_candidates=args.qwen_max_candidates,
     ))
 
     config = zenoh.Config()
