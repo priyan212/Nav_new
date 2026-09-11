@@ -151,7 +151,7 @@ def main():
     ap.add_argument("--jpeg-quality", type=int, default=65)  # lowered from a
     # typical 80 -- depth is now sharing this same Wi-Fi link (see the PNG
     # compression comment below), so color's own budget needed to shrink too
-    ap.add_argument("--depth-hz", type=float, default=5.0, help=(
+    ap.add_argument("--depth-hz", type=float, default=2.0, help=(
         "Depth publish rate cap, independent of the camera's own capture "
         "fps. 2026-08-13: publishing depth at the full 15fps alongside "
         "color made reception on the GPU side WORSE than a slower, "
@@ -159,9 +159,23 @@ def main():
         "ceiling, not a compute problem (that was ruled out separately, "
         "see the PNG compression comment below). NavDP only infers at "
         "~2-3Hz (README.md), so publishing depth faster than that buys "
-        "nothing downstream -- 5Hz leaves headroom while staying well "
-        "inside isaac_gui.py's/zenoh_node.py's DEPTH_STALE_S=1.0s "
-        "freshness window."))
+        "nothing downstream -- 5Hz was chosen to leave headroom while "
+        "staying well inside isaac_gui.py's/zenoh_node.py's "
+        "DEPTH_STALE_S=1.0s freshness window.\n"
+        "Lowered 5.0 -> 2.0 (2026-08-19): live-tested against reference/"
+        "internvla_dualvln_zenoh_node.py (newly wired up to consume real "
+        "depth) with 5Hz -- color frame arrival collapsed from a steady "
+        "~15-20fps to as low as ~0.4fps in one 10s window, matching a run "
+        "with no depth subscriber at all as the control. 2Hz (every 0.5s) "
+        "is still comfortably inside the 1.0s freshness window every "
+        "consumer in this project actually needs, at well under half the "
+        "message rate -- and nothing downstream moves fast enough (this "
+        "rig creeps at 0.04-0.08 m/s) for depth staleness up to ~0.5-1s "
+        "to matter. Not yet re-validated against the ORIGINAL DINO+NavDP "
+        "pipeline (isaac_gui.py/remind_gui.py) this was first tuned for -- "
+        "if THAT pipeline's own frame rate regresses, this is the first "
+        "constant to revisit (raise back toward 5.0), since it was working "
+        "fine there before this change."))
     args = ap.parse_args()
 
     config = zenoh.Config()

@@ -52,7 +52,7 @@ backend_parse_args() {
     done
 
     if [[ "$BACKEND" == "rover" ]]; then
-        BACKEND_DEFAULT_IP=192.168.21.125   # updated 2026-08-11, Pi IP churns -- verify if unreachable
+        BACKEND_DEFAULT_IP=10.86.180.125   # updated 2026-08-25, Pi IP churns -- verify if unreachable
         BACKEND_PI_PASS_DEFAULT=hri
         # Camera is the Intel RealSense D435i (scripts/realsense_only_
         # bringup.launch.py) as of 2026-08-13 -- the earlier 2026-08-11

@@ -32,9 +32,11 @@ Publishes (Zenoh, CDR):
 """
 
 import sys
+import re
 import struct
 import time
 import argparse
+from collections import deque
 from threading import Lock
 from typing import Optional
 
@@ -209,6 +211,9 @@ def serialize_string(text: str) -> bytes:
 #  Shared state (Zenoh callbacks write; Tkinter refresh loop reads)
 # ================================================================
 class SharedState:
+    # How many past decisions the history strip shows -- see App._draw_history.
+    HISTORY_LEN = 20
+
     def __init__(self):
         self.lock = Lock()
         self.latest_rgb: Optional[np.ndarray] = None
@@ -216,9 +221,30 @@ class SharedState:
         self.linear = 0.0
         self.angular = 0.0
         self.explanation = ""
+        self.kind = ""            # parsed from explanation's "KIND=..." tag, see on_explanation
+        self.raw_output = ""      # parsed from explanation's "RAW='...'" tag -- the model's literal generated text
+        self.kind_history = deque(maxlen=self.HISTORY_LEN)
         self.frame_count = 0
         self.last_frame_ts = 0.0
         self.last_traj_ts = 0.0
+
+
+# kind -> (fill color, label). Matches the kinds internvla_dualvln_zenoh_node.py
+# actually publishes (see its infer_cmd/_apply_depth_safety/_apply_discrete_
+# repeat_breaker return values) -- unrecognized/empty kind falls back to gray.
+_KIND_STYLE = {
+    "trajectory": ("#2e7d32", "TRAJECTORY (smooth)"),           # green
+    "discrete": ("#e65100", "DISCRETE (crude turn)"),           # orange
+    "stop": ("#1565c0", "STOP (arrival)"),                      # blue
+    "obstacle-stop": ("#c62828", "BLOCKED (obstacle)"),         # red
+    "stall-recover": ("#c62828", "STALL RECOVERY"),             # red
+    "discrete-repeat-break": ("#6a1b9a", "RESET (indecision)"),  # purple
+}
+_KIND_UNKNOWN = ("#9e9e9e", "...")
+
+
+def _kind_style(kind: str) -> tuple:
+    return _KIND_STYLE.get(kind, _KIND_UNKNOWN)
 
 
 # ================================================================
@@ -243,26 +269,50 @@ class App:
         main = ttk.Frame(root, padding=8)
         main.grid(sticky="nsew")
 
+        # Mode banner -- deliberately the largest, most visually dominant
+        # thing in the window (2026-08-19, user request: "trajectory
+        # working or not" should be checkable at a glance, not by reading
+        # fine print). Background color + text both driven by the current
+        # decision's kind, see _KIND_STYLE.
+        self.mode_banner = tk.Label(main, text="waiting for first decision...", anchor="w",
+                                     font=("TkDefaultFont", 16, "bold"), fg="white", bg=_KIND_UNKNOWN[0],
+                                     padx=10, pady=6)
+        self.mode_banner.grid(row=0, column=0, columnspan=2, sticky="we", pady=(0, 6))
+
         self.cam_label = ttk.Label(main)
-        self.cam_label.grid(row=0, column=0, padx=4, pady=4)
+        self.cam_label.grid(row=1, column=0, padx=4, pady=4)
         self._blank_photo = ImageTk.PhotoImage(Image.new("RGB", (self.CAM_SIZE, self.CAM_SIZE), "#222"))
         self.cam_label.configure(image=self._blank_photo)
 
         self.plot = tk.Canvas(main, width=self.PLOT_SIZE, height=self.PLOT_SIZE, bg="white")
-        self.plot.grid(row=0, column=1, padx=4, pady=4)
+        self.plot.grid(row=1, column=1, padx=4, pady=4)
 
         bar = ttk.Frame(main)
-        bar.grid(row=1, column=0, columnspan=2, sticky="we", pady=(6, 0))
+        bar.grid(row=2, column=0, columnspan=2, sticky="we", pady=(6, 0))
         ttk.Label(bar, text="Instruction:").pack(side="left")
         self.goal_entry = ttk.Entry(bar, width=60)
         self.goal_entry.pack(side="left", padx=4, fill="x", expand=True)
         ttk.Button(bar, text="Set", command=self.on_set_goal).pack(side="left")
         self.goal_entry.bind("<Return>", lambda e: self.on_set_goal())
 
+        # Decision history strip -- last HISTORY_LEN kinds as colored dots,
+        # oldest to newest left to right, so a pattern like "all orange"
+        # (stuck in discrete mode) or "all red" (repeatedly blocked) is
+        # visible as a shape, not something you have to read line by line.
+        hist_row = ttk.Frame(main)
+        hist_row.grid(row=3, column=0, columnspan=2, sticky="we", pady=(6, 0))
+        ttk.Label(hist_row, text="History:").pack(side="left")
+        self.history_canvas = tk.Canvas(hist_row, width=20 * SharedState.HISTORY_LEN, height=20,
+                                         bg="white", highlightthickness=1, highlightbackground="#ccc")
+        self.history_canvas.pack(side="left", padx=4)
+
         self.status = ttk.Label(main, text="waiting for frames...", anchor="w")
-        self.status.grid(row=2, column=0, columnspan=2, sticky="we", pady=(4, 0))
+        self.status.grid(row=4, column=0, columnspan=2, sticky="we", pady=(4, 0))
+        self.raw_label = ttk.Label(main, text="raw model output: (none yet)", anchor="w",
+                                    font=("TkFixedFont", 11))
+        self.raw_label.grid(row=5, column=0, columnspan=2, sticky="we")
         self.explain = ttk.Label(main, text="", anchor="w", wraplength=self.CAM_SIZE + self.PLOT_SIZE)
-        self.explain.grid(row=3, column=0, columnspan=2, sticky="we")
+        self.explain.grid(row=6, column=0, columnspan=2, sticky="we")
 
         self.root.after(66, self.refresh)  # ~15Hz self-rescheduling, decoupled from Zenoh threads
 
@@ -283,6 +333,9 @@ class App:
             traj = self.st.latest_trajectory
             lin, ang = self.st.linear, self.st.angular
             explanation = self.st.explanation
+            kind = self.st.kind
+            raw_output = self.st.raw_output
+            kind_history = list(self.st.kind_history)
             frame_count = self.st.frame_count
             frame_age = time.time() - self.st.last_frame_ts if self.st.last_frame_ts else None
             traj_age = time.time() - self.st.last_traj_ts if self.st.last_traj_ts else None
@@ -293,15 +346,27 @@ class App:
             self.cam_label.configure(image=self._photo)
 
         self._draw_plot(traj)
+        self._draw_history(kind_history)
+
+        color, label = _kind_style(kind)
+        self.mode_banner.configure(text=f"MODE: {label}", bg=color)
 
         stale = " (STALE)" if frame_age is not None and frame_age > 2.0 else ""
         self.status.configure(
             text=f"frames={frame_count}{stale}  lin={lin:+.3f} m/s  ang={ang:+.3f} rad/s"
             + (f"  traj_age={traj_age:.1f}s" if traj_age is not None else "  traj=none")
         )
+        self.raw_label.configure(text=f"raw model output: {raw_output!r}" if raw_output else "raw model output: (none yet)")
         self.explain.configure(text=explanation)
 
         self.root.after(66, self.refresh)
+
+    def _draw_history(self, kinds: list):
+        self.history_canvas.delete("all")
+        for i, k in enumerate(kinds):
+            color, _ = _kind_style(k)
+            x0 = i * 20 + 3
+            self.history_canvas.create_oval(x0, 3, x0 + 14, 17, fill=color, outline="")
 
     def _draw_plot(self, traj: Optional[np.ndarray]):
         self.plot.delete("all")
@@ -369,8 +434,20 @@ def make_callbacks(st: SharedState):
             text = parse_string(bytes(sample.payload))
         except Exception:
             return
+        # KIND=.../RAW='...' are optional tags the node prepends/appends to
+        # real decision explanations (2026-08-19) -- transient status text
+        # ("settling before first move...", stall messages) has neither, so
+        # a miss here just leaves kind/raw_output/history untouched rather
+        # than clearing them.
+        kind_m = re.search(r"KIND=(\S+)", text)
+        raw_m = re.search(r"RAW='(.*)'(?:\s*\||$)", text)
         with st.lock:
             st.explanation = text
+            if kind_m:
+                st.kind = kind_m.group(1)
+                st.kind_history.append(st.kind)
+            if raw_m:
+                st.raw_output = raw_m.group(1)
 
     return on_image, on_image_compressed, on_trajectory, on_cmd, on_explanation
 

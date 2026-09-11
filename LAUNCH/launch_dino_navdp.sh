@@ -41,6 +41,10 @@ if $BACKEND_EXPLICIT; then
     set -- "${BACKEND_ARGS[@]}"
     EXTRA_ARGS=(--pi-ip "$PI_IP" --fov "$BACKEND_FOV")
     [[ "$BACKEND" == "hiwonder" ]] && EXTRA_ARGS+=(--footprint-length "$BACKEND_FOOTPRINT_LENGTH" --footprint-width "$BACKEND_FOOTPRINT_WIDTH")
+    # ESP32 6WD rover only -- see pipeline.py's clear_wheel_deadband. Never
+    # for --hiwonder: different chassis/firmware, this deadband math
+    # doesn't apply.
+    [[ "$BACKEND" == "rover" ]] && EXTRA_ARGS+=(--wheel-deadband-correction)
     exec python -m nav_pipeline.zenoh_node "${EXTRA_ARGS[@]}" "$@"
 else
     exec python -m nav_pipeline.zenoh_node "$@"

@@ -497,8 +497,16 @@ class DinoNavDPZenohNode:
 
         t0 = time.time()
         try:
-            res = self.pipe.step(rgb, self.target, depth=depth, pose=(self.odom.x, self.odom.y, self.odom.theta),
-                                  intrinsics=intrinsics)
+            if self.pipe.cfg.use_qwen_instruction:
+                # --use-qwen-instruction: self.target (set from --target /
+                # the goal_text Zenoh topic) is read as a free-text
+                # INSTRUCTION for Qwen to ground into NavDP's goal, not a
+                # DINO object phrase -- see qwen_pixel_goal.py.
+                res = self.pipe.step(rgb, "", depth=depth, pose=(self.odom.x, self.odom.y, self.odom.theta),
+                                      intrinsics=intrinsics, instruction=self.target)
+            else:
+                res = self.pipe.step(rgb, self.target, depth=depth, pose=(self.odom.x, self.odom.y, self.odom.theta),
+                                      intrinsics=intrinsics)
         except Exception as e:
             print(f"[ERROR] pipeline step failed: {e}")
             self.publish_cmd(0.0, 0.0)
@@ -576,6 +584,41 @@ def main():
                         "(e.g. the LanderPi, see landerpi/README.md) before trusting obstacle avoidance")
     p.add_argument("--footprint-width", type=float, default=GuardConfig().footprint_width,
                    help="robot width (m), see --footprint-length")
+    p.add_argument("--no-dino", action="store_true",
+                   help="skip loading Grounding DINO entirely (saves VRAM/load time) -- only "
+                        "safe with --use-qwen-instruction AND no --avoid, ever, this run")
+    p.add_argument("--wheel-deadband-correction", action="store_true",
+                   help="ESP32 6WD rover ONLY (never --hiwonder) -- boosts a commanded "
+                        "(linear, angular) that would otherwise differential-mix down to a "
+                        "stalled wheel on the real hardware; see pipeline.py's "
+                        "clear_wheel_deadband")
+    p.add_argument("--use-qwen-search", action="store_true",
+                   help="while DINO can't see --target, ask a frozen Qwen2.5-VL-7B-Instruct "
+                        "to point toward the best direction to search/move next instead of "
+                        "the fixed spin toward the last-known side; dropped automatically "
+                        "the instant DINO reacquires the target (see qwen_search_guide.py)")
+    p.add_argument("--qwen-model-id", default="Qwen/Qwen2.5-VL-7B-Instruct",
+                   help="HF model id for --use-qwen-search")
+    p.add_argument("--qwen-search-period-s", type=float, default=2.0,
+                   help="min seconds between Qwen search-guidance calls (throttle)")
+    p.add_argument("--qwen-fp16", action="store_true",
+                   help="load Qwen2.5-VL-7B in fp16 instead of the 4-bit default (needs "
+                        "~16.6GB VRAM vs 4-bit's ~6.2GB; use if bitsandbytes isn't installed)")
+    p.add_argument("--use-qwen-instruction", action="store_true",
+                   help="DINO target detection is bypassed entirely: --target is read as a "
+                        "free-text INSTRUCTION for Qwen2.5-VL to ground into NavDP's goal via "
+                        "depth, same as a DINO detection would. See qwen_pixel_goal.py.")
+    p.add_argument("--qwen-instruction-period-s", type=float, default=1.5,
+                   help="min seconds between Qwen instruction-grounding calls (throttle)")
+    p.add_argument("--qwen-goal-consistency-m", type=float, default=1.5,
+                   help="reject a new Qwen instruction-grounding more than this many meters "
+                        "from the current confident goal instead of snapping to it (e.g. a "
+                        "second door coming into view); see pipeline.py's "
+                        "qwen_goal_consistency_m for the full explanation")
+    p.add_argument("--qwen-max-candidates", type=int, default=3,
+                   help="ask Qwen for up to this many ranked, confidence-scored waypoint "
+                        "candidates instead of one, scored by semantic confidence + continuity "
+                        "+ obstacle cost; 1 disables scoring. See PipelineConfig.qwen_max_candidates.")
     args = p.parse_args()
 
     cfg = PipelineConfig(
@@ -588,6 +631,16 @@ def main():
         invert_angular=args.invert_angular,
         use_belief_goal=not args.no_belief_goal,
         guard=GuardConfig(footprint_length=args.footprint_length, footprint_width=args.footprint_width),
+        wheel_deadband_correction=args.wheel_deadband_correction,
+        use_dino=not args.no_dino,
+        use_qwen_search=args.use_qwen_search,
+        qwen_model_id=args.qwen_model_id,
+        qwen_search_period_s=args.qwen_search_period_s,
+        qwen_load_in_4bit=not args.qwen_fp16,
+        use_qwen_instruction=args.use_qwen_instruction,
+        qwen_instruction_period_s=args.qwen_instruction_period_s,
+        qwen_goal_consistency_m=args.qwen_goal_consistency_m,
+        qwen_max_candidates=args.qwen_max_candidates,
     )
     pipeline = DinoNavDPPipeline(cfg)
 

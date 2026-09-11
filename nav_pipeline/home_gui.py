@@ -149,6 +149,7 @@ from nav_pipeline.odometry_logger import OdometryLogger  # noqa: E402
 RPM_KEYS = ["rover/rpm", "rt/rover/rpm"]
 CAMERA_KEYS = ["image_raw", "rt/image_raw", "rover_camera", "rt/rover_camera"]
 CAMERA_COMPRESSED_KEYS = ["image_raw/compressed", "rt/image_raw/compressed"]
+DEPTH_KEYS = ["depth_raw", "rt/depth_raw", "rover_camera_depth", "rt/rover_camera_depth"]
 
 
 class CDRReader:
@@ -243,6 +244,48 @@ def parse_image(cdr_data: bytes) -> Optional[np.ndarray]:
     return img[:, :, :3]
 
 
+def parse_depth_image(cdr_data: bytes) -> Optional[np.ndarray]:
+    """sensor_msgs/Image CDR -> float32 depth in meters (H,W), or None.
+    Duplicated from zenoh_node.py's parse_image depth branches (see this
+    file's module docstring for why) -- handles the three depth encodings
+    DEPTH_KEYS can carry: 32FC1/16UC1 (real RealSense driver) and the
+    custom "png16" (PNG-compressed uint16 mm, half color's pixel dims --
+    see scripts/realsense_direct_publisher.py) used by the Pi-side
+    direct-SDK publisher this project's --rover backend actually runs."""
+    r = CDRReader(cdr_data)
+    r.read_int32(); r.read_uint32(); r.read_string()  # header
+    height = r.read_uint32()
+    width = r.read_uint32()
+    encoding = r.read_string(skip=False)
+    r.read_uint8(); r._align(4); r.read_uint32()  # is_bigendian, step
+    pixel_data = r.read_sequence_uint8()
+
+    enc = encoding.lower()
+    if enc in ("32fc1", "depth32f"):
+        img = np.frombuffer(pixel_data, dtype=np.float32)
+        try:
+            return img.reshape(height, width).copy()
+        except ValueError:
+            return None
+    if enc == "16uc1":
+        img = np.frombuffer(pixel_data, dtype=np.uint16)
+        try:
+            return img.reshape(height, width).astype(np.float32) / 1000.0
+        except ValueError:
+            return None
+    if enc == "png16":
+        if cv2 is None:
+            return None
+        arr = np.frombuffer(pixel_data, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            return None
+        if img.shape != (480, 640):  # encoded at half color's dims, see docstring above
+            img = cv2.resize(img, (640, 480), interpolation=cv2.INTER_NEAREST)
+        return img.astype(np.float32) / 1000.0
+    return None
+
+
 def parse_compressed_image(cdr_data: bytes) -> Optional[np.ndarray]:
     """sensor_msgs/CompressedImage CDR -> RGB uint8 (H,W,3)."""
     r = CDRReader(cdr_data)
@@ -321,6 +364,12 @@ ROTATE_ENTER_RAD = math.radians(20.0)
 DRIVE_ENTER_RAD = math.radians(8.0)
 HOMING_TIMEOUT_S = 180.0
 RPM_STALE_S = 1.5
+# Compressed frames over the rover's Wi-Fi normally land every few hundred ms
+# even under load (see _backend.sh's comment on raw-vs-compressed bandwidth);
+# a longer gap than this reliably means a real stall (Wi-Fi drop/congestion),
+# not just a slow frame -- distinguished from CAM_STALE_S's sibling
+# "frame_count==0" case (camera subscription never got a single frame at all).
+CAM_STALE_S = 1.5
 # navdp_home_loop's spin-stall watchdog -- same thresholds as isaac_gui.py's
 # (a real documented incident there: 145s/17 turns spinning against nothing,
 # 493deg peak turn for 0.36m net travel). Duplicated rather than imported,
@@ -361,6 +410,13 @@ class SharedState:
         # NavDP obstacle avoidance while homing (see navdp_home_loop)
         self.latest_rgb: Optional[np.ndarray] = None
         self.frame_count = 0
+        self.last_frame_t = 0.0
+        # Depth (meters, float32) -- only ever populated when the backend
+        # actually publishes DEPTH_KEYS (the --rover RealSense direct-SDK
+        # publisher does; a Logitech-only backend doesn't, and this just
+        # stays None forever in that case -- see rgbd_record_loop).
+        self.latest_depth: Optional[np.ndarray] = None
+        self.depth_frame_count = 0
         self.home_leg = "servo"  # "navdp" | "servo" -- who's allowed to write last_cmd while
         #                          homing; see navdp_home_loop's and home_control_loop's
         #                          docstrings for the hand-off contract. "servo" (a no-op gate)
@@ -406,6 +462,7 @@ def zenoh_setup(session: zenoh.Session, st: SharedState, odom: OdometryLogger, c
                 with st.lock:
                     st.latest_rgb = img
                     st.frame_count += 1
+                    st.last_frame_t = time.time()
         except Exception as e:
             print(f"[WARN] image parse failed: {e}")
 
@@ -416,8 +473,19 @@ def zenoh_setup(session: zenoh.Session, st: SharedState, odom: OdometryLogger, c
                 with st.lock:
                     st.latest_rgb = img
                     st.frame_count += 1
+                    st.last_frame_t = time.time()
         except Exception as e:
             print(f"[WARN] compressed image parse failed: {e}")
+
+    def on_depth(sample):
+        try:
+            depth = parse_depth_image(bytes(sample.payload))
+            if depth is not None:
+                with st.lock:
+                    st.latest_depth = depth
+                    st.depth_frame_count += 1
+        except Exception as e:
+            print(f"[WARN] depth parse failed: {e}")
 
     # Camera subscription is opt-in (--enable-obstacle-avoidance): even
     # compressed JPEG is continuous Wi-Fi traffic + Pi CPU load competing
@@ -430,16 +498,94 @@ def zenoh_setup(session: zenoh.Session, st: SharedState, odom: OdometryLogger, c
     if enable_camera:
         raw_keys = [] if compressed_only else CAMERA_KEYS
         compressed_keys = CAMERA_COMPRESSED_KEYS
+        depth_keys = DEPTH_KEYS
     else:
         raw_keys = []
         compressed_keys = []
+        depth_keys = []
     subs = (
         [session.declare_subscriber(k, on_rpm) for k in RPM_KEYS]
         + [session.declare_subscriber(k, on_image) for k in raw_keys]
         + [session.declare_subscriber(k, on_image_compressed) for k in compressed_keys]
+        + [session.declare_subscriber(k, on_depth) for k in depth_keys]
     )
     pubs = {"cmd": session.declare_publisher("cmd_vel")}
     return subs, pubs
+
+
+def video_record_loop(st: SharedState, running: dict, out_path: str, fps: float) -> None:
+    """Samples st.latest_rgb (the same frame zenoh_setup's on_image/
+    on_image_compressed populate for navdp_home_loop) at a fixed cadence and
+    writes it to an mp4. Deliberately independent of
+    --enable-obstacle-avoidance -- see main()'s --record-video wiring -- so
+    recording a manual-drive session never requires loading the
+    DINO/NavDP/depth models."""
+    if cv2 is None:
+        print("[WARN] --record-video needs opencv-python (cv2) -- not recording")
+        return
+
+    period = 1.0 / fps
+    writer = None
+    frames_written = 0
+    print(f"[INFO] recording video to {out_path} ...")
+    try:
+        while running["on"]:
+            t0 = time.time()
+            with st.lock:
+                rgb = st.latest_rgb
+            if rgb is not None:
+                bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                if writer is None:
+                    h, w = bgr.shape[:2]
+                    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+                writer.write(bgr)
+                frames_written += 1
+            time.sleep(max(0.0, period - (time.time() - t0)))
+    finally:
+        if writer is not None:
+            writer.release()
+        print(f"[INFO] video saved: {out_path} ({frames_written} frames written)")
+
+
+def rgbd_record_loop(st: SharedState, running: dict, out_dir: str, fps: float) -> None:
+    """Dumps synced RGB + 16-bit-depth (mm) PNG frame pairs into out_dir at a
+    fixed cadence, alongside video_record_loop's continuous RGB mp4 -- both
+    started together under --record-video (see main()). Per CLAUDE.md's
+    "collect all images in data/" convention -- out_dir is a data/rgbd_<ts>
+    subfolder, one per session.
+
+    Only ever writes a pair once BOTH st.latest_rgb and st.latest_depth are
+    populated -- depth stays None forever on a backend that doesn't publish
+    DEPTH_KEYS (e.g. the Logitech-only Hiwonder backend), so this loop is a
+    silent no-op there rather than an error."""
+    if cv2 is None:
+        print("[WARN] --record-video's RGB+depth frame dump needs opencv-python (cv2) -- skipping")
+        return
+
+    period = 1.0 / fps
+    frame_idx = 0
+    dir_made = False
+    try:
+        while running["on"]:
+            t0 = time.time()
+            with st.lock:
+                rgb, depth = st.latest_rgb, st.latest_depth
+            if rgb is not None and depth is not None:
+                if not dir_made:
+                    os.makedirs(out_dir, exist_ok=True)
+                    dir_made = True
+                    print(f"[INFO] recording RGB+depth frame pairs to {out_dir} ...")
+                bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(os.path.join(out_dir, f"frame_{frame_idx:06d}_rgb.png"), bgr)
+                depth_mm = np.clip(depth * 1000.0, 0, 65535).astype(np.uint16)
+                cv2.imwrite(os.path.join(out_dir, f"frame_{frame_idx:06d}_depth.png"), depth_mm)
+                frame_idx += 1
+            time.sleep(max(0.0, period - (time.time() - t0)))
+    finally:
+        if dir_made:
+            print(f"[INFO] RGB+depth frame pairs saved: {out_dir} ({frame_idx} pairs written)")
+        else:
+            print("[INFO] no depth ever arrived (backend doesn't publish depth_raw) -- no RGB+depth frames saved")
 
 
 def navdp_home_loop(pipe: "DinoNavDPPipeline", st: SharedState, running: dict,
@@ -694,14 +840,17 @@ def home_control_loop(st: SharedState, running, args):
 class App:
     PLOT_SIZE = 520
     MIN_SPAN_M = 1.0  # floor on the autoscale range so a stationary rover isn't shown zoomed to a point
+    CAM_PREVIEW_W = 480  # live camera panel width (px); height keeps the source frame's aspect ratio
 
     def __init__(self, root: tk.Tk, st: SharedState, obstacle_avoidance_enabled: bool = False,
-                 imu_min_mag_calib: int = 3):
+                 imu_min_mag_calib: int = 3, recording: bool = False, camera_enabled: bool = False):
         self.root = root
         self.st = st
         self.obstacle_avoidance_enabled = obstacle_avoidance_enabled
+        self.camera_enabled = camera_enabled  # broader than obstacle_avoidance_enabled -- also true
+        #                                       for --record-video alone, see main()'s need_camera
         self.imu_min_mag_calib = imu_min_mag_calib
-        root.title("Nav_new — Manual Control + Go Home")
+        root.title("Nav_new — Manual Control + Go Home" + (" [● REC]" if recording else ""))
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.closed = False
 
@@ -710,6 +859,16 @@ class App:
 
         self.plot = tk.Canvas(main, width=self.PLOT_SIZE, height=self.PLOT_SIZE, bg="white")
         self.plot.grid(row=0, column=0, padx=4, pady=4)
+
+        # live camera preview -- only ever has anything to show when the
+        # camera subscription is on (--enable-obstacle-avoidance or
+        # --record-video, see main()'s need_camera); st.latest_rgb is the
+        # same frame video_record_loop/navdp_home_loop consume.
+        self._cam_photo = None  # keep a reference -- tk.PhotoImage is GC'd otherwise
+        self.cam_label = tk.Label(main, bg="black", fg="white",
+                                   text="camera off\n(pass --record-video or\n--enable-obstacle-avoidance)",
+                                   width=60, height=20)
+        self.cam_label.grid(row=0, column=1, padx=4, pady=4, sticky="n")
 
         # -------- manual drive (same hold-button / arrow-key pattern as isaac_gui.py) --------
         self._manual_held: set = set()
@@ -835,9 +994,13 @@ class App:
             lin, ang = self.st.last_cmd
             imu_heading, imu_calib, theta_src = self.st.imu_heading_deg, self.st.imu_calib, self.st.theta_source
             rpm_count, last_rpm_t = self.st.rpm_count, self.st.last_rpm_t
-            frame_count = self.st.frame_count
+            frame_count, last_frame_t = self.st.frame_count, self.st.last_frame_t
+            depth_frame_count = self.st.depth_frame_count
             navdp_state, min_fwd = self.st.navdp_state, self.st.navdp_min_forward
             home_leg = self.st.home_leg
+            rgb = self.st.latest_rgb
+
+        self._update_cam_preview(rgb)
 
         S = self.PLOT_SIZE
         cx, cy, span = self._bounds(path, home, x, y)
@@ -887,12 +1050,18 @@ class App:
                  f"(theta src: {theta_src})   imu heading {heading_txt}  calib [{decode_calib(imu_calib)}]"
         )
         stale = last_rpm_t == 0.0 or (time.time() - last_rpm_t) > RPM_STALE_S
+        cam_stale_s = (time.time() - last_frame_t) if last_frame_t > 0 else float("inf")
         if stale:
             self.warn.configure(text="⚠ NO /rover/rpm DATA — check rover-agent on the Pi (see launch script output)")
-        elif self.obstacle_avoidance_enabled and frame_count == 0:
+        elif self.camera_enabled and frame_count == 0:
+            avoid_note = " -- NavDP obstacle avoidance is blind, Go Home has no collision protection" \
+                if self.obstacle_avoidance_enabled else ""
             self.warn.configure(
-                text="⚠ NO CAMERA FRAMES — NavDP obstacle avoidance is blind, Go Home has no collision "
-                     "protection until frames arrive (check rover-camera on the Pi)")
+                text=f"⚠ NO CAMERA FRAMES YET{avoid_note} (check rover-camera on the Pi)")
+        elif self.camera_enabled and cam_stale_s > CAM_STALE_S:
+            self.warn.configure(
+                text=f"⚠ CAMERA FEED STALE ({cam_stale_s:.1f}s since last frame) — likely Wi-Fi drop/congestion, "
+                     "not a GUI issue (check rover-camera on the Pi)")
         elif (int(round(imu_calib)) % 10 if math.isfinite(imu_calib) else 0) < self.imu_min_mag_calib:
             # Mag-calib check, not theta_src -- theta_src also reads "enc"
             # whenever the wheels aren't turning (OdometryLogger._imu_theta's
@@ -902,7 +1071,25 @@ class App:
                 text="⚠ heading source: wheel encoders only (IMU not calibrated yet — "
                      f"tilt/rotate the rover until magnetometer calib >={self.imu_min_mag_calib})")
         else:
-            self.warn.configure(text=f"rpm samples: {rpm_count}   camera frames: {frame_count}")
+            depth_txt = f"   depth frames: {depth_frame_count}" if self.camera_enabled and depth_frame_count > 0 else ""
+            self.warn.configure(text=f"rpm samples: {rpm_count}   camera frames: {frame_count}{depth_txt}")
+
+    def _update_cam_preview(self, rgb: Optional[np.ndarray]):
+        """Renders st.latest_rgb into self.cam_label. Raw numpy -> tk.PhotoImage
+        via a P6 PPM header (Tk parses PPM natively) -- avoids adding a PIL
+        dependency just for this, since cv2 (used for the resize below) is
+        already required wherever the camera subscription is even on."""
+        if rgb is None:
+            return
+        h, w = rgb.shape[:2]
+        if cv2 is not None and w != self.CAM_PREVIEW_W:
+            new_w = self.CAM_PREVIEW_W
+            new_h = max(1, int(round(h * new_w / w)))
+            rgb = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            h, w = new_h, new_w
+        header = f"P6 {w} {h} 255 ".encode("ascii")
+        self._cam_photo = tk.PhotoImage(data=header + np.ascontiguousarray(rgb).tobytes())
+        self.cam_label.configure(image=self._cam_photo, text="", width=w, height=h)
 
     def _dashed_line(self, x0, y0, x1, y1, fill, dash_len=8):
         length = math.hypot(x1 - x0, y1 - y0)
@@ -958,6 +1145,12 @@ def main():
                     help="subscribe to image_raw/compressed only, not raw image_raw -- avoids "
                          "saturating the rover's Wi-Fi link and starving cmd_vel/rpm (see "
                          "zenoh_setup's comment); the launch script always passes this")
+    ap.add_argument("--record-video", action="store_true",
+                    help="start the Pi camera subscription and record it to an mp4 while manual "
+                         "driving -- independent of --enable-obstacle-avoidance, does NOT load "
+                         "DINO/NavDP/depth models just to record (see video_record_loop)")
+    ap.add_argument("--video-dir", type=str, default="videos", help="output dir for --record-video")
+    ap.add_argument("--video-fps", type=float, default=10.0, help="output mp4 frame rate for --record-video")
     ap.add_argument("--fov", type=float, default=60.0,
                     help="camera horizontal FOV (deg) -- 60 matches the Logitech camera on the "
                          "real rover, see launch_rover.sh's comment")
@@ -1053,8 +1246,9 @@ def main():
     st = SharedState()
     st.max_linear = args.max_linear
     st.max_angular = args.max_angular
+    need_camera = args.enable_obstacle_avoidance or args.record_video
     _subs, pubs = zenoh_setup(session, st, odom, compressed_only=args.compressed_only,
-                              enable_camera=args.enable_obstacle_avoidance)
+                              enable_camera=need_camera)
     running = {"on": True}
 
     Thread(target=heartbeat_loop, args=(st, pubs, running), daemon=True).start()
@@ -1066,9 +1260,24 @@ def main():
                        "navdp_timeout_s": args.home_navdp_timeout_s},
                daemon=True).start()
 
+    video_thread = None
+    rgbd_thread = None
+    if args.record_video:
+        os.makedirs(args.video_dir, exist_ok=True)
+        session_ts = time.strftime('%Y%m%d_%H%M%S')
+        video_path = os.path.join(args.video_dir, f"manual_drive_{session_ts}.mp4")
+        video_thread = Thread(target=video_record_loop, args=(st, running, video_path, args.video_fps),
+                              daemon=True)
+        video_thread.start()
+
+        rgbd_dir = os.path.join("data", f"rgbd_{session_ts}")
+        rgbd_thread = Thread(target=rgbd_record_loop, args=(st, running, rgbd_dir, args.video_fps),
+                             daemon=True)
+        rgbd_thread.start()
+
     root = tk.Tk()
     App(root, st, obstacle_avoidance_enabled=args.enable_obstacle_avoidance,
-        imu_min_mag_calib=args.imu_min_mag_calib)
+        imu_min_mag_calib=args.imu_min_mag_calib, recording=args.record_video, camera_enabled=need_camera)
 
     signal.signal(signal.SIGINT, lambda *_: root.after(0, root.destroy))
     signal.signal(signal.SIGTERM, lambda *_: root.after(0, root.destroy))
@@ -1081,6 +1290,10 @@ def main():
         root.mainloop()
     finally:
         running["on"] = False
+        if video_thread is not None:
+            video_thread.join(timeout=3.0)  # let cv2.VideoWriter.release() flush before exit
+        if rgbd_thread is not None:
+            rgbd_thread.join(timeout=3.0)
         time.sleep(0.2)
         pubs["cmd"].put(serialize_twist(0.0, 0.0))
         time.sleep(0.1)

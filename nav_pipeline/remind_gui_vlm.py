@@ -36,6 +36,7 @@ launch_rover_remind_vlm.sh, which brings up both):
 """
 
 import argparse
+import math
 import os
 import signal
 import sys
@@ -70,7 +71,7 @@ from nav_pipeline.obstacle_guard import GuardConfig  # noqa: E402
 from nav_pipeline.odometry_logger import OdometryLogger  # noqa: E402
 from nav_pipeline.pipeline import DinoNavDPPipeline, PipelineConfig  # noqa: E402
 from nav_pipeline.remind_client import RemindClient  # noqa: E402
-from nav_pipeline.remind_gui import App, SharedState, _update_object_map, remind_poll_loop  # noqa: E402
+from nav_pipeline.remind_gui import App, SharedState, _revisit_step, _update_object_map, remind_poll_loop  # noqa: E402
 from nav_pipeline.zenoh_node import serialize_path, serialize_string, serialize_twist  # noqa: E402
 
 
@@ -161,7 +162,9 @@ def remind_inference_loop_vlm(pipe: DinoNavDPPipeline, st: SharedState, pubs,
                               match_grace_period_s: float = 1.2,
                               clip_matcher: Optional[ClipObjectMatcher] = None,
                               object_map_update_period_s: float = 1.0,
-                              vlm_gate: Optional[VLMArrivalGate] = None):
+                              vlm_gate: Optional[VLMArrivalGate] = None,
+                              align_tolerance_rad: float = math.radians(6.0),
+                              align_angular: float = 0.15):
     """Identical to remind_gui.remind_inference_loop except for the
     reached decision at the bottom (metric stop_streak confirmation ANDed
     with vlm_gate.check() when a gate is given) -- see this module's
@@ -231,6 +234,36 @@ def remind_inference_loop_vlm(pipe: DinoNavDPPipeline, st: SharedState, pubs,
                 if target_id is None:
                     st.state_text = "waiting for target, e.g. 'ID 1'"
             time.sleep(0.1)
+            continue
+
+        if mode == "revisit":
+            # See remind_gui.remind_inference_loop's identical branch --
+            # returns to the rover's OWN remembered pose (object_map.py's
+            # rover_pose) instead of chasing the object.
+            entry = object_map.get(target_id) if object_map is not None else None
+            rp = entry.get("rover_pose") if entry is not None else None
+            if rp is None or pose is None:
+                with st.lock:
+                    st.last_cmd = (0.0, 0.0)
+                    st.display_rgb = rgb
+                    st.vel_text = "lin 0.000  ang +0.000"
+                    st.state_text = f"REVISIT: no remembered vantage pose for ID {target_id} yet"
+                time.sleep(0.1)
+                continue
+            linear, angular, state_text, arrived = _revisit_step(
+                pipe, rgb, depth, pose, rp, goto_arrival_radius, align_tolerance_rad, align_angular)
+            with st.lock:
+                st.display_rgb = rgb
+                if arrived:
+                    st.goal_reached = True
+                    st.last_cmd = (0.0, 0.0)
+                else:
+                    st.last_cmd = (linear, angular)
+                st.state_text = state_text
+                st.vel_text = f"lin {linear:.3f}  ang {angular:+.3f}"
+            dt = period - (time.time() - t0)
+            if dt > 0:
+                time.sleep(dt)
             continue
 
         matched = [o for o in last_objects if o.object_id == target_id]
@@ -392,6 +425,14 @@ def main():
                          "but not-currently-visible object's location before giving up on blind "
                          "GOTO driving and falling back to a search spin (see pipeline.py's GOTO "
                          "state)")
+    ap.add_argument("--align-tolerance-deg", type=float, default=6.0,
+                    help="degrees: how close (by odometry heading) counts as 'facing the right way' "
+                         "once 'Revisit pose' (object_map.py's rover_pose) has driven within "
+                         "--goto-arrival-radius of the remembered spot, before declaring arrival")
+    ap.add_argument("--align-angular", type=float, default=None,
+                    help="rad/s: in-place rotation speed used only during Revisit pose's final "
+                         "heading-alignment phase; defaults to --search-angular (capped by "
+                         "--max-angular) if not given")
     ap.add_argument("--match-grace-period", type=float, default=1.2,
                     help="seconds: how long to keep coasting on the last-known detection after "
                          "REMIND stops matching the target before treating it as truly not "
@@ -484,7 +525,10 @@ def main():
                    "match_grace_period_s": args.match_grace_period,
                    "clip_matcher": clip_matcher,
                    "object_map_update_period_s": args.object_map_update_period,
-                   "vlm_gate": vlm_gate},
+                   "vlm_gate": vlm_gate,
+                   "align_tolerance_rad": math.radians(args.align_tolerance_deg),
+                   "align_angular": (args.align_angular if args.align_angular is not None
+                                      else min(args.search_angular, args.max_angular))},
            daemon=True).start()
 
     root = tk.Tk()

@@ -55,7 +55,7 @@ def world_to_local(world_xy: Tuple[float, float], pose: Tuple[float, float, floa
 
 class ObjectMap:
     """object_id -> {"caption", "world_x", "world_y", "last_seen", "n_obs",
-    "embedding"}.
+    "embedding", "rover_pose"}.
 
     caption is kept purely for internal bookkeeping/debugging -- the GUI
     displays IDs only (see remind_gui.py), not this text. embedding is an
@@ -65,6 +65,15 @@ class ObjectMap:
     text. Cached once per object_id and never overwritten, since the point
     is a stable fingerprint of "what this object looks like" that free-text
     queries can be scored against consistently across the object's lifetime.
+
+    rover_pose ({"x", "y", "theta"}) is the rover's OWN world pose -- not
+    the object's -- at the most recent observation. Unlike world_x/world_y,
+    it is overwritten every update, never EMA-blended: the point is to
+    remember an actual pose the rover physically stood at (so a caller can
+    drive back to it exactly, see remind_gui.py's "revisit" mode), and
+    blending poses across many ticks would synthesize a pose that was never
+    really visited. Absent (None) until the object has been observed at
+    least once with a valid pose under this feature.
     """
 
     def __init__(self, path: str, ema_alpha: float = 0.3, save_period_s: float = 2.0):
@@ -108,6 +117,7 @@ class ObjectMap:
         caption: Optional[str],
         world_xy: Tuple[float, float],
         timestamp: float,
+        rover_pose: Optional[Tuple[float, float, float]] = None,
     ) -> None:
         oid = int(object_id)
         wx, wy = float(world_xy[0]), float(world_xy[1])
@@ -120,6 +130,7 @@ class ObjectMap:
                 "last_seen": float(timestamp),
                 "n_obs": 1,
             }
+            entry = self._entries[oid]
         else:
             a = self.ema_alpha
             entry["world_x"] = (1.0 - a) * float(entry["world_x"]) + a * wx
@@ -128,6 +139,12 @@ class ObjectMap:
             entry["n_obs"] = int(entry.get("n_obs", 0)) + 1
             if caption:
                 entry["caption"] = caption
+        if rover_pose is not None:
+            entry["rover_pose"] = {
+                "x": float(rover_pose[0]),
+                "y": float(rover_pose[1]),
+                "theta": float(rover_pose[2]),
+            }
         self._dirty = True
         self.save()
 

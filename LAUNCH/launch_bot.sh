@@ -32,11 +32,15 @@ backend_parse_args "$@"
 set -- "${BACKEND_ARGS[@]}"
 
 ENABLE_AVOID=false
+RECORD_VIDEO=false
 for arg in "$@"; do
     [[ "$arg" == "--enable-obstacle-avoidance" ]] && ENABLE_AVOID=true
+    [[ "$arg" == "--record-video" ]] && RECORD_VIDEO=true
 done
+NEED_CAMERA=false
+{ $ENABLE_AVOID || $RECORD_VIDEO; } && NEED_CAMERA=true
 
-$ENABLE_AVOID && backend_bringup camera || backend_bringup nocamera
+$NEED_CAMERA && backend_bringup camera || backend_bringup nocamera
 
 # ── Launch the GUI ───────────────────────────────────────────
 set +u
@@ -51,11 +55,11 @@ fi
 pkill -f "nav_pipeline.home_gui" 2>/dev/null && sleep 1
 
 EXTRA_ARGS=()
-if $ENABLE_AVOID; then
+if $NEED_CAMERA; then
     EXTRA_ARGS+=(--fov "$BACKEND_FOV" --compressed-only)
     [[ "$BACKEND" == "hiwonder" ]] && EXTRA_ARGS+=(--footprint-length "$BACKEND_FOOTPRINT_LENGTH" --footprint-width "$BACKEND_FOOTPRINT_WIDTH")
 fi
-info "Starting Nav_new manual-control + Go-Home GUI [$BACKEND] (pi-ip=$PI_IP, caps 0.15 m/s / 0.5 rad/s$($ENABLE_AVOID && echo ', obstacle avoidance on'))..."
+info "Starting Nav_new manual-control + Go-Home GUI [$BACKEND] (pi-ip=$PI_IP, caps 0.15 m/s / 0.5 rad/s$($ENABLE_AVOID && echo ', obstacle avoidance on')$($RECORD_VIDEO && echo ', recording video'))..."
 exec python -u -m nav_pipeline.home_gui \
     --pi-ip "$PI_IP" \
     --max-linear 0.15 --max-angular 0.5 \

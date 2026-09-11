@@ -77,6 +77,11 @@ pkill -f "nav_pipeline.zenoh_node" 2>/dev/null && sleep 1
 EXTRA_ARGS=()
 if [[ "$BACKEND" == "hiwonder" ]]; then
     EXTRA_ARGS+=(--footprint-length "$BACKEND_FOOTPRINT_LENGTH" --footprint-width "$BACKEND_FOOTPRINT_WIDTH")
+else
+    # ESP32 6WD rover only -- see pipeline.py's clear_wheel_deadband. Never
+    # for --hiwonder: different chassis/firmware, this deadband math
+    # doesn't apply (same reasoning as search_angular's floor above).
+    EXTRA_ARGS+=(--wheel-deadband-correction)
 fi
 info "Starting Nav_new GUI [$BACKEND] (pi-ip=$PI_IP, caps 0.15 m/s / $BACKEND_MAX_ANGULAR rad/s, fov $BACKEND_FOV, search $BACKEND_SEARCH_ANGULAR rad/s, ramp 70deg, slew $BACKEND_ANGULAR_SLEW_MAX rad/s/tick)..."
 exec python -u -m nav_pipeline.isaac_gui \

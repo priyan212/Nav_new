@@ -39,6 +39,7 @@ launch_rover_remind.sh, which brings up both):
 
 import argparse
 import colorsys
+import math
 import os
 import signal
 import sys
@@ -104,7 +105,7 @@ class SharedState:
         self.latest_depth: Optional[np.ndarray] = None
         self.latest_depth_t = 0.0
         self.frame_count = 0
-        self.mode = "manual"                    # "text" | "manual" -- starts inert
+        self.mode = "manual"                    # "text" | "manual" | "revisit" -- starts inert
         self.target = target                     # display string, e.g. "ID 1"
         self.target_id: Optional[int] = None
         self.stopped = False
@@ -195,7 +196,7 @@ def _update_object_map(objects: List[RemindObject], depth: Optional[np.ndarray],
         u, v = mask_centroid(o.mask)
         local = pixel_depth_to_point(u, v, d, fx, fy, cx, cy)
         world_xy = local_to_world((float(local[0]), float(local[1])), pose)
-        object_map.update(o.object_id, o.class_name, world_xy, now)
+        object_map.update(o.object_id, o.class_name, world_xy, now, rover_pose=pose)
         if (clip_matcher is not None and rgb is not None
                 and not object_map.has_embedding(o.object_id)):
             try:
@@ -206,6 +207,53 @@ def _update_object_map(objects: List[RemindObject], depth: Optional[np.ndarray],
                 print(f"[WARN] CLIP embedding failed for object {o.object_id}: {e}")
 
 
+def _revisit_step(pipe: DinoNavDPPipeline, rgb: np.ndarray, depth: Optional[np.ndarray],
+                   pose: tuple, target_pose: dict, goto_arrival_radius: float,
+                   align_tolerance_rad: float, align_angular: float):
+    """Drive back to a previously-observed ROVER pose (object_map.py's
+    "rover_pose" field -- where/which way the rover itself was, NOT the
+    object's own location) and match its heading, instead of approaching
+    the object. Two phases, both reusing existing machinery:
+
+    DRIVE: the exact same blind-GOTO mechanism remind_inference_loop
+    already uses to chase a remembered-but-not-visible object's world_xy
+    (pipe.step's external_goal/"GOTO" path, see pipeline.py) -- just aimed
+    at the stored rover position instead, so obstacle avoidance stays
+    active for free. Passing external_dets=None with external_goal set
+    makes pipe.step's _step_inner skip its DINO detector call entirely
+    (pipeline.py's `elif external_goal is not None:` branch) and skip
+    SEARCH/belief-coasting too (goal is filled from external_goal before
+    the `if goal is None:` block that would otherwise trigger them) --
+    this leg is a blind drive to a fixed point plus obstacle avoidance
+    only, never a visual hunt for the object.
+
+    ALIGN: once within goto_arrival_radius, bypasses pipe.step entirely and
+    rotates in place toward the stored heading (mirrors pipeline.py's own
+    SEARCH state, which sets angular directly without invoking the
+    obstacle guard -- safe since it's pure rotation, no forward motion).
+    Shortest-path angle error via atan2(sin, cos) so it never fights itself
+    across the +-pi wrap.
+
+    Returns (linear, angular, state_text, arrived) -- arrived means BOTH
+    position and heading are within tolerance, not just position.
+    """
+    target_xy = (target_pose["x"], target_pose["y"])
+    lx, ly = world_to_local(target_xy, pose)
+    dist = float(np.hypot(lx, ly))
+    if dist > goto_arrival_radius:
+        res = pipe.step(rgb, "revisit vantage pose", depth=depth, pose=pose,
+                         external_dets=None, external_goal=np.array([lx, ly, 0.0], dtype=np.float32))
+        if res.state == "STOP":
+            return 0.0, 0.0, f"REVISIT: driving to vantage pose ({dist:.2f}m)", False
+        return res.linear, res.angular, f"REVISIT: driving to vantage pose ({dist:.2f}m)", False
+
+    err = math.atan2(math.sin(target_pose["theta"] - pose[2]), math.cos(target_pose["theta"] - pose[2]))
+    if abs(err) <= align_tolerance_rad:
+        return 0.0, 0.0, "REVISIT REACHED: at vantage pose, heading aligned", True
+    angular = math.copysign(align_angular, err)
+    return 0.0, angular, f"REVISIT: aligning heading ({math.degrees(err):+.0f}deg)", False
+
+
 def remind_inference_loop(pipe: DinoNavDPPipeline, st: SharedState, pubs,
                           running, predict_hz: float,
                           stop_confirm: int = 3, odom: Optional[OdometryLogger] = None,
@@ -213,7 +261,9 @@ def remind_inference_loop(pipe: DinoNavDPPipeline, st: SharedState, pubs,
                           goto_arrival_radius: float = 1.0,
                           match_grace_period_s: float = 1.2,
                           clip_matcher: Optional[ClipObjectMatcher] = None,
-                          object_map_update_period_s: float = 1.0):
+                          object_map_update_period_s: float = 1.0,
+                          align_tolerance_rad: float = math.radians(6.0),
+                          align_angular: float = 0.15):
     period = 1.0 / predict_hz
     stop_streak = 0
     last_target_id: Optional[int] = None
@@ -320,6 +370,37 @@ def remind_inference_loop(pipe: DinoNavDPPipeline, st: SharedState, pubs,
                 if target_id is None:
                     st.state_text = "waiting for target, e.g. 'ID 1'"
             time.sleep(0.1)
+            continue
+
+        if mode == "revisit":
+            # Return to where the ROVER stood (and which way it faced) the
+            # last time it observed target_id -- object_map.py's rover_pose
+            # -- rather than chasing the object itself. Live REMIND matching
+            # below is irrelevant here, so this branch skips it entirely.
+            entry = object_map.get(target_id) if object_map is not None else None
+            rp = entry.get("rover_pose") if entry is not None else None
+            if rp is None or pose is None:
+                with st.lock:
+                    st.last_cmd = (0.0, 0.0)
+                    st.display_rgb = rgb
+                    st.vel_text = "lin 0.000  ang +0.000"
+                    st.state_text = f"REVISIT: no remembered vantage pose for ID {target_id} yet"
+                time.sleep(0.1)
+                continue
+            linear, angular, state_text, arrived = _revisit_step(
+                pipe, rgb, depth, pose, rp, goto_arrival_radius, align_tolerance_rad, align_angular)
+            with st.lock:
+                st.display_rgb = rgb
+                if arrived:
+                    st.goal_reached = True
+                    st.last_cmd = (0.0, 0.0)
+                else:
+                    st.last_cmd = (linear, angular)
+                st.state_text = state_text
+                st.vel_text = f"lin {linear:.3f}  ang {angular:+.3f}"
+            dt = period - (time.time() - t0)
+            if dt > 0:
+                time.sleep(dt)
             continue
 
         matched = [o for o in last_objects if o.object_id == target_id]
@@ -504,6 +585,7 @@ class App:
         self.id_entry.bind("<Return>", lambda e: self.send_target())
 
         ttk.Button(bar, text="Send", command=self.send_target).pack(side="left", padx=(8, 2))
+        ttk.Button(bar, text="Revisit pose", command=self.revisit_target).pack(side="left", padx=(2, 8))
         ttk.Button(bar, text="STOP", command=self.stop).pack(side="left", padx=10)
         ttk.Button(bar, text="Reset REMIND memory", command=self.reset_memory).pack(side="left", padx=10)
         ttk.Button(bar, text="Forget locations", command=self.forget_locations).pack(side="left", padx=10)
@@ -580,11 +662,26 @@ class App:
                 note=result.message + (" -- ambiguous, picked closest/best match" if result.ambiguous else "")))
         Thread(target=_do, daemon=True).start()
 
-    def _apply_target(self, target_id: int, canonical: str, note: str = ""):
+    def revisit_target(self):
+        """Drive back to the ROVER pose (position + heading) stored the last
+        time the entered ID was observed (object_map.py's rover_pose) --
+        distinct from Send/'go to the object', which chases the object
+        itself. ID-only: unlike send_target, no free-text resolution here,
+        since revisiting is inherently about a specific already-known ID."""
+        text = self.id_entry.get().strip()
+        try:
+            target_id = int(text)
+        except ValueError:
+            with self.st.lock:
+                self.st.state_text = "Revisit pose needs a numeric object ID"
+            return
+        self._apply_target(target_id, f"ID {target_id} (revisit pose)", mode="revisit")
+
+    def _apply_target(self, target_id: int, canonical: str, note: str = "", mode: str = "text"):
         self._manual_held.clear()
         self._set_fields(target_id)
         with self.st.lock:
-            self.st.mode = "text"
+            self.st.mode = mode
             self.st.target_id = target_id
             self.st.target = canonical
             self.st.stopped = False
@@ -843,6 +940,14 @@ def main():
                          "but not-currently-visible object's location before giving up on blind "
                          "GOTO driving and falling back to a search spin (see pipeline.py's GOTO "
                          "state)")
+    ap.add_argument("--align-tolerance-deg", type=float, default=6.0,
+                    help="degrees: how close (by odometry heading) counts as 'facing the right way' "
+                         "once 'Revisit pose' (object_map.py's rover_pose) has driven within "
+                         "--goto-arrival-radius of the remembered spot, before declaring arrival")
+    ap.add_argument("--align-angular", type=float, default=None,
+                    help="rad/s: in-place rotation speed used only during Revisit pose's final "
+                         "heading-alignment phase; defaults to --search-angular (capped by "
+                         "--max-angular) if not given")
     ap.add_argument("--match-grace-period", type=float, default=1.2,
                     help="seconds: how long to keep coasting on the last-known detection after "
                          "REMIND stops matching the target, before treating it as truly not "
@@ -940,7 +1045,10 @@ def main():
                    "goto_arrival_radius": args.goto_arrival_radius,
                    "match_grace_period_s": args.match_grace_period,
                    "clip_matcher": clip_matcher,
-                   "object_map_update_period_s": args.object_map_update_period},
+                   "object_map_update_period_s": args.object_map_update_period,
+                   "align_tolerance_rad": math.radians(args.align_tolerance_deg),
+                   "align_angular": (args.align_angular if args.align_angular is not None
+                                      else min(args.search_angular, args.max_angular))},
            daemon=True).start()
 
     root = tk.Tk()

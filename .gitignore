@@ -27,3 +27,16 @@ REMIND/*.mp4
 REMIND/*.pdf
 REMIND/remind-reid-tracker/testData/videos/**/*.mp4
 2607.09267v1.pdf
+
+# Images, videos, and data collection outputs (not source)
+*.png
+*.jpg
+*.jpeg
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.csv
+*.json
+*.tsv
