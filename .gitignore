@@ -40,3 +40,4 @@ REMIND/remind-reid-tracker/testData/videos/**/*.mp4
 *.csv
 *.json
 *.tsv
+rover_data.tar.xz
